@@ -5,6 +5,16 @@ Changelog
 Upcoming version (not yet released)
 -----------------------------------
 
+Added
+^^^^^
+
+- ``osl_fullbody_robot`` to the asset zoo: a full-body model of a right transfemoral
+  amputee with an Open-Source Leg prosthesis, actuated by 27 position servos and the
+  2 OSL torque motors, with 44 joints driven by equality constraints. The vendored
+  MJCF is a byte-identical copy of its source; the asset rebasing, the removal of the
+  scene's floor/light/skybox, and the rewrite of the servos from normalized to
+  radian commands all happen in ``get_spec``.
+
 Changed
 ^^^^^^^
 

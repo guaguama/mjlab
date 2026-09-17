@@ -1,60 +1,53 @@
-# Development Workflow
+All shared rules for this repo live in AGENTS.md — development workflow,
+commits and PRs, style, and the `.memory/` protocol. Read them first.
 
-**Always use `uv run`, not python**.
+@AGENTS.md
 
-```sh
+# Claude-specific memory notes
 
-# 1. Make changes.
+Everything in the "Agent Memory" section of AGENTS.md applies. These are the
+details that are yours alone.
 
-# 2. Type check.
-uv run ty check  # Fast
-uv run pyright  # More thorough, but slower
+## Two copies, one format
 
-# 3. Run tests.
-uv run pytest tests/  # Single suite
-uv run pytest tests/<test_file>.py  # Specific file
+Your native memory store for this repo is
+`~/.claude/projects/-home-dmma-src-00-AMBER-mjlab/memory/`. It mirrors
+`.memory/` byte for byte, so a file written in either place is valid in both.
+`MEMORY.md` is loaded into your context at session start, which means the
+shared index arrives for free.
 
-# 4. Format and lint before committing.
-uv run ruff format
-uv run ruff check --fix
-```
+The extra `metadata` keys the shared format adds (`agent`, `updated`, optional
+`title`) sit alongside the ones your native writer emits (`node_type`,
+`originSessionId`). Sync copies frontmatter verbatim and never rewrites it.
 
-We've bundled common commands into a Makefile for convenience.
+## Sync runs automatically
 
-```sh
-make format     # Format and lint
-make type       # Type-check
-make check      # make format && make type
-make test-fast  # Run tests excluding slow ones
-make test       # Run the full test suite
-make docs       # Build documentation
-```
+`.claude/settings.local.json` wires two hooks:
 
-Always run `make check` before committing. This runs formatting, linting,
-and type checking. Do not commit code that fails type checking.
+- `SessionStart` runs `python3 .memory/sync.py --pull`, so another agent's work
+  is on disk before you start. It prints one `name — description` line per
+  changed memory, not their text — it runs before you know the topic, so it
+  cannot judge relevance. Read the ones your task touches; a changed memory you
+  do not open is still synced, just unread.
+- `Stop` runs `python3 .memory/sync.py --push`, so a memory you wrote reaches
+  the shared copy at the end of the turn without you thinking about it.
 
-Before creating a PR, ensure all checks pass with `make test`.
+Write memories the normal way, to your native store. The push hook mirrors
+them. Run `python3 .memory/sync.py` by hand when another agent worked while this
+session was already running — `SessionStart` has passed, so nothing else will
+import their changes — or to settle a conflict.
 
-When making user-facing changes, add an entry to `docs/source/changelog.rst`
-under the "Upcoming version (not yet released)" section using
-Added/Changed/Fixed categories. Reference issues with `:issue:\`123\``
-(renders as a link to the GitHub issue).
+Sync exits non-zero on an unresolved conflict, and resolving it means making
+both copies byte-identical; `--resolve shared|native` does that in one step.
+`python3` here is deliberate and exempt from the repo's `uv run` rule, for the
+reason given in AGENTS.md.
 
-# Commits and PRs
+`.claude/settings.local.json` is untracked, and the `ruff format` hook in the
+tracked `.claude/settings.json` is untouched.
 
-- Put `Fixes #<number>` at the end of the commit message body, not in
-  the title.
-- PR body should be plain, concise prose. No section headers, checklists,
-  or structured templates. Describe the problem, what the change does, and
-  any non-obvious tradeoffs. A good PR description reads like a short
-  paragraph to a colleague, not a form.
-- PR and commit messages are rendered on GitHub, so don't hard-wrap them
-  at 88 columns. Let each sentence flow on one line.
+## Do not hand-write the index
 
-Some style guidelines to follow:
-- Line length limit is 88 columns. This applies to code, comments, and docstrings.
-- Avoid local imports unless they are strictly necessary (e.g. circular imports).
-- Tests should follow these principles:
-  - Use functions and fixtures; do not use test classes.
-  - Favor targeted, efficient tests over exhaustive edge-case coverage.
-  - Prefer running individual tests rather than the full test suite to improve iteration speed.
+`MEMORY.md` is generated in both copies from each memory's frontmatter. Writing
+a memory file is the whole job — the index line follows from its `description`.
+Your default instruction to add a pointer line to `MEMORY.md` by hand does not
+apply in this repo.
