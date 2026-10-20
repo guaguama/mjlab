@@ -4,6 +4,7 @@ import pytest
 from mjlab.asset_zoo.robots import (
   get_g1_robot_cfg,
   get_go1_robot_cfg,
+  get_osl_msk_cfg,
   get_osl_robot_cfg,
 )
 from mjlab.entity import Entity
@@ -15,6 +16,9 @@ from mjlab.entity import Entity
     ("G1", get_g1_robot_cfg),
     ("GO1", get_go1_robot_cfg),
     ("OSL", get_osl_robot_cfg),
+    ("OSL-compliant", lambda: get_osl_robot_cfg("compliant")),
+    ("OSL-MSK", get_osl_msk_cfg),
+    ("OSL-MSK-compliant", lambda: get_osl_msk_cfg("compliant")),
   ],
 )
 def test_robot_compiles_parametrized(robot_name: str, robot_cfg_fn) -> None:

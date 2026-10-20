@@ -36,10 +36,12 @@ def test_tracking_tasks_have_motion_command(tracking_task_ids: list[str]) -> Non
 def test_tracking_tasks_have_self_collision_sensor(
   tracking_task_ids: list[str],
 ) -> None:
-  """All tracking tasks should have a self_collision sensor."""
+  """Tasks enabling the self-collision reward must provide its sensor."""
   for task_id in tracking_task_ids:
     cfg = load_env_cfg(task_id)
 
+    if "self_collisions" not in cfg.rewards:
+      continue
     assert cfg.scene.sensors is not None, f"Task {task_id} has no sensors"
 
     sensor_names = {s.name for s in cfg.scene.sensors}

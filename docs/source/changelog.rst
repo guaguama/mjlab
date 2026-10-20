@@ -13,12 +13,21 @@ Added
   kernels for Blackwell GPUs.
 - Added ``SimulationCfg.graph_conditional`` to toggle MuJoCo Warp's CUDA graph
   conditional nodes, which require CUDA 12.4 or newer.
-- ``osl_fullbody_robot`` to the asset zoo: a full-body model of a right transfemoral
-  amputee with an Open-Source Leg prosthesis, actuated by 27 position servos and the
-  2 OSL torque motors, with 44 joints driven by equality constraints. The vendored
-  MJCF is a byte-identical copy of its source; the asset rebasing, the removal of the
-  scene's floor/light/skybox, and the rewrite of the servos from normalized to
-  radian commands all happen in ``get_spec``.
+- OSL full-body walking tracking tasks for all four ``osl_fullbody`` variants:
+  ``Mjlab-Tracking-Flat-OSL-Fullbody`` and ``-Compliant`` (position servos and
+  prosthesis motors), ``-MSK`` and ``-MSK-Compliant`` (muscle excitations and
+  prosthesis motors). Stock tracking rewards, with coupled joint resets, one motion
+  clip shared across variants, pelvis IMUs, and native PPO checkpoints and playback.
+  ONNX export is deferred for OSL.
+- ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
+  amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
+  is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and
+  ``get_osl_msk_cfg`` the musculoskeletal model (401 muscles and the same 2 motors),
+  each with a rigid or compliant socket. In every variant 44 joints are driven by
+  equality constraints. The vendored MJCFs are byte-identical copies of their
+  source; the removal of the scene's floor/light/skybox and placeholder keyframes,
+  and the rewrite of the servos from normalized to radian commands, all happen in
+  ``get_spec``.
 
 Changed
 ^^^^^^^
