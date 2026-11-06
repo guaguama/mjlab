@@ -53,9 +53,11 @@ SIM_CFGS = {
 MUSCLE_CTRL = 0.1
 NUM_STEPS = {"robot": 300, "msk": 100}
 # (early, whole-window) bounds on |qpos warp - qpos cpu|. Measured: robot 4.6e-07
-# early and 2.6e-06 over 300 steps; musculoskeletal 9.1e-05 early and 7.4e-04 over
-# 100. The musculoskeletal drift is all in the wrists and fingers -- light distal
-# joints under strong muscles, integrated explicitly -- and levels off by step 50.
+# early and 2.6e-06 over 300 steps; musculoskeletal (fingers kept) 9.1e-05 early
+# and 7.4e-04 over 100, all of it in the wrists and fingers -- light distal joints
+# under strong muscles, integrated explicitly. The model is now fingerless by
+# default; a scratch prototype measured about 1.6e-06 over 0.2 s, so these bounds
+# hold with room to spare but have not been re-tightened.
 TOLERANCES = {"robot": (1e-5, 1e-4), "msk": (1e-3, 1e-2)}
 # The window where a structural error - a mismapped equality, a dropped contact,
 # a misread actuator - shows up immediately.

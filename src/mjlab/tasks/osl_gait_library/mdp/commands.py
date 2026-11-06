@@ -1,0 +1,821 @@
+"""A twist command over a looping gait library, serving a musclemimic-style reference.
+
+The library is a folder of clipper ``--format mjlab`` clips at the control rate. Each
+walking clip is one stride that loops, with phase 0 at the OSL foot's touchdown, a
+``twist`` label ``[vx, vy, wz]`` (forward = the root's body -y, vy left, wz CCW) and
+the stride's planar displacement ``stride_se2``. ``idle.npz`` holds the standing
+pose with a zero twist.
+
+The command follows sesteban's G1 unicycle task (``jog_unicycle`` over
+``crawling_fwd_blending``):
+
+* **Sampling.** A per-env timer draws a twist: zero for ``rel_static_envs``,
+  otherwise the unicycle modes (pivot, forward or backward arc). The twist snaps to
+  the nearest clip under a weighted L2 metric. A command that snaps to the idle clip
+  is zeroed, so idle, zero twist and a blanked phase always coincide.
+* **Switching.** The new clip keeps the stride phase (``frame / T``). Over
+  ``blend_time_s`` the reference fades from the outgoing clip, read at the shared
+  phase, to the new one. Positions lerp, orientations nlerp, and velocities lerp plus
+  ``alpha_dot * (new - old)``, so a served velocity is the derivative of its served
+  position. The outgoing clip is time-warped onto the new period, so its velocities
+  scale with the period ratio.
+* **Episode starts.** A sampled twist, a uniformly random phase and the exact
+  reference state, as musclemimic starts. No noise.
+
+Two mechanisms replace the stock tracking command's absolute root target, which
+looping clips break (their root jumps back one stride at every loop):
+
+* **Unrolling.** Each env holds a planar anchor (x, y, yaw) for its clip, composed
+  with the clip's ``stride_se2`` at every loop. The served root and sites then advance
+  continuously, stride after stride. This is exact; sesteban integrates the reference
+  velocity instead.
+* **Re-basing.** At every timer resample the anchors move so that the served root's
+  planar pose equals the robot's. This is sesteban's egocentric target: drift is
+  forgiven at each command change, never in between. Height, roll and pitch are never
+  re-based.
+
+Timing is :class:`~mjlab.tasks.osl_mimic.mdp.MimicMotionCommand`'s: ``frame`` is the
+frame the last observation was built at, and rewards compare with ``reference(1)``.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import numpy as np
+import torch
+
+from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
+from mjlab.tasks.osl_mimic.mdp import (
+  MIMIC_BODIES,
+  ROOT_BODY,
+  MimicLookahead,
+  MimicReference,
+  pad_clip_joints,
+  relative_site_quantities,
+  relative_site_velocities,
+)
+from mjlab.tasks.tracking.config.osl.mdp import check_motion_fps
+from mjlab.utils.lab_api.math import (
+  axis_angle_from_quat,
+  matrix_from_quat,
+  quat_apply,
+  quat_apply_inverse,
+  quat_conjugate,
+  quat_mul,
+)
+
+if TYPE_CHECKING:
+  from mjlab.entity import Entity
+  from mjlab.envs import ManagerBasedRlEnv
+
+Frame = dict[str, torch.Tensor]
+"""Reference fields of one frame per env, before :class:`MimicReference` is built."""
+
+# Fields that interpolate linearly, and each velocity with the position it is the
+# derivative of (for the blend's ``alpha_dot`` term).
+_POSITIONS = ("root_pos", "joint_pos", "site_pos", "rpos", "rangles")
+_VELOCITY_OF = {
+  "root_lin_vel": "root_pos",
+  "joint_vel": "joint_pos",
+  "v_rel": "rpos",
+  "omega_rel": "rangles",
+}
+_VELOCITIES = (*_VELOCITY_OF, "root_ang_vel_w", "rvel")
+
+
+##
+# Planar (SE(2)) poses: (..., 3) tensors (x, y, yaw).
+##
+
+
+def se2_compose(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+  """``a ∘ b``: apply ``b``, then ``a``."""
+  c, s = torch.cos(a[..., 2]), torch.sin(a[..., 2])
+  x = a[..., 0] + c * b[..., 0] - s * b[..., 1]
+  y = a[..., 1] + s * b[..., 0] + c * b[..., 1]
+  return torch.stack([x, y, a[..., 2] + b[..., 2]], dim=-1)
+
+
+def se2_inverse(a: torch.Tensor) -> torch.Tensor:
+  c, s = torch.cos(a[..., 2]), torch.sin(a[..., 2])
+  x = -(c * a[..., 0] + s * a[..., 1])
+  y = s * a[..., 0] - c * a[..., 1]
+  return torch.stack([x, y, -a[..., 2]], dim=-1)
+
+
+def quat_yaw(quat: torch.Tensor) -> torch.Tensor:
+  """Yaw of a (w, x, y, z) quaternion: the azimuth of its body x axis."""
+  w, x, y, z = quat.unbind(-1)
+  return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def planar_pose(pos: torch.Tensor, quat: torch.Tensor) -> torch.Tensor:
+  return torch.stack([pos[..., 0], pos[..., 1], quat_yaw(quat)], dim=-1)
+
+
+def _yaw_quat(yaw: torch.Tensor) -> torch.Tensor:
+  half = 0.5 * yaw
+  zero = torch.zeros_like(half)
+  return torch.stack([torch.cos(half), zero, zero, torch.sin(half)], dim=-1)
+
+
+def _rotate_xy(v: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+  """Rotate the xy part of (B, ..., 3) vectors by a per-env yaw."""
+  shape = (-1,) + (1,) * (v.ndim - 2)
+  c, s = cos.view(shape), sin.view(shape)
+  x, y = v[..., 0], v[..., 1]
+  return torch.stack([c * x - s * y, s * x + c * y, v[..., 2]], dim=-1)
+
+
+def _bcast(w: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+  """(B,) per-env weights broadcast against a (B, ...) tensor."""
+  return w.view((-1,) + (1,) * (like.ndim - 1))
+
+
+def _nlerp(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+  b = torch.where((a * b).sum(-1, keepdim=True) < 0.0, -b, b)
+  q = torch.lerp(a, b, _bcast(w, a))
+  return q / q.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+def heading_twist(
+  quat: torch.Tensor, lin_vel_w: torch.Tensor, ang_vel_w: torch.Tensor
+) -> torch.Tensor:
+  """(B, 3) planar twist [forward, left, yaw rate] in the root's heading frame.
+
+  Forward is the root's body -y (the osl_fullbody convention, which the library's
+  twist labels use), projected onto the ground.
+  """
+  fwd = torch.zeros_like(lin_vel_w)
+  fwd[:, 1] = -1.0
+  fwd = quat_apply(quat, fwd)
+  heading = torch.atan2(fwd[:, 1], fwd[:, 0])
+  c, s = torch.cos(heading), torch.sin(heading)
+  forward = c * lin_vel_w[:, 0] + s * lin_vel_w[:, 1]
+  left = -s * lin_vel_w[:, 0] + c * lin_vel_w[:, 1]
+  return torch.stack([forward, left, ang_vel_w[:, 2]], dim=-1)
+
+
+@dataclass(kw_only=True)
+class GaitLibraryCommandCfg(CommandTermCfg):
+  """Configuration for :class:`GaitLibraryCommand`."""
+
+  library_dir: str = ""
+  """Folder of clipper mjlab clips at the control rate (every ``*.npz`` is loaded)."""
+  entity_name: str = "robot"
+  site_bodies: tuple[str, ...] = MIMIC_BODIES
+  lookahead_steps: int = 5
+  """``GoalTrajMimic.n_step_lookahead``: frames in the goal, the current one included."""
+  lookahead_stride: int = 20
+  """``GoalTrajMimic.n_step_stride``, in frames."""
+  resampling_time_range: tuple[float, float] = (3.0, 8.0)
+  """Seconds between twist resamples (sesteban's walk and jog unicycle)."""
+  blend_time_s: float = 0.4
+  rebase_on_resample: bool = True
+  """Move the root target onto the robot (x, y, yaw) at every timer resample."""
+  twist_metric_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)
+  """Weights of the nearest-clip metric on (vx, vy, wz). Use
+  ``span_normalized_weights`` once a library spans both vx and wz."""
+  rel_static_envs: float = 0.15
+  """Fraction of draws that command a zero twist (the idle clip)."""
+  rel_turn_envs: float = 0.0
+  """Fraction of draws that pivot in place, ``[0, 0, ±wz]``."""
+  rel_back_envs: float = 0.0
+  """Fraction of arc draws that walk backward."""
+  vx_fwd_range: tuple[float, float] | None = None
+  """Forward arc speed (m/s). None: the library's forward span."""
+  vx_bck_range: tuple[float, float] = (0.0, 0.0)
+  arc_wz_range: tuple[float, float] = (0.0, 0.0)
+  """Arc yaw-rate magnitude (rad/s), random sign; 0 walks straight."""
+  wz_range: tuple[float, float] = (0.0, 0.0)
+  """Pivot yaw-rate magnitude (rad/s), random sign."""
+  fixed_clips: bool = False
+  """Validation: env ``i`` plays clip ``i % num_clips`` from phase 0 at its label,
+  forever (set ``resampling_time_range`` past the episode)."""
+
+  def build(self, env: ManagerBasedRlEnv) -> GaitLibraryCommand:
+    return GaitLibraryCommand(self, env)
+
+
+def span_normalized_weights(
+  vx_range: tuple[float, float], wz_range: tuple[float, float]
+) -> tuple[float, float, float]:
+  """sesteban's metric weights: a full-span miss costs the same on vx as on wz."""
+  wx = 1.0 / max(abs(vx_range[1] - vx_range[0]), 1e-6) ** 2
+  wz = 1.0 / max(abs(wz_range[1] - wz_range[0]), 1e-6) ** 2
+  m = max(wx, wz)
+  return (wx / m, wx / m, wz / m)
+
+
+class GaitLibraryCommand(CommandTerm):
+  cfg: GaitLibraryCommandCfg
+
+  def __init__(self, cfg: GaitLibraryCommandCfg, env: ManagerBasedRlEnv):
+    super().__init__(cfg, env)
+    if not cfg.library_dir:
+      raise ValueError(
+        "No gait library: pass --env.commands.motion.library-dir <folder of clipper "
+        "--format mjlab clips at the task's control rate>."
+      )
+    self.robot: Entity = env.scene[cfg.entity_name]
+    self._step_dt = float(env.step_dt)
+    self._load_library(Path(cfg.library_dir))
+
+    n, dev = self.num_envs, self.device
+    self.clip = torch.zeros(n, dtype=torch.long, device=dev)
+    self.frame = torch.zeros(n, dtype=torch.long, device=dev)
+    self.twist_command = torch.zeros(n, 3, device=dev)
+    self.anchor = torch.zeros(n, 3, device=dev)
+    self.z_offset = torch.zeros(n, device=dev)
+    self.blend_steps = max(1, round(cfg.blend_time_s / self._step_dt))
+    self._alpha_rate = 1.0 / (self.blend_steps * self._step_dt)
+    # The clip being faded out: its anchor, its own clock (fractional frame, frames
+    # per step), and the steps into the fade (blend_steps: no blend running).
+    self.clip_prev = torch.zeros(n, dtype=torch.long, device=dev)
+    self.anchor_prev = torch.zeros(n, 3, device=dev)
+    self.frame_prev = torch.zeros(n, device=dev)
+    self.rate_prev = torch.ones(n, device=dev)
+    self.blend_count = torch.full((n,), self.blend_steps, dtype=torch.long, device=dev)
+    # World-frame xy the served root lags the lerp of the two clips by, during a blend
+    # (see ``_serve``); folded into the anchor when the blend ends.
+    self.catchup = torch.zeros(n, 2, device=dev)
+
+    self._just_reset = torch.zeros(n, dtype=torch.bool, device=dev)
+    self._jump_step = torch.full((n,), -10, dtype=torch.long, device=dev)
+    self._episode_reset = False
+    self._cache: dict[int, MimicReference] = {}
+
+  ##
+  # Loading.
+  ##
+
+  def _load_library(self, folder: Path) -> None:
+    files = sorted(folder.glob("*.npz"))
+    if not files:
+      raise ValueError(f"No *.npz clips in {folder}.")
+    body_names = list(self.robot.body_names)
+    joint_names = list(self.robot.joint_names)
+    root = body_names.index(ROOT_BODY)
+    self.site_body_ids = [body_names.index(b) for b in self.cfg.site_bodies]
+    dev = self.device
+
+    clips: list[dict[str, torch.Tensor]] = []
+    twists, strides, lengths = [], [], []
+    for path in files:
+      check_motion_fps(str(path), self._step_dt)
+      with np.load(path) as data:
+        a = {
+          k: torch.tensor(data[k], dtype=torch.float32, device=dev)
+          for k in (
+            "joint_pos",
+            "joint_vel",
+            "body_pos_w",
+            "body_quat_w",
+            "body_lin_vel_w",
+            "body_ang_vel_w",
+          )
+        }
+        twist = np.asarray(data["twist"], dtype=np.float64).reshape(3)
+        se2 = (
+          np.asarray(data["stride_se2"], dtype=np.float64)
+          if "stride_se2" in data.files
+          else np.eye(3)
+        )
+      if a["body_pos_w"].shape[1] != len(body_names):
+        raise ValueError(
+          f"{path.name} has {a['body_pos_w'].shape[1]} bodies; the entity has "
+          f"{len(body_names)}."
+        )
+      joint_pos, joint_vel = pad_clip_joints(
+        a["joint_pos"], a["joint_vel"], joint_names
+      )
+      quat = a["body_quat_w"][:, root]
+      site_pos = a["body_pos_w"][:, self.site_body_ids]
+      site_mat = matrix_from_quat(a["body_quat_w"][:, self.site_body_ids])
+      ang = a["body_ang_vel_w"][:, self.site_body_ids]
+      lin = a["body_lin_vel_w"][:, self.site_body_ids]
+      rpos, rangles, rvel = relative_site_quantities(site_pos, site_mat, ang, lin)
+      v_rel, omega_rel = relative_site_velocities(site_mat, ang, lin)
+      clip = {
+        "joint_pos": joint_pos,
+        "joint_vel": joint_vel,
+        "root_pos": a["body_pos_w"][:, root],
+        "root_quat": quat,
+        "root_lin_vel": a["body_lin_vel_w"][:, root],
+        "root_ang_vel_w": a["body_ang_vel_w"][:, root],
+        "root_ang_vel_b": quat_apply_inverse(quat, a["body_ang_vel_w"][:, root]),
+        "site_pos": site_pos,
+        "rpos": rpos,
+        "rangles": rangles,
+        "rvel": rvel,
+        "v_rel": v_rel,
+        "omega_rel": omega_rel,
+      }
+      stride = (float(se2[0, 2]), float(se2[1, 2]), math.atan2(se2[1, 0], se2[0, 0]))
+      self._check_loop(path.name, clip, stride)
+      clips.append(clip)
+      twists.append(twist)
+      strides.append(stride)
+      lengths.append(int(joint_pos.shape[0]))
+
+    t_max = max(lengths)
+    self.num_clips = len(clips)
+    self.clip_names = [p.stem for p in files]
+    self.num_frames = torch.tensor(lengths, dtype=torch.long, device=dev)
+    self.twists = torch.tensor(np.stack(twists), dtype=torch.float32, device=dev)
+    self.strides = torch.tensor(strides, dtype=torch.float32, device=dev)
+    # (C, T_max, ...), short clips padded with their last frame (never read).
+    self.data: dict[str, torch.Tensor] = {}
+    for key in clips[0]:
+      padded = []
+      for clip in clips:
+        x = clip[key]
+        pad = x[-1:].expand(t_max - x.shape[0], *x.shape[1:])
+        padded.append(torch.cat([x, pad], dim=0))
+      self.data[key] = torch.stack(padded)
+    self.data["root_planar"] = planar_pose(
+      self.data["root_pos"], self.data["root_quat"]
+    )
+
+    zero = self.twists.norm(dim=-1) < 1e-6
+    idle = torch.nonzero(zero).flatten()
+    self.idle_clip: int | None = int(idle[0]) if idle.numel() else None
+    if self.cfg.rel_static_envs > 0.0 and self.idle_clip is None:
+      raise ValueError("rel_static_envs > 0 needs a zero-twist (idle) clip.")
+    forward = self.twists[:, 0][self.twists[:, 0] > 1e-6]
+    if self.cfg.vx_fwd_range is not None:
+      self.vx_fwd_range = self.cfg.vx_fwd_range
+    elif forward.numel():
+      self.vx_fwd_range = (float(forward.min()), float(forward.max()))
+    else:
+      self.vx_fwd_range = (0.0, 0.0)
+    self._metric = torch.tensor(self.cfg.twist_metric_weights, device=dev)
+
+    # Loops any served offset can cross: lookahead plus the blend's +1 interpolation.
+    reach = (self.cfg.lookahead_steps - 1) * self.cfg.lookahead_stride + 2
+    self._max_wraps = max((n - 1 + reach) // n for n in lengths) + 1
+
+  def _check_loop(
+    self, name: str, clip: dict[str, torch.Tensor], stride: tuple[float, float, float]
+  ) -> None:
+    """The stride transform must carry frame 0 onto the frame after the last one."""
+    dt = self._step_dt
+    nxt_pos = clip["root_pos"][-1] + clip["root_lin_vel"][-1] * dt
+    nxt_yaw = quat_yaw(clip["root_quat"][-1]) + clip["root_ang_vel_w"][-1, 2] * dt
+    s = torch.tensor(stride, dtype=torch.float32, device=self.device)
+    first = planar_pose(clip["root_pos"][0], clip["root_quat"][0])
+    unrolled = se2_compose(s, first)
+    pos_err = float((unrolled[:2] - nxt_pos[:2]).norm())
+    yaw_err = abs(float(torch.remainder(unrolled[2] - nxt_yaw + math.pi, 2 * math.pi)))
+    yaw_err = abs(yaw_err - math.pi)
+    if pos_err > 0.01 or yaw_err > 0.02:
+      raise ValueError(
+        f"{name}: stride_se2 does not close the loop (position {pos_err * 1e3:.1f} mm, "
+        f"yaw {math.degrees(yaw_err):.2f} deg). Expected world-frame "
+        "P(frame T) = stride_se2 ∘ P(frame 0)."
+      )
+
+  ##
+  # Serving the reference.
+  ##
+
+  def _gather(
+    self,
+    clip: torch.Tensor,
+    f: torch.Tensor,
+    anchor: torch.Tensor,
+    z: torch.Tensor | None = None,
+  ) -> Frame:
+    """The reference of ``clip`` at unbounded frame ``f >= 0``, loops unrolled, under
+    ``anchor`` and raised by ``z``. Every argument is per env (or per selected env)."""
+    n = self.num_frames[clip]
+    wraps = torch.div(f, n, rounding_mode="floor")
+    g = f - wraps * n
+    a = self._unroll(anchor, clip, wraps)
+    cos, sin = torch.cos(a[:, 2]), torch.sin(a[:, 2])
+    d = self.data
+    root_pos = _rotate_xy(d["root_pos"][clip, g], cos, sin)
+    site_pos = _rotate_xy(d["site_pos"][clip, g], cos, sin)
+    height = torch.zeros_like(a[:, :1]) if z is None else z[:, None]
+    shift = torch.cat([a[:, :2], height], dim=-1)
+    return {
+      "root_pos": root_pos + shift,
+      "root_quat": quat_mul(_yaw_quat(a[:, 2]), d["root_quat"][clip, g]),
+      "root_lin_vel": _rotate_xy(d["root_lin_vel"][clip, g], cos, sin),
+      "root_ang_vel_w": _rotate_xy(d["root_ang_vel_w"][clip, g], cos, sin),
+      "joint_pos": d["joint_pos"][clip, g],
+      "joint_vel": d["joint_vel"][clip, g],
+      "site_pos": site_pos + shift[:, None, :],
+      "rpos": _rotate_xy(d["rpos"][clip, g], cos, sin),
+      "rangles": d["rangles"][clip, g],
+      "rvel": d["rvel"][clip, g],
+      "v_rel": _rotate_xy(d["v_rel"][clip, g], cos, sin),
+      "omega_rel": d["omega_rel"][clip, g],
+    }
+
+  def _unroll(
+    self, anchor: torch.Tensor, clip: torch.Tensor, wraps: torch.Tensor
+  ) -> torch.Tensor:
+    """``anchor ∘ stride**wraps``: the anchor of the ``wraps``-th loop."""
+    stride = self.strides[clip]
+    a = anchor
+    for i in range(self._max_wraps):
+      a = torch.where((wraps > i)[:, None], se2_compose(a, stride), a)
+    return a
+
+  def _root_xy(
+    self, clip: torch.Tensor, x: torch.Tensor, anchor: torch.Tensor
+  ) -> torch.Tensor:
+    """(B, 2) the anchored root xy of ``clip`` at unbounded fractional frame ``x``."""
+
+    def at(f: torch.Tensor) -> torch.Tensor:
+      n = self.num_frames[clip]
+      wraps = torch.div(f, n, rounding_mode="floor")
+      a = self._unroll(anchor, clip, wraps)
+      p = self.data["root_pos"][clip, f - wraps * n]
+      c, s = torch.cos(a[:, 2]), torch.sin(a[:, 2])
+      return (
+        torch.stack([c * p[:, 0] - s * p[:, 1], s * p[:, 0] + c * p[:, 1]], -1)
+        + (a[:, :2])
+      )
+
+    lo = x.floor().long()
+    return torch.lerp(at(lo), at(lo + 1), (x - lo.float())[:, None])
+
+  @property
+  def alpha(self) -> torch.Tensor:
+    """(B,) the current clip's blend weight: 1 when no blend is running."""
+    return self.blend_count.float() / self.blend_steps
+
+  def _outgoing(self, ids: torch.Tensor | slice, offset: int) -> Frame:
+    """The outgoing clip ``offset`` steps ahead on its own clock, with velocities
+    scaled to that clock's rate."""
+    prev = self.clip_prev[ids]
+    rate = self.rate_prev[ids]
+    x = self.frame_prev[ids] + offset * rate
+    lo = x.floor().long()
+    frac = x - lo.float()
+    anchor, z = self.anchor_prev[ids], self.z_offset[ids]
+    a, b = self._gather(prev, lo, anchor, z), self._gather(prev, lo + 1, anchor, z)
+    out = {k: torch.lerp(a[k], b[k], _bcast(frac, a[k])) for k in a if k != "root_quat"}
+    out["root_quat"] = _nlerp(a["root_quat"], b["root_quat"], frac)
+    for k in _VELOCITIES:
+      out[k] = out[k] * _bcast(rate, out[k])
+    return out
+
+  def _serve(self, offset: int, ids: torch.Tensor | slice = slice(None)) -> Frame:
+    clip = self.clip[ids]
+    f = self.frame[ids] + offset
+    cur = self._gather(clip, f, self.anchor[ids], self.z_offset[ids])
+    count = self.blend_count[ids]
+    alpha = (count + offset).clamp(max=self.blend_steps).float() / self.blend_steps
+    blending = alpha < 1.0
+    old = self._outgoing(ids, offset)
+    alpha_dot = torch.where(
+      blending, torch.full_like(alpha, self._alpha_rate), torch.zeros_like(alpha)
+    )
+    mixed: Frame = {}
+    for k in _POSITIONS:
+      mixed[k] = torch.lerp(old[k], cur[k], _bcast(alpha, cur[k]))
+    mixed["root_quat"] = _nlerp(old["root_quat"], cur["root_quat"], alpha)
+    for vel, pos in _VELOCITY_OF.items():
+      mixed[vel] = torch.lerp(old[vel], cur[vel], _bcast(alpha, cur[vel])) + _bcast(
+        alpha_dot, cur[vel]
+      ) * (cur[pos] - old[pos])
+    # The two clips' roots drift apart in xy at their speed difference, so a lerp of
+    # absolute positions would overshoot to catch up. The served root instead moves at
+    # the lerp of their velocities: its xy trails the lerp by catchup, (1/T_blend) times
+    # the integral of the gap, and its xy velocity loses the alpha_dot term.
+    mixed["root_lin_vel"][:, :2] -= alpha_dot[:, None] * (
+      cur["root_pos"][:, :2] - old["root_pos"][:, :2]
+    )
+    q_old = old["root_quat"]
+    q_cur = torch.where(
+      (q_old * cur["root_quat"]).sum(-1, keepdim=True) < 0.0,
+      -cur["root_quat"],
+      cur["root_quat"],
+    )
+    turn = axis_angle_from_quat(quat_mul(q_cur, quat_conjugate(q_old)))
+    mixed["root_ang_vel_w"] = (
+      torch.lerp(old["root_ang_vel_w"], cur["root_ang_vel_w"], alpha[:, None])
+      + alpha_dot[:, None] * turn
+    )
+    mixed["rvel"] = torch.lerp(old["rvel"], cur["rvel"], _bcast(alpha, cur["rvel"]))
+    served = {
+      k: torch.where(_bcast(blending, v), mixed[k], v) if k in mixed else v
+      for k, v in cur.items()
+    }
+    # Catch-up at this offset: the state's value, plus the step to come (rectangle
+    # rule, as ``_update_command`` integrates it) while the blend is still running.
+    gap = cur["root_pos"][:, :2] - old["root_pos"][:, :2]
+    running = (count < self.blend_steps) & (offset > 0)
+    catchup = self.catchup[ids] + (
+      running.float()[:, None] * (offset * self._step_dt * self._alpha_rate) * gap
+    )
+    served["root_pos"] = served["root_pos"].clone()
+    served["root_pos"][:, :2] -= catchup
+    served["site_pos"] = served["site_pos"].clone()
+    served["site_pos"][..., :2] -= catchup[:, None, :]
+    return served
+
+  @staticmethod
+  def _as_reference(f: Frame) -> MimicReference:
+    return MimicReference(
+      root_pos_w=f["root_pos"],
+      root_quat=f["root_quat"],
+      root_lin_vel_w=f["root_lin_vel"],
+      root_ang_vel_b=quat_apply_inverse(f["root_quat"], f["root_ang_vel_w"]),
+      joint_pos=f["joint_pos"],
+      joint_vel=f["joint_vel"],
+      site_pos_w=f["site_pos"],
+      rpos=f["rpos"],
+      rangles=f["rangles"],
+      rvel=f["rvel"],
+      v_rel=f["v_rel"],
+      omega_rel=f["omega_rel"],
+    )
+
+  ##
+  # The imitation terms' interface (``osl_mimic.mdp.reference``).
+  ##
+
+  def reference(self, offset: int) -> MimicReference:
+    if offset not in self._cache:
+      self._cache[offset] = self._as_reference(self._serve(offset))
+    return self._cache[offset]
+
+  def lookahead(self) -> MimicLookahead:
+    """The goal's lookahead, on the current clip (a blend is not looked through)."""
+    now = self._gather(self.clip, self.frame, self.anchor)
+    deltas, qvel_deltas, rpos = [], [], []
+    qvel_now = self._root_qvel(now)
+    for i in range(1, self.cfg.lookahead_steps):
+      future = self._gather(
+        self.clip, self.frame + i * self.cfg.lookahead_stride, self.anchor
+      )
+      deltas.append(future["root_pos"] - now["root_pos"])
+      qvel_deltas.append(self._root_qvel(future) - qvel_now)
+      rpos.append(future["rpos"])
+    return MimicLookahead(
+      root_pos_delta=torch.stack(deltas, dim=1),
+      root_qvel_delta=torch.stack(qvel_deltas, dim=1),
+      rpos=torch.stack(rpos, dim=1),
+    )
+
+  @staticmethod
+  def _root_qvel(f: Frame) -> torch.Tensor:
+    ang_b = quat_apply_inverse(f["root_quat"], f["root_ang_vel_w"])
+    return torch.cat([f["root_lin_vel"], ang_b], dim=-1)
+
+  @property
+  def phase(self) -> torch.Tensor:
+    """Stride phase in [0, 1): ``frame / T`` of the current clip."""
+    return self.frame.float() / self.num_frames[self.clip].float()
+
+  @property
+  def is_idle(self) -> torch.Tensor:
+    if self.idle_clip is None:
+      return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+    return self.clip == self.idle_clip
+
+  @property
+  def reference_jumped(self) -> torch.Tensor:
+    return (self._env.common_step_counter - self._jump_step) == 1
+
+  @property
+  def root_qpos(self) -> torch.Tensor:
+    return self.robot.data.data.qpos[:, self.robot.indexing.free_joint_q_adr]
+
+  @property
+  def root_qvel(self) -> torch.Tensor:
+    return self.robot.data.data.qvel[:, self.robot.indexing.free_joint_v_adr]
+
+  def site_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    data = self.robot.data
+    ids = self.site_body_ids
+    return (
+      data.body_link_pos_w[:, ids],
+      matrix_from_quat(data.body_link_quat_w[:, ids]),
+      data.body_link_ang_vel_w[:, ids],
+      data.body_link_lin_vel_w[:, ids],
+    )
+
+  @property
+  def command(self) -> torch.Tensor:
+    return self.twist_command
+
+  ##
+  # Twist sampling (sesteban's unicycle sampler) and snapping.
+  ##
+
+  def _uniform(self, bounds: tuple[float, float], n: int) -> torch.Tensor:
+    return torch.empty(n, device=self.device).uniform_(bounds[0], bounds[1])
+
+  def _sign(self, n: int) -> torch.Tensor:
+    return torch.where(torch.rand(n, device=self.device) < 0.5, -1.0, 1.0)
+
+  def _sample_twist(self, n: int) -> torch.Tensor:
+    cfg = self.cfg
+    twist = torch.zeros(n, 3, device=self.device)
+    mode = torch.rand(n, device=self.device)
+    is_turn = (mode >= cfg.rel_static_envs) & (
+      mode < cfg.rel_static_envs + cfg.rel_turn_envs
+    )
+    is_arc = mode >= cfg.rel_static_envs + cfg.rel_turn_envs
+    back = torch.rand(n, device=self.device) < cfg.rel_back_envs
+    vx = torch.where(
+      back, self._uniform(cfg.vx_bck_range, n), self._uniform(self.vx_fwd_range, n)
+    )
+    arc_wz = self._uniform(cfg.arc_wz_range, n) * self._sign(n)
+    pivot_wz = self._uniform(cfg.wz_range, n) * self._sign(n)
+    twist[:, 0] = torch.where(is_arc, vx, twist[:, 0])
+    twist[:, 2] = torch.where(is_arc, arc_wz, torch.where(is_turn, pivot_wz, 0.0))
+    return twist
+
+  def _snap(self, twist: torch.Tensor) -> torch.Tensor:
+    dist = ((self.twists[None] - twist[:, None]) ** 2 * self._metric).sum(-1)
+    return torch.argmin(dist, dim=-1)
+
+  ##
+  # CommandTerm interface.
+  ##
+
+  def reset(self, env_ids: torch.Tensor | slice | None) -> dict[str, float]:
+    self._episode_reset = True
+    try:
+      return super().reset(env_ids)
+    finally:
+      self._episode_reset = False
+
+  def _update_metrics(self) -> None:
+    pass
+
+  def _resample_command(self, env_ids: torch.Tensor) -> None:
+    if len(env_ids) == 0:
+      return
+    if self._episode_reset:
+      self._start_episode(env_ids)
+    else:
+      self._switch(env_ids)
+    self._cache.clear()
+
+  def _start_episode(self, env_ids: torch.Tensor) -> None:
+    n = len(env_ids)
+    if self.cfg.fixed_clips:
+      clip = env_ids % self.num_clips
+      twist = self.twists[clip].clone()
+      frame = torch.zeros(n, dtype=torch.long, device=self.device)
+    else:
+      twist = self._sample_twist(n)
+      clip = self._snap(twist)
+      length = self.num_frames[clip]
+      frame = (torch.rand(n, device=self.device) * length).long().clamp(max=length - 1)
+    if self.idle_clip is not None:
+      twist[clip == self.idle_clip] = 0.0
+
+    origins = self._env.scene.env_origins[env_ids]
+    start = self.data["root_pos"][clip, frame]
+    anchor = torch.zeros(n, 3, device=self.device)
+    anchor[:, :2] = origins[:, :2] - start[:, :2]
+    self.clip[env_ids] = clip
+    self.frame[env_ids] = frame
+    self.twist_command[env_ids] = twist
+    self.anchor[env_ids] = anchor
+    self.z_offset[env_ids] = origins[:, 2]
+    self.clip_prev[env_ids] = clip
+    self.anchor_prev[env_ids] = anchor
+    self.frame_prev[env_ids] = frame.float()
+    self.rate_prev[env_ids] = 1.0
+    self.blend_count[env_ids] = self.blend_steps
+    self.catchup[env_ids] = 0.0
+    self._jump_step[env_ids] = -10
+    self._just_reset[env_ids] = True
+
+    ref = self._serve(0, env_ids)
+    root_state = torch.cat(
+      [ref["root_pos"], ref["root_quat"], ref["root_lin_vel"], ref["root_ang_vel_w"]],
+      dim=-1,
+    )
+    self.robot.write_joint_state_to_sim(
+      ref["joint_pos"], ref["joint_vel"], env_ids=env_ids
+    )
+    self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
+    self.robot.reset(env_ids=env_ids)
+
+  def _switch(self, env_ids: torch.Tensor) -> None:
+    """Timer resample: new twist, phase-preserving clip switch, blend, re-base."""
+    if self.cfg.fixed_clips:
+      return
+    old_clip, old_frame = self.clip[env_ids], self.frame[env_ids]
+    if self.cfg.rebase_on_resample:
+      data = self.robot.data
+      target = planar_pose(
+        data.root_link_pos_w[env_ids], data.root_link_quat_w[env_ids]
+      )
+    else:
+      served = self._serve(0, env_ids)
+      target = planar_pose(served["root_pos"], served["root_quat"])
+
+    twist = self._sample_twist(len(env_ids))
+    clip = self._snap(twist)
+    if self.idle_clip is not None:
+      twist[clip == self.idle_clip] = 0.0
+    n_old, n_new = self.num_frames[old_clip], self.num_frames[clip]
+    same = clip == old_clip
+    raw = torch.round(old_frame.float() * n_new.float() / n_old.float()).long()
+    frame = torch.where(same, old_frame, raw % n_new)
+
+    # The outgoing clip's clock. Into a gait: sesteban's shared phase, the old clip
+    # time-warped onto the new period. Into idle, whose 50 frames are no period: the
+    # old clip keeps its own frame and speed, so the reference slows to a stand
+    # instead of sprinting through a warped stride.
+    into_gait = torch.ones_like(same)
+    if self.idle_clip is not None:
+      into_gait = clip != self.idle_clip
+    warp = n_old.float() / n_new.float()
+    x = torch.where(into_gait, frame.float() * warp, old_frame.float())
+    rate = torch.where(into_gait, warp, torch.ones_like(warp))
+
+    # Anchors that put both clips' served root at the target pose right now.
+    new_root = self.data["root_planar"][clip, frame]
+    anchor = se2_compose(target, se2_inverse(new_root))
+    old_root = self._clip_planar(old_clip, x)
+    anchor_prev = se2_compose(target, se2_inverse(old_root))
+
+    self.clip[env_ids] = clip
+    self.frame[env_ids] = frame
+    self.twist_command[env_ids] = twist
+    self.anchor[env_ids] = anchor
+    self.clip_prev[env_ids] = torch.where(same, clip, old_clip)
+    self.anchor_prev[env_ids] = torch.where(same[:, None], anchor, anchor_prev)
+    self.frame_prev[env_ids] = torch.where(same, frame.float(), x)
+    self.rate_prev[env_ids] = torch.where(same, torch.ones_like(rate), rate)
+    self.blend_count[env_ids] = torch.where(
+      same, self.blend_count[env_ids], torch.zeros_like(frame)
+    )
+    self.catchup[env_ids] = 0.0
+    self._jump_step[env_ids] = self._env.common_step_counter
+
+  def _clip_planar(self, clip: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """A clip's raw root planar pose at fractional frame ``x`` in [0, T), unrolled."""
+    lo = x.floor().long()
+    frac = x - lo.float()
+    identity = torch.zeros(clip.shape[0], 3, device=self.device)
+    a = self._gather(clip, lo, identity)
+    b = self._gather(clip, lo + 1, identity)
+    pa = planar_pose(a["root_pos"], a["root_quat"])
+    pb = planar_pose(b["root_pos"], b["root_quat"])
+    turn = torch.remainder(pb[:, 2] - pa[:, 2] + math.pi, 2 * math.pi) - math.pi
+    out = torch.lerp(pa, pb, frac[:, None])
+    out[:, 2] = pa[:, 2] + frac * turn
+    return out
+
+  def _update_command(self, env_ids: torch.Tensor | None) -> None:
+    if env_ids is None:
+      step = (~self._just_reset).long()
+      advanced = self.frame + step
+      n = self.num_frames[self.clip]
+      wrapped = advanced >= n
+      self.frame = torch.where(wrapped, advanced - n, advanced)
+      self.anchor = torch.where(
+        wrapped[:, None], se2_compose(self.anchor, self.strides[self.clip]), self.anchor
+      )
+      # The outgoing clip advances on its own clock and loops at its own length.
+      x = self.frame_prev + step.float() * self.rate_prev
+      n_prev = self.num_frames[self.clip_prev].float()
+      wrapped_prev = x >= n_prev
+      self.frame_prev = torch.where(wrapped_prev, x - n_prev, x)
+      self.anchor_prev = torch.where(
+        wrapped_prev[:, None],
+        se2_compose(self.anchor_prev, self.strides[self.clip_prev]),
+        self.anchor_prev,
+      )
+      blending = (self.blend_count < self.blend_steps) & (step > 0)
+      self.blend_count = self.blend_count + blending.long()
+      gap = self._root_xy(self.clip, self.frame.float(), self.anchor) - self._root_xy(
+        self.clip_prev, self.frame_prev, self.anchor_prev
+      )
+      self.catchup = (
+        self.catchup
+        + blending.float()[:, None] * (self._step_dt * self._alpha_rate) * gap
+      )
+      # Blend over: the served root is the new clip's, shifted by the catch-up.
+      done = blending & (self.blend_count >= self.blend_steps)
+      self.anchor[:, :2] -= done.float()[:, None] * self.catchup
+      self.catchup = self.catchup * (~done).float()[:, None]
+      # The served velocity loses its alpha_dot term at the next step's reward, when
+      # the blend completes; the CLF must not difference across that.
+      ending = self.blend_count == self.blend_steps - 1
+      self._jump_step = torch.where(
+        ending,
+        torch.full_like(self._jump_step, self._env.common_step_counter),
+        self._jump_step,
+      )
+      self._just_reset.zero_()
+    else:
+      self._just_reset[env_ids] = False
+    self._cache.clear()

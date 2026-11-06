@@ -9,8 +9,11 @@ Four variants are vendored, selected by ``model`` and ``socket``:
 
 * ``model="robot"``: the joint-actuated twin, fingers removed. 27 position servos
   plus the 2 OSL torque motors. nq 80 (rigid) / 84 (compliant).
-* ``model="msk"``: the musculoskeletal model, fingers kept. 401 Hill-type muscles on
-  spatial tendons plus the same 2 OSL torque motors. nq 120 / 124.
+* ``model="msk"``: the musculoskeletal model. 339 Hill-type muscles on spatial
+  tendons plus the same 2 OSL torque motors, nq 80 / 84. The source XML also has 40
+  finger joints and 62 finger muscles; :func:`get_spec` deletes them by default,
+  exactly as musclemimic's ``disable_fingers`` does, which leaves a skeleton
+  identical to the robot's. ``fingers=True`` keeps them (401 muscles, nq 120 / 124).
 * ``socket="compliant"`` adds the four socket DoFs (``socket_piston``,
   ``socket_rotation_1..3``) between the residual femur and the prosthesis.
 
@@ -43,6 +46,7 @@ from mjlab.utils.spec_config import CollisionCfg
 
 Model = Literal["robot", "msk"]
 Socket = Literal["rigid", "compliant"]
+Collision = Literal["mjlab", "xml"]
 
 ##
 # MJCF and assets.
@@ -108,6 +112,32 @@ SOCKET_JOINTS: tuple[str, ...] = (
   "socket_rotation_3",
 )
 
+# musclemimic's exact finger lists (``environments/humanoids/osl_fullbody.py``).
+# Exact names, never patterns: the v3 export renamed four right-hand joints (no
+# ``_r``) and the left-arm muscles (``_left`` -> ``_l``), and finger names prefix one
+# another (``cmc_flexion`` / ``cmc_flexion_l``).
+FINGER_JOINTS: tuple[str, ...] = (
+  "cmc_flexion", "cmc_abduction", "mp_flexion_r", "ip_flexion_r", "mcp2_flexion_r",
+  "mcp2_abduction_r", "mcp3_flexion_r", "mcp3_abduction_r", "mcp4_flexion_r",
+  "mcp4_abduction_r", "mcp5_flexion_r", "mcp5_abduction_r", "md2_flexion_r",
+  "md3_flexion", "md4_flexion_r", "md5_flexion_r", "pm2_flexion_r", "pm3_flexion_r",
+  "pm4_flexion", "pm5_flexion_r", "cmc_flexion_l", "cmc_abduction_l", "mp_flexion_l",
+  "ip_flexion_l", "mcp2_flexion_l", "mcp2_abduction_l", "mcp3_flexion_l",
+  "mcp3_abduction_l", "mcp4_flexion_l", "mcp4_abduction_l", "mcp5_flexion_l",
+  "mcp5_abduction_l", "md2_flexion_l", "md3_flexion_l", "md4_flexion_l",
+  "md5_flexion_l", "pm2_flexion_l", "pm3_flexion_l", "pm4_flexion_l", "pm5_flexion_l",
+)  # fmt: skip
+
+FINGER_MUSCLES: tuple[str, ...] = (
+  "FDS2", "FDS3", "FDS4", "FDS5", "FDP2", "FDP3", "FDP4", "FDP5", "EDC2", "EDC3",
+  "EDC4", "EDC5", "EDM", "EIP", "EPL", "EPB", "FPL", "APL", "OP", "RI2", "RI3", "RI4",
+  "RI5", "LU_RB2", "LU_RB3", "LU_RB4", "LU_RB5", "UI_UB2", "UI_UB3", "UI_UB4",
+  "UI_UB5", "FDS2_l", "FDS3_l", "FDS4_l", "FDS5_l", "FDP2_l", "FDP3_l", "FDP4_l",
+  "FDP5_l", "EDC2_l", "EDC3_l", "EDC4_l", "EDC5_l", "EDM_l", "EIP_l", "EPL_l",
+  "EPB_l", "FPL_l", "APL_l", "OP_l", "RI2_l", "RI3_l", "RI4_l", "RI5_l", "LU_RB2_l",
+  "LU_RB3_l", "LU_RB4_l", "LU_RB5_l", "UI_UB2_l", "UI_UB3_l", "UI_UB4_l", "UI_UB5_l",
+)  # fmt: skip
+
 
 def _strip_scene(spec: mujoco.MjSpec) -> None:
   """Remove everything that is scene furniture rather than robot.
@@ -156,9 +186,15 @@ def _reparameterize_servos(spec: mujoco.MjSpec) -> None:
       before:  F = Kp * (midpoint + half_range * ctrl - q) - Kd * qdot
       after:   F = Kp * (ctrl - q) - Kd * qdot
 
-  Kp, Kd, ``forcerange`` and the reachable target set are all unchanged; only the
-  units the policy commands in change, from a fraction of travel to radians. The
-  recovered ``ctrlrange`` reproduces the joint's own range.
+  Kp, Kd and ``forcerange`` are unchanged; only the units the policy commands in
+  change, from a fraction of travel to radians. The recovered ``ctrlrange``
+  reproduces the joint's own range.
+
+  The command is no longer *clamped* to that range, which is G1's convention. The
+  clamp left ``knee_angle_l`` up to 174 N·m short of its force limit in up to 18.6%
+  of tracking steps, because a servo near its stop cannot command past it. The range
+  is kept, unenforced, so a task that wants musclemimic's clamp can read it and clip
+  its actions (``tasks/osl_mimic`` does).
 
   It also makes ``rl.exporter_utils.get_base_metadata`` correct for these actuators,
   since it reads ``gainprm[0]`` as stiffness -- which in the normalized form would
@@ -180,6 +216,7 @@ def _reparameterize_servos(spec: mujoco.MjSpec) -> None:
     actuator.biasprm[1] = -stiffness
     actuator.biasprm[2] = -damping
     actuator.ctrlrange = (midpoint - half_range, midpoint + half_range)
+    actuator.ctrllimited = mujoco.mjtLimited.mjLIMITED_FALSE
 
 
 def _strip_keyframes(spec: mujoco.MjSpec) -> None:
@@ -197,13 +234,55 @@ def _strip_keyframes(spec: mujoco.MjSpec) -> None:
   spec.nkey = 0
 
 
-def get_spec(model: Model = "robot", socket: Socket = "rigid") -> mujoco.MjSpec:
+def _delete_fingers(spec: mujoco.MjSpec) -> None:
+  """Delete the 40 finger joints, the 62 finger muscles and their tendons.
+
+  A mirror of musclemimic's ``OSLFullBody._delete_fingers``. The hand bodies stay,
+  welded to the wrist with their masses unchanged; no equality, pair, exclude or
+  sensor references a finger. The extrinsic finger muscles cross the wrist, so wrist
+  capacity roughly halves -- the same as in musclemimic.
+
+  Must run after :func:`_strip_keyframes`: deleting a joint from a spec that still
+  has keyframes fails to compile ("keyframe 'stand': invalid qpos size").
+  """
+  joints = [j for j in spec.joints if j.name in FINGER_JOINTS]
+  muscles = [a for a in spec.actuators if a.name in FINGER_MUSCLES]
+  if len(joints) != len(FINGER_JOINTS) or len(muscles) != len(FINGER_MUSCLES):
+    raise ValueError(
+      f"Expected {len(FINGER_JOINTS)} finger joints and {len(FINGER_MUSCLES)} finger "
+      f"muscles, found {len(joints)} and {len(muscles)}. Was the model regenerated?"
+    )
+  tendon_names = {a.target for a in muscles}
+  tendons = [t for t in spec.tendons if t.name in tendon_names]
+  if len(tendons) != len(tendon_names):
+    raise ValueError(
+      f"Finger muscles target {len(tendon_names)} tendons, found {len(tendons)}."
+    )
+  for element in (*muscles, *tendons, *joints):
+    spec.delete(element)
+
+
+def get_spec(
+  model: Model = "robot", socket: Socket = "rigid", fingers: bool = False
+) -> mujoco.MjSpec:
+  """Load a variant and apply every adaptation mjlab needs.
+
+  Args:
+    model: ``"robot"`` (position servos) or ``"msk"`` (muscles).
+    socket: ``"rigid"`` or ``"compliant"``.
+    fingers: Keep the musculoskeletal model's 40 finger joints and 62 finger
+      muscles. The default deletes them, as musclemimic does. The robot has none.
+  """
+  if fingers and model != "msk":
+    raise ValueError("Only the musculoskeletal model has fingers to keep.")
   # Load by absolute path: MuJoCo resolves the musculoskeletal model's nested
   # include and skybox against the main file's directory.
   spec = mujoco.MjSpec.from_file(str(OSL_XMLS[(model, socket)]))
   _strip_scene(spec)
   _reparameterize_servos(spec)
   _strip_keyframes(spec)
+  if model == "msk" and not fingers:
+    _delete_fingers(spec)
   return spec
 
 
@@ -224,11 +303,24 @@ def get_msk_compliant_spec() -> mujoco.MjSpec:
   return get_spec("msk", "compliant")
 
 
+def get_msk_fingers_spec() -> mujoco.MjSpec:
+  return get_spec("msk", "rigid", fingers=True)
+
+
+def get_msk_compliant_fingers_spec() -> mujoco.MjSpec:
+  return get_spec("msk", "compliant", fingers=True)
+
+
 _SPEC_FNS = {
   ("robot", "rigid"): get_robot_spec,
   ("robot", "compliant"): get_robot_compliant_spec,
   ("msk", "rigid"): get_msk_spec,
   ("msk", "compliant"): get_msk_compliant_spec,
+}
+
+_FINGERED_SPEC_FNS = {
+  "rigid": get_msk_fingers_spec,
+  "compliant": get_msk_compliant_fingers_spec,
 }
 
 
@@ -383,8 +475,8 @@ _SERVOS = XmlActuatorCfg(target_names_expr=SERVO_JOINTS, command_field="position
 _OSL_MOTORS = XmlActuatorCfg(
   target_names_expr=OSL_TORQUE_JOINTS, command_field="effort"
 )
-# The 401 muscle tendons are ``<muscle>_tendon`` (``_tendon_l`` on 63 left-arm
-# muscles). The pattern leaves out the 8 passive shoulder ligaments, which carry no
+# The muscle tendons (339, or 401 with fingers) are ``<muscle>_tendon``
+# (``_tendon_l`` on the left-arm muscles). The pattern leaves out the 8 passive shoulder ligaments, which carry no
 # actuator, and matches no joint or site, which Entity would warn about.
 MUSCLE_TENDONS_EXPR = r"^.*_tendon(_l)?$"
 _MUSCLES = XmlActuatorCfg(
@@ -400,15 +492,26 @@ _MUSCLES = XmlActuatorCfg(
 _SOFT_JOINT_POS_LIMIT_FACTOR = 1.0
 
 
-def get_osl_robot_cfg(socket: Socket = "rigid") -> EntityCfg:
+def _collisions(collision: Collision) -> tuple[CollisionCfg, ...]:
+  return (FULL_COLLISION,) if collision == "mjlab" else ()
+
+
+def get_osl_robot_cfg(
+  socket: Socket = "rigid", collision: Collision = "mjlab"
+) -> EntityCfg:
   """Get a fresh OSL full-body robot configuration instance.
 
   Returns a new EntityCfg instance each time to avoid mutation issues when
   the config is shared across multiple places.
+
+  Args:
+    socket: ``"rigid"`` or ``"compliant"``.
+    collision: ``"mjlab"`` applies :data:`FULL_COLLISION`; ``"xml"`` keeps the
+      model's own contact settings, which is what musclemimic simulates.
   """
   return EntityCfg(
     init_state=WALK_START_KEYFRAME,
-    collisions=(FULL_COLLISION,),
+    collisions=_collisions(collision),
     spec_fn=_SPEC_FNS[("robot", socket)],
     articulation=EntityArticulationInfoCfg(
       actuators=(_SERVOS, _OSL_MOTORS),
@@ -417,12 +520,20 @@ def get_osl_robot_cfg(socket: Socket = "rigid") -> EntityCfg:
   )
 
 
-def get_osl_msk_cfg(socket: Socket = "rigid") -> EntityCfg:
-  """Get a fresh OSL full-body musculoskeletal configuration instance."""
+def get_osl_msk_cfg(
+  socket: Socket = "rigid", collision: Collision = "mjlab", fingers: bool = False
+) -> EntityCfg:
+  """Get a fresh OSL full-body musculoskeletal configuration instance.
+
+  Args:
+    socket: ``"rigid"`` or ``"compliant"``.
+    collision: See :func:`get_osl_robot_cfg`.
+    fingers: Keep the 40 finger joints and 62 finger muscles (default: deleted).
+  """
   return EntityCfg(
     init_state=WALK_START_KEYFRAME,
-    collisions=(FULL_COLLISION,),
-    spec_fn=_SPEC_FNS[("msk", socket)],
+    collisions=_collisions(collision),
+    spec_fn=_FINGERED_SPEC_FNS[socket] if fingers else _SPEC_FNS[("msk", socket)],
     articulation=EntityArticulationInfoCfg(
       actuators=(_OSL_MOTORS, _MUSCLES),
       soft_joint_pos_limit_factor=_SOFT_JOINT_POS_LIMIT_FACTOR,

@@ -13,21 +13,34 @@ Added
   kernels for Blackwell GPUs.
 - Added ``SimulationCfg.graph_conditional`` to toggle MuJoCo Warp's CUDA graph
   conditional nodes, which require CUDA 12.4 or newer.
-- OSL full-body walking tracking tasks for all four ``osl_fullbody`` variants:
+- OSL full-body walking tracking tasks for the ``osl_fullbody`` robot model:
   ``Mjlab-Tracking-Flat-OSL-Fullbody`` and ``-Compliant`` (position servos and
-  prosthesis motors), ``-MSK`` and ``-MSK-Compliant`` (muscle excitations and
   prosthesis motors). Stock tracking rewards, with coupled joint resets, one motion
-  clip shared across variants, pelvis IMUs, and native PPO checkpoints and playback.
-  ONNX export is deferred for OSL.
+  clip shared across sockets, pelvis IMUs, a self-collision penalty over the model's
+  explicit contact pairs, a gravity-direction tilt termination (the stock check is
+  pitch-blind on this pelvis frame), and native PPO checkpoints and playback. ONNX
+  export is deferred for OSL.
+- ``Mjlab-Mimic-OSL-Fullbody`` tasks: musclemimic's three ``osl_fullbody`` imitation
+  configs (robot and musculoskeletal model with MimicReward, musculoskeletal model
+  with CLFReward) plus a robot CLFReward variant, each with a rigid or compliant
+  socket (``-MSK``, ``-CLF`` and ``-Compliant`` suffixes). The ``tasks/osl_mimic``
+  package reproduces musclemimic's simulation settings (100 Hz Euler control, its
+  contact model), observations (muscle state, touch, a 1 s reference lookahead),
+  reward, terminations and exact-reference random starts, and trains with its PPO:
+  16-layer SiLU/LayerNorm networks, the Muon optimizer, a linearly decaying learning
+  rate, reward normalization, no bootstrapping at episode ends and in-training
+  validation.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and
-  ``get_osl_msk_cfg`` the musculoskeletal model (401 muscles and the same 2 motors),
-  each with a rigid or compliant socket. In every variant 44 joints are driven by
-  equality constraints. The vendored MJCFs are byte-identical copies of their
-  source; the removal of the scene's floor/light/skybox and placeholder keyframes,
-  and the rewrite of the servos from normalized to radian commands, all happen in
-  ``get_spec``.
+  ``get_osl_msk_cfg`` the musculoskeletal model (339 muscles and the same 2 motors;
+  ``fingers=True`` keeps the 40 finger joints and 62 finger muscles), each with a
+  rigid or compliant socket. In every variant 44 joints are driven by equality
+  constraints. The vendored MJCFs are byte-identical copies of their source; the
+  removal of the scene's floor/light/skybox, placeholder keyframes and fingers, and
+  the rewrite of the servos from clamped normalized commands to unclamped radian
+  targets, all happen in ``get_spec``. OSL motion commands check that a clip's
+  ``fps`` equals the control rate.
 
 Changed
 ^^^^^^^

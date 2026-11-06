@@ -1,9 +1,11 @@
 """OSL motion padding, reset constraints and gravity-relative tilt termination."""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 
 import mujoco
+import numpy as np
 import torch
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import SOCKET_JOINTS, get_spec
@@ -16,21 +18,45 @@ from mjlab.utils.lab_api.math import quat_apply_inverse
 def _clip_joint_names() -> list[str]:
   """The joints a motion clip names: the rigid robot's 73, in spec order.
 
-  Clips are generated from the rigid, fingerless model, so they carry neither the
-  compliant socket's four joints nor the musculoskeletal model's 40 finger joints.
+  Clips are generated from the rigid model, so they do not carry the compliant
+  socket's four joints.
   """
   # Bind the spec: iterating the joints of a temporary spec reads freed memory.
   spec = get_spec("robot", "rigid")
   return [j.name for j in spec.joints if j.type != mujoco.mjtJoint.mjJNT_FREE]
 
 
+def check_motion_fps(motion_file: str | Path, step_dt: float) -> float:
+  """Raise unless a motion NPZ was written at the env's control rate.
+
+  mjlab's motion loaders advance one frame per env step and never read ``fps``, so a
+  clip at any other rate silently plays at the wrong speed. clipper writes ``fps``
+  into every NPZ (``--output-fps`` sets it). Returns the clip's rate.
+  """
+  with np.load(motion_file) as data:
+    if "fps" not in data:
+      raise ValueError(
+        f"{motion_file} has no 'fps' key, so its frame rate cannot be checked. "
+        "Regenerate it with clipper (--format mjlab)."
+      )
+    fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+  expected = 1.0 / step_dt
+  if abs(fps - expected) > 1e-6 * expected:
+    raise ValueError(
+      f"{motion_file} is a {fps:g} Hz clip, but this task steps at {expected:g} Hz "
+      f"(step_dt {step_dt:g} s). Re-export it with clipper's --output-fps "
+      f"{expected:g}."
+    )
+  return fps
+
+
 class OslMotionCommand(MotionCommand):
   """Pad the motion to the entity's joints and keep resets on the manifold.
 
-  One 73-joint clip serves all four variants: every variant has the same 105
-  bodies in the same order, and the clip's joints appear in each in the same
-  relative order. The joints a clip does not name -- socket and fingers -- are
-  padded with zeros, their neutral position.
+  One 73-joint clip serves every variant: all have the same 105 bodies in the same
+  order, and the clip's joints appear in each in the same relative order. The joints
+  a clip does not name -- the compliant socket's -- are padded with zeros, their
+  neutral position. The clip's frame rate must equal the control rate.
 
   Stock sampling perturbs all coordinates; dependent samples are discarded here.
   This shared write hook also covers wraparound and deterministic viewer resets.
@@ -39,6 +65,7 @@ class OslMotionCommand(MotionCommand):
   """
 
   def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRlEnv):
+    check_motion_fps(cfg.motion_file, env.step_dt)
     super().__init__(cfg, env)
     self._pad_motion_joints()
     model = env.sim.mj_model

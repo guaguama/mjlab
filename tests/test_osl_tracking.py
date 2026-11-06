@@ -1,14 +1,15 @@
-"""OSL tracking contracts for the four v3 variants.
+"""OSL tracking contracts for the two robot variants (G1-style rewards).
 
 Ordinary tests generate their own 73-joint reference clip from the rigid robot, which
-also exercises the padding every other variant needs. The real clip is checked
-separately when it is available.
+also exercises the padding the compliant socket needs. The real clip is checked
+separately when it is available. The musculoskeletal model trains with musclemimic's
+recipe instead (``tests/test_osl_mimic.py``).
 """
 
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
 import mujoco
@@ -26,7 +27,11 @@ from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.registry import load_env_cfg, load_runner_cls
 from mjlab.tasks.tracking.config.osl import OslTrackingOnPolicyRunner
 from mjlab.tasks.tracking.config.osl.env_cfgs import osl_fullbody_tracking_env_cfg
-from mjlab.tasks.tracking.config.osl.mdp import OslMotionCommand, bad_osl_anchor_ori
+from mjlab.tasks.tracking.config.osl.mdp import (
+  OslMotionCommand,
+  bad_osl_anchor_ori,
+  check_motion_fps,
+)
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.noise import UniformNoiseCfg
 
@@ -43,18 +48,6 @@ TASKS = {
     "compliant",
     77,
     {"joint_pos": 27, "osl_effort": 2},
-  ),
-  "Mjlab-Tracking-Flat-OSL-Fullbody-MSK": (
-    "msk",
-    "rigid",
-    113,
-    {"osl_effort": 2, "muscles": 401},
-  ),
-  "Mjlab-Tracking-Flat-OSL-Fullbody-MSK-Compliant": (
-    "msk",
-    "compliant",
-    117,
-    {"osl_effort": 2, "muscles": 401},
   ),
 }
 REAL_CLIP = Path(
@@ -124,7 +117,13 @@ def test_task_contract(task: str) -> None:
   assert cfg.sim.mujoco.timestep * cfg.decimation == pytest.approx(0.02)
   assert motion.body_names[:2] == ("Full Body", "pelvis")
   assert motion.anchor_body_name == "pelvis"
-  assert "self_collisions" not in cfg.rewards
+  # The 46 explicit contact pairs are active, so self collision is penalized.
+  assert "self_collisions" in cfg.rewards
+  assert [s.name for s in cfg.scene.sensors] == ["self_collision"]
+  # Pitch-aware tilt check: the stock projected-gravity-z one is blind to pitch here.
+  anchor_ori = cfg.terminations["anchor_ori"]
+  assert anchor_ori.func is bad_osl_anchor_ori
+  assert anchor_ori.params["threshold"] == 0.5
   assert play_motion.sampling_mode == "start"
   assert not play_motion.pose_range
   assert not play_motion.velocity_range
@@ -226,7 +225,7 @@ def test_padding_rejects_unknown_width(tmp_path: Path, synthetic_clip: Path) -> 
   arrays["joint_vel"] = arrays["joint_vel"][:, :70]
   bad = tmp_path / "bad.npz"
   np.savez(bad, **arrays)
-  cfg = load_env_cfg("Mjlab-Tracking-Flat-OSL-Fullbody-MSK", play=True)
+  cfg = load_env_cfg("Mjlab-Tracking-Flat-OSL-Fullbody-Compliant", play=True)
   motion = cfg.commands["motion"]
   assert isinstance(motion, MotionCommandCfg)
   motion.motion_file = str(bad)
@@ -235,16 +234,30 @@ def test_padding_rejects_unknown_width(tmp_path: Path, synthetic_clip: Path) -> 
     ManagerBasedRlEnv(cfg, device=get_test_device())
 
 
+def test_motion_fps_is_checked(tmp_path: Path, synthetic_clip: Path) -> None:
+  """A clip at another rate, or with no rate, would silently play at the wrong speed."""
+  with np.load(synthetic_clip) as clip:
+    arrays = dict(clip)
+  assert check_motion_fps(synthetic_clip, 0.02) == 50.0
+  fast = tmp_path / "fast.npz"
+  fast_arrays: dict[str, Any] = {**arrays, "fps": np.array([100.0])}
+  np.savez(fast, **fast_arrays)
+  with pytest.raises(ValueError, match="100 Hz clip"):
+    check_motion_fps(fast, 0.02)
+  unlabeled = tmp_path / "unlabeled.npz"
+  unlabeled_arrays: dict[str, Any] = {k: v for k, v in arrays.items() if k != "fps"}
+  np.savez(unlabeled, **unlabeled_arrays)
+  with pytest.raises(ValueError, match="no 'fps' key"):
+    check_motion_fps(unlabeled, 0.02)
+
+
 def test_socket_joints_are_named() -> None:
-  model = Entity(
-    osl_fullbody_tracking_env_cfg("robot", "compliant").scene.entities["robot"]
-  )
+  model = Entity(osl_fullbody_tracking_env_cfg("compliant").scene.entities["robot"])
   assert set(SOCKET_JOINTS) <= set(model.joint_names)
 
 
 def test_normalized_tilt() -> None:
-  # Same z projection, opposite tilt: a z-only comparison would miss this. Not
-  # used by the stock-behaviour tasks; kept for tuning.
+  # Same z projection, opposite tilt: a z-only comparison would miss this.
   angle = torch.tensor([0.0, 0.8])
   reference = torch.stack(
     (torch.cos(angle / 2), torch.sin(angle / 2), torch.zeros(2), torch.zeros(2)), dim=-1

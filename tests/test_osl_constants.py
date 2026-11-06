@@ -20,8 +20,8 @@ VARIANTS = list(osl_constants.OSL_XMLS)
 DIMS = {
   ("robot", "rigid"): (80, 73, 29),
   ("robot", "compliant"): (84, 77, 29),
-  ("msk", "rigid"): (120, 113, 403),
-  ("msk", "compliant"): (124, 117, 403),
+  ("msk", "rigid"): (80, 73, 341),
+  ("msk", "compliant"): (84, 77, 341),
 }
 
 
@@ -108,11 +108,11 @@ def test_command_fields_detected(variant: Variant, entity: Entity) -> None:
       if actuator.biastype == mujoco.mjtBias.mjBIAS_AFFINE:
         assert is_position_actuator(actuator)
   else:
-    assert fields.count("effort") == 403
+    assert fields.count("effort") == 341
     muscles = [
       a for a in entity.spec.actuators if a.dyntype == mujoco.mjtDyn.mjDYN_MUSCLE
     ]
-    assert len(muscles) == 401
+    assert len(muscles) == 339
     assert all(a.trntype == mujoco.mjtTrn.mjTRN_TENDON for a in muscles)
   wrapped = sum(len(a.target_names) for a in entity.actuators)
   assert wrapped == entity.spec.compile().nu
@@ -139,6 +139,8 @@ def test_servo_force_law_unchanged(
     dst_bias = model.actuator_biasprm[i]
     assert dst_gain[0] == -dst_bias[1]
     assert dst_bias[0] == 0.0
+    # The range is kept but no longer enforced (G1's convention).
+    assert not model.actuator_ctrllimited[i]
     # The recovered ctrlrange reproduces the joint's own range. Not exact: the
     # source XML writes these as float32 text, so the round trip lands within
     # ~6e-6. Note np.allclose's default rtol=1e-5 would hide this.
@@ -186,10 +188,16 @@ def test_muscles_untouched(
     pytest.skip("muscles exist only in the musculoskeletal model")
   muscles = np.flatnonzero(model.actuator_dyntype == mujoco.mjtDyn.mjDYN_MUSCLE)
   source = np.flatnonzero(source_model.actuator_dyntype == mujoco.mjtDyn.mjDYN_MUSCLE)
-  assert len(muscles) == len(source) == 401
+  assert len(muscles) == 339
+  assert len(source) == 401
+  # The 339 kept muscles are the source's non-finger muscles, parameters untouched.
+  names = [source_model.actuator(int(i)).name for i in source]
+  kept = [model.actuator(int(i)).name.split("/")[-1] for i in muscles]
+  assert kept == [n for n in names if n not in osl_constants.FINGER_MUSCLES]
+  matched = [int(source[names.index(n)]) for n in kept]
   for attr in ("actuator_gainprm", "actuator_biasprm", "actuator_dynprm"):
     np.testing.assert_array_equal(
-      getattr(model, attr)[muscles], getattr(source_model, attr)[source]
+      getattr(model, attr)[muscles], getattr(source_model, attr)[matched]
     )
 
 
@@ -266,3 +274,32 @@ def test_initial_pose_joint_names_cannot_alias(entity: Entity) -> None:
   assert len(pose) == 73
   collisions = [(a, b) for a in pose for b in names if a != b and b.startswith(a)]
   assert collisions == []
+
+
+@pytest.mark.parametrize("socket", ["rigid", "compliant"])
+def test_msk_fingerless_skeleton_matches_robot(socket: osl_constants.Socket) -> None:
+  """musclemimic's finger deletion leaves exactly the robot's joints, in order."""
+  msk, robot = (
+    osl_constants.get_spec("msk", socket),
+    osl_constants.get_spec("robot", socket),
+  )
+  msk_joints = [j.name for j in msk.joints]
+  robot_joints = [j.name for j in robot.joints]
+  assert msk_joints == robot_joints
+  compiled = msk.compile()
+  assert (compiled.nq, compiled.nu, compiled.na) == (DIMS[("msk", socket)][0], 341, 339)
+
+
+@pytest.mark.parametrize("socket", ["rigid", "compliant"])
+def test_msk_fingers_opt_in(socket: osl_constants.Socket) -> None:
+  spec = osl_constants.get_spec("msk", socket, fingers=True)
+  model = spec.compile()
+  assert model.nu == 403
+  assert model.nq == (120 if socket == "rigid" else 124)
+  names = {j.name for j in spec.joints}
+  assert set(osl_constants.FINGER_JOINTS) <= names
+
+
+def test_robot_has_no_fingers_to_keep() -> None:
+  with pytest.raises(ValueError, match="fingers"):
+    osl_constants.get_spec("robot", "rigid", fingers=True)

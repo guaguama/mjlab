@@ -1,7 +1,8 @@
-"""Full-body OSL walking tracking for the four v3 model variants.
+"""Full-body OSL walking tracking for the robot model (both socket variants).
 
 Stock mjlab tracking behaviour and rewards, following the G1 task. The deviations
-are the ones the model forces; each is commented where it is made.
+are the ones the model forces; each is commented where it is made. The
+musculoskeletal model and musclemimic's training recipe live in ``tasks/osl_mimic``.
 """
 
 from copy import deepcopy
@@ -11,28 +12,23 @@ import mujoco
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   FULL_COLLISION,
-  MUSCLE_TENDONS_EXPR,
   OSL_TORQUE_JOINTS,
   SERVO_JOINTS,
-  Model,
   Socket,
-  get_osl_msk_cfg,
   get_osl_robot_cfg,
   get_spec,
 )
 from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.envs.mdp.actions import (
-  JointEffortActionCfg,
-  JointPositionActionCfg,
-  TendonEffortActionCfg,
-)
+from mjlab.envs.mdp.actions import JointEffortActionCfg, JointPositionActionCfg
 from mjlab.managers import SceneEntityCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
+from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg
 
-from .mdp import OslMotionCommandCfg
+from .mdp import OslMotionCommandCfg, bad_osl_anchor_ori
 
 TRACKED_BODIES = (
   "Full Body",
@@ -54,6 +50,13 @@ TRACKED_BODIES = (
   "OSL_KA_L1_osl_ankle_assembly",
   "OSL_KA_L1_osl_foot_assembly",
 )
+
+# 2 ms is musclemimic's training timestep; the stock 5 ms is unsafe for the stiff
+# servos. Decimation 10 keeps step_dt at 0.02 s, so motion clips must be 50 Hz.
+# The stock implicitfast integrator treats joint damping and servo Kd implicitly, so
+# the compliant socket needs none of the Euler-damping toggle musclemimic uses.
+TIMESTEP = 0.002
+DECIMATION = 10
 
 
 def _add_tracking_imu(spec: mujoco.MjSpec) -> mujoco.MjSpec:
@@ -80,25 +83,15 @@ def tracking_robot_compliant_spec() -> mujoco.MjSpec:
   return _add_tracking_imu(get_spec("robot", "compliant"))
 
 
-def tracking_msk_spec() -> mujoco.MjSpec:
-  return _add_tracking_imu(get_spec("msk", "rigid"))
-
-
-def tracking_msk_compliant_spec() -> mujoco.MjSpec:
-  return _add_tracking_imu(get_spec("msk", "compliant"))
-
-
 _TRACKING_SPEC_FNS = {
-  ("robot", "rigid"): tracking_robot_spec,
-  ("robot", "compliant"): tracking_robot_compliant_spec,
-  ("msk", "rigid"): tracking_msk_spec,
-  ("msk", "compliant"): tracking_msk_compliant_spec,
+  "rigid": tracking_robot_spec,
+  "compliant": tracking_robot_compliant_spec,
 }
 
 
-def _entity_cfg(model: Model, socket: Socket) -> EntityCfg:
-  cfg = get_osl_robot_cfg(socket) if model == "robot" else get_osl_msk_cfg(socket)
-  cfg.spec_fn = _TRACKING_SPEC_FNS[(model, socket)]
+def _entity_cfg(socket: Socket) -> EntityCfg:
+  cfg = get_osl_robot_cfg(socket)
+  cfg.spec_fn = _TRACKING_SPEC_FNS[socket]
   return cfg
 
 
@@ -116,48 +109,49 @@ def _servo_action_scale(spec: mujoco.MjSpec) -> dict[str, float]:
 
 
 def osl_fullbody_tracking_env_cfg(
-  model: Model = "robot",
   socket: Socket = "rigid",
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
-  """Create an OSL full-body flat terrain tracking configuration."""
+  """Create an OSL full-body (robot) flat terrain tracking configuration."""
   cfg = make_tracking_env_cfg()
 
-  cfg.scene.entities = {"robot": _entity_cfg(model, socket)}
-  spec = get_spec(model, socket)
+  cfg.scene.entities = {"robot": _entity_cfg(socket)}
+  spec = get_spec("robot", socket)
 
-  osl_effort = JointEffortActionCfg(
-    entity_name="robot",
-    actuator_names=OSL_TORQUE_JOINTS,
-    preserve_order=True,
-    # Raw torque command; the motors' +-2.88 ctrlrange is never renormalized.
-    scale=1.0,
-    offset=0.0,
+  # The 46 explicit contact pairs (arms against thorax and pelvis, among others)
+  # are active even though FULL_COLLISION gives every geom contype 0: explicit pairs
+  # ignore contype/conaffinity. "Full Body" is the root, so its subtree is the
+  # whole model. One history slot per physics substep, as G1 has.
+  cfg.scene.sensors = (
+    ContactSensorCfg(
+      name="self_collision",
+      primary=ContactMatch(mode="subtree", pattern="Full Body", entity="robot"),
+      secondary=ContactMatch(mode="subtree", pattern="Full Body", entity="robot"),
+      fields=("found", "force"),
+      reduce="none",
+      num_slots=1,
+      history_length=DECIMATION,
+    ),
   )
-  if model == "robot":
-    cfg.actions = {
-      # Keeps the name the exporter looks up, although export is deferred for OSL.
-      "joint_pos": JointPositionActionCfg(
-        entity_name="robot",
-        actuator_names=SERVO_JOINTS,
-        preserve_order=True,
-        scale=_servo_action_scale(spec),
-        use_default_offset=True,
-      ),
-      "osl_effort": osl_effort,
-    }
-  else:
-    cfg.actions = {
-      "osl_effort": osl_effort,
-      # Muscle ctrlrange is [0, 1] and clamped, so a negative action is zero
-      # excitation: the same effective mapping as musclemimic's [-1, 1] range.
-      "muscles": TendonEffortActionCfg(
-        entity_name="robot",
-        actuator_names=(MUSCLE_TENDONS_EXPR,),
-        scale=1.0,
-        offset=0.0,
-      ),
-    }
+
+  cfg.actions = {
+    # Keeps the name the exporter looks up, although export is deferred for OSL.
+    "joint_pos": JointPositionActionCfg(
+      entity_name="robot",
+      actuator_names=SERVO_JOINTS,
+      preserve_order=True,
+      scale=_servo_action_scale(spec),
+      use_default_offset=True,
+    ),
+    "osl_effort": JointEffortActionCfg(
+      entity_name="robot",
+      actuator_names=OSL_TORQUE_JOINTS,
+      preserve_order=True,
+      # Raw torque command; the motors' +-2.88 ctrlrange is never renormalized.
+      scale=1.0,
+      offset=0.0,
+    ),
+  }
 
   base = cfg.commands["motion"]
   assert isinstance(base, MotionCommandCfg)
@@ -165,10 +159,6 @@ def osl_fullbody_tracking_env_cfg(
   motion.anchor_body_name = "pelvis"
   motion.body_names = TRACKED_BODIES
   cfg.commands["motion"] = motion
-
-  # The model has no self-collision sensor, and self collision is off by
-  # construction.
-  cfg.rewards.pop("self_collisions")
 
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = (
     FULL_COLLISION.geom_names_expr[0],
@@ -197,6 +187,18 @@ def osl_fullbody_tracking_env_cfg(
       n_min=tuple(-v for v in magnitudes), n_max=magnitudes
     )
 
+  # The stock check compares the z component of projected gravity in the anchor
+  # frame. The OSL pelvis frame is x forward, y up, z lateral, so that check never
+  # fires on pitch and fires on roll only past about 53 degrees. This one compares
+  # the whole gravity direction: 1 - cos(tilt error) > 0.5 is 60 degrees.
+  cfg.terminations["anchor_ori"] = TerminationTermCfg(
+    func=bad_osl_anchor_ori,
+    params={
+      "asset_cfg": SceneEntityCfg("robot"),
+      "command_name": "motion",
+      "threshold": 0.5,
+    },
+  )
   cfg.terminations["ee_body_pos"].params["body_names"] = (
     "toes_l",
     "OSL_KA_L1_osl_foot_assembly",
@@ -206,11 +208,8 @@ def osl_fullbody_tracking_env_cfg(
 
   cfg.viewer.body_name = "pelvis"
 
-  # 2 ms is musclemimic's training timestep; the stock 5 ms is unsafe for the stiff
-  # servos and for the muscles, whose damping mujoco_warp integrates explicitly.
-  # Decimation 10 keeps step_dt at the 0.02 s the 50 Hz motion NPZ assumes.
-  cfg.sim.mujoco.timestep = 0.002
-  cfg.decimation = 10
+  cfg.sim.mujoco.timestep = TIMESTEP
+  cfg.decimation = DECIMATION
   # The 44 equality rows are unconditional, so the stock 250/35 budget leaves too
   # little room under RSI; overflow silently drops constraints.
   cfg.sim.njmax = 256

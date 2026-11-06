@@ -1,0 +1,33 @@
+"""Runner settings: the MSK CLF task's, plus time-out bootstrapping."""
+
+from __future__ import annotations
+
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Socket
+from mjlab.tasks.osl_mimic.config.rl_cfg import (
+  MuscleMimicPpoCfg,
+  OslMimicRunnerCfg,
+  OslMimicValidationCfg,
+  osl_mimic_runner_cfg,
+)
+
+from .env_cfgs import EPISODE_LENGTH_S
+
+
+def osl_gait_library_runner_cfg(
+  socket: Socket, experiment_name: str
+) -> OslMimicRunnerCfg:
+  cfg = osl_mimic_runner_cfg("msk", socket, "clf", experiment_name)
+  assert isinstance(cfg.algorithm, MuscleMimicPpoCfg)
+  # Library episodes are cut off by the 10 s limit, not finished, so the critic
+  # bootstraps there (rsl_rl's default; musclemimic's clips simply end).
+  cfg.algorithm.bootstrap_time_outs = True
+  cfg.validation = OslMimicValidationCfg(
+    interval=cfg.validation.interval,
+    num_envs=0,  # One env per library clip.
+    num_steps=round(EPISODE_LENGTH_S * 100),
+    model="msk",
+    socket=socket,
+    reward="clf",
+  )
+  cfg.wandb_tags = ("osl_fullbody", "msk", "clf", "gait_library")
+  return cfg
