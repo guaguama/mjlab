@@ -30,6 +30,15 @@ Added
   16-layer SiLU/LayerNorm networks, the Muon optimizer, a linearly decaying learning
   rate, reward normalization, no bootstrapping at episode ends and in-training
   validation.
+- ``Mjlab-Gait-Library-OSL-Fullbody`` tasks: twist-commanded imitation over a
+  looping clipper gait library (``--env.commands.motion.library-dir``), for the
+  robot model with MimicReward and the musculoskeletal model with CLFReward
+  (``-MSK-CLF``), each with a rigid or compliant socket (``-Compliant``). Each is
+  the matching ``Mjlab-Mimic-OSL-Fullbody`` task with a unicycle twist command that
+  snaps to the nearest clip, keeps the stride phase across blended switches and
+  unrolls each loop by its stride displacement, plus a stride-averaged twist reward,
+  the twist and stride phase as observations, 10 s episodes with time-out
+  bootstrapping, and validation over every clip.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and

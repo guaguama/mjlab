@@ -16,6 +16,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
 from mjlab.tasks.osl_gait_library.config.env_cfgs import (
   TWIST_STD,
   TWIST_WEIGHT,
@@ -33,12 +34,16 @@ from mjlab.tasks.osl_gait_library.mdp.commands import (
   se2_inverse,
 )
 from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
+from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.config.rl_cfg import MuscleMimicPpoCfg, OslMimicRunnerCfg
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 
-TASKS = {
-  "Mjlab-Gait-Library-OSL-Fullbody-MSK-CLF": "rigid",
-  "Mjlab-Gait-Library-OSL-Fullbody-MSK-CLF-Compliant": "compliant",
+# task id -> (model, socket, reward)
+TASKS: dict[str, tuple[Model, Socket, Reward]] = {
+  "Mjlab-Gait-Library-OSL-Fullbody": ("robot", "rigid", "mimic"),
+  "Mjlab-Gait-Library-OSL-Fullbody-Compliant": ("robot", "compliant", "mimic"),
+  "Mjlab-Gait-Library-OSL-Fullbody-MSK-CLF": ("msk", "rigid", "clf"),
+  "Mjlab-Gait-Library-OSL-Fullbody-MSK-CLF-Compliant": ("msk", "compliant", "clf"),
 }
 DT = 0.01
 
@@ -49,15 +54,19 @@ DT = 0.01
 
 @pytest.mark.parametrize("task", list(TASKS))
 def test_task_contract(task: str) -> None:
-  socket = TASKS[task]
+  model, socket, reward = TASKS[task]
   cfg = load_env_cfg(task)
   assert load_runner_cls(task) is GaitLibraryOnPolicyRunner
 
-  # The MSK CLF task's simulation.
+  # The osl_mimic task's simulation and actions.
   mj = cfg.sim.mujoco
   assert mj.timestep == 0.002 and cfg.decimation == 5 and mj.integrator == "euler"
   assert ("eulerdamp" in mj.disableflags) == (socket == "rigid")
   assert cfg.episode_length_s == 10.0
+  expected_actions = (
+    ["servos", "osl_motors"] if model == "robot" else ["osl_motors", "muscles"]
+  )
+  assert list(cfg.actions) == expected_actions
 
   motion = cfg.commands["motion"]
   assert isinstance(motion, GaitLibraryCommandCfg)
@@ -71,7 +80,7 @@ def test_task_contract(task: str) -> None:
   assert {"site_deviation", "root_deviation", "root_orientation"} <= set(
     cfg.terminations
   )
-  assert cfg.rewards["mimic"].params["clf"] is not None
+  assert (cfg.rewards["mimic"].params["clf"] is not None) == (reward == "clf")
   assert cfg.rewards["twist"].weight == TWIST_WEIGHT
   assert cfg.rewards["twist"].params["std"] == TWIST_STD
 
@@ -79,11 +88,14 @@ def test_task_contract(task: str) -> None:
   assert isinstance(rl, OslMimicRunnerCfg)
   assert isinstance(rl.algorithm, MuscleMimicPpoCfg)
   assert rl.algorithm.bootstrap_time_outs
-  assert rl.validation.num_steps == 1000 and rl.validation.num_envs == 0
+  assert rl.algorithm.actor_bias_init == ("qpos0" if model == "robot" else "none")
+  assert rl.actor.distribution_cfg is not None
+  assert rl.actor.distribution_cfg["init_std"] == (0.2 if model == "robot" else 3.0)
+  v = rl.validation
+  assert v.num_steps == 1000 and v.num_envs == 0
+  assert (v.model, v.socket, v.reward) == (model, socket, reward)
 
-  validation = osl_gait_library_env_cfg(
-    "rigid" if socket == "rigid" else "compliant", mode="validation"
-  )
+  validation = osl_gait_library_env_cfg(model, socket, reward, mode="validation")
   v_motion = validation.commands["motion"]
   assert isinstance(v_motion, GaitLibraryCommandCfg) and v_motion.fixed_clips
   assert set(validation.terminations) == {"time_out", "site_deviation"}
@@ -412,11 +424,12 @@ LIBRARY = os.environ.get("MJLAB_OSL_GAIT_LIBRARY", "")
 
 @pytest.mark.slow
 @pytest.mark.skipif(not LIBRARY, reason="set MJLAB_OSL_GAIT_LIBRARY to a library dir")
-def test_library_env_rollout() -> None:
+@pytest.mark.parametrize("model, reward", [("robot", "mimic"), ("msk", "clf")])
+def test_library_env_rollout(model: Model, reward: Reward) -> None:
   """A few hundred steps with timer switches: finite rewards, a continuous reference."""
   from mjlab.envs import ManagerBasedRlEnv
 
-  cfg = osl_gait_library_env_cfg("rigid", mode="train")
+  cfg = osl_gait_library_env_cfg(model, "rigid", reward, mode="train")
   cfg.scene.num_envs = 8
   motion = cfg.commands["motion"]
   assert isinstance(motion, GaitLibraryCommandCfg)
@@ -430,9 +443,9 @@ def test_library_env_rollout() -> None:
   prev = cmd.reference(0).root_pos_w.clone()
   worst = 0.0
   for _ in range(200):
-    _, reward, terminated, truncated, _ = env.step(zero)
+    _, step_reward, terminated, truncated, _ = env.step(zero)
     jumped = cmd._jump_step == env.common_step_counter
-    assert torch.isfinite(reward).all()
+    assert torch.isfinite(step_reward).all()
     now = cmd.reference(0).root_pos_w
     moved = (now - prev)[:, :2].norm(dim=-1)
     fresh = terminated | truncated | jumped | (env.episode_length_buf <= 1)

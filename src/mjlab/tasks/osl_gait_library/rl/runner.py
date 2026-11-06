@@ -2,8 +2,9 @@
 
 Validation plays each clip (the idle one included) in its own env from phase 0 at
 its own twist, deterministically, for one 10 s episode, ending early only on the
-0.5 m site check. The metrics are the training diagnostics (CLF and twist) averaged
-over the run, plus the early-termination rate and episode length and return.
+0.5 m site check. The metrics are the training diagnostics (imitation reward, CLF
+when on, and twist) averaged over the run, plus the early-termination rate and
+episode length and return.
 """
 
 from __future__ import annotations
@@ -22,7 +23,9 @@ class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
     from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 
     v = self.validation_cfg
-    cfg = osl_gait_library_env_cfg(v["socket"], mode="validation")
+    cfg = osl_gait_library_env_cfg(
+      v["model"], v["socket"], v["reward"], mode="validation"
+    )
     train_motion = self.env.unwrapped.cfg.commands["motion"]
     motion = cfg.commands["motion"]
     assert isinstance(train_motion, GaitLibraryCommandCfg)
