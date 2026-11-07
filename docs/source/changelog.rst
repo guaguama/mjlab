@@ -39,6 +39,18 @@ Added
   unrolls each loop by its stride displacement, plus a stride-averaged twist reward,
   the twist and stride phase as observations, 10 s episodes with time-out
   bootstrapping, and validation over every clip.
+- ``Mjlab-Gait-Library-Unicycle-OSL-Fullbody`` tasks: the gait-library task over a
+  full unicycle library (forward and backward arcs, pivots, idle), for every
+  combination of model (``-MSK``), reward (``-CLF``) and socket (``-Compliant``).
+  Commands are drawn at random from the library's clips in sesteban's G1 unicycle
+  mode split, and the command takes a twist cap that a curriculum can raise
+  (``twist_limit_curriculum``). Training randomizes the physical properties (torso
+  COM and mass, foot friction, armature, servo gains, muscle and OSL motor strength),
+  pushes the body, and delays the OSL motor and human actuator commands by one
+  random lag per episode. Validation reports its metrics per clip family as well.
+- The gait-library command gained a library sampling mode, a union of sampling boxes
+  for libraries whose twist grid is not a rectangle, and a load-time check that the
+  library covers every twist the sampler can command.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and
@@ -64,6 +76,9 @@ Changed
 Fixed
 ^^^^^
 
+- OSL imitation and gait-library envs on the compliant socket no longer re-read the
+  robot model for every clip they pad; a 779-clip library took about four minutes per
+  env to load.
 - The viewer now resets recurrent policy hidden state for environments that terminate
   or time out. Previously it only reset the policy when the user pressed the reset
   button, so each auto-reset environment kept the previous episode's memory :issue:`1222`.

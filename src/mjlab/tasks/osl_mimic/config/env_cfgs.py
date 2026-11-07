@@ -59,7 +59,7 @@ DECIMATION = 5
 """100 Hz control, so motion clips must be 100 Hz."""
 EPISODE_LENGTH_S = 300.0
 """musclemimic's ``horizon: 30000`` steps. Clip ends terminate episodes long before."""
-NUM_ENVS = 2048
+NUM_ENVS = 4096
 
 # conf_osl_fullbody.yaml reward_params (the seven *_w_sum weights).
 MIMIC_WEIGHTS: dict[str, float] = {

@@ -1,32 +1,52 @@
-"""Tests for the round-1 OSL gait-library task (``mjlab.tasks.osl_gait_library``).
+"""Tests for the OSL gait-library tasks (``mjlab.tasks.osl_gait_library``).
 
 The command and twist reward are exercised on a synthetic library through a fake env
 (CPU only): loop unrolling, the phase-preserving switch with re-basing, the blend's
-velocity consistency and the stride window. The real library is checked by
-``test_library_env_rollout`` (slow; needs ``MJLAB_OSL_GAIT_LIBRARY``).
+velocity consistency, the stride window, library and continuous sampling, the
+coverage check and the twist cap. The task configs are checked for both variants,
+including the unicycle variant's domain randomization. The real libraries are
+checked by the slow rollouts (``MJLAB_OSL_GAIT_LIBRARY`` for the forward library,
+``MJLAB_OSL_UNICYCLE_LIBRARY`` for the unicycle one).
 """
 
 from __future__ import annotations
 
 import math
 import os
+import re
+from collections import Counter
 from types import SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
 import torch
+import warp as wp
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  OSL_TORQUE_JOINTS,
+  Model,
+  Socket,
+)
+from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.tasks.osl_gait_library import mdp
+from mjlab.tasks.osl_gait_library.config.dr import FOOT_GEOMS, SLIDE_SCALE, OslDrCfg
 from mjlab.tasks.osl_gait_library.config.env_cfgs import (
   TWIST_STD,
   TWIST_WEIGHT,
+  UNICYCLE_BCK_ARC_REGIONS,
+  UNICYCLE_FWD_ARC_REGIONS,
+  UNICYCLE_TWIST_METRIC_WEIGHTS,
+  UNICYCLE_WZ_RANGE,
   osl_gait_library_env_cfg,
 )
+from mjlab.tasks.osl_gait_library.config.rl_cfg import GaitLibraryRunnerCfg
 from mjlab.tasks.osl_gait_library.mdp import (
   GaitLibraryCommand,
   GaitLibraryCommandCfg,
   heading_twist,
   stride_twist,
+  twist_limit_curriculum,
 )
 from mjlab.tasks.osl_gait_library.mdp.commands import (
   planar_pose,
@@ -44,6 +64,21 @@ TASKS: dict[str, tuple[Model, Socket, Reward]] = {
   "Mjlab-Gait-Library-OSL-Fullbody-Compliant": ("robot", "compliant", "mimic"),
   "Mjlab-Gait-Library-OSL-Fullbody-MSK-CLF": ("msk", "rigid", "clf"),
   "Mjlab-Gait-Library-OSL-Fullbody-MSK-CLF-Compliant": ("msk", "compliant", "clf"),
+}
+_MODELS: tuple[tuple[Model, str], ...] = (("robot", ""), ("msk", "-MSK"))
+_REWARDS: tuple[tuple[Reward, str], ...] = (("mimic", ""), ("clf", "-CLF"))
+_SOCKETS: tuple[tuple[Socket, str], ...] = (("rigid", ""), ("compliant", "-Compliant"))
+UNICYCLE_TASKS: dict[str, tuple[Model, Socket, Reward]] = {
+  f"Mjlab-Gait-Library-Unicycle-OSL-Fullbody{m_tag}{r_tag}{s_tag}": (m, s, r)
+  for m, m_tag in _MODELS
+  for r, r_tag in _REWARDS
+  for s, s_tag in _SOCKETS
+}
+PHYSICAL_EVENTS = {
+  "torso_inertia",
+  "foot_friction",
+  "joint_armature",
+  "osl_motor_strength",
 }
 DT = 0.01
 
@@ -94,11 +129,92 @@ def test_task_contract(task: str) -> None:
   v = rl.validation
   assert v.num_steps == 1000 and v.num_envs == 0
   assert (v.model, v.socket, v.reward) == (model, socket, reward)
+  assert isinstance(rl, GaitLibraryRunnerCfg) and rl.validation.variant == "walk_fwd"
 
   validation = osl_gait_library_env_cfg(model, socket, reward, mode="validation")
   v_motion = validation.commands["motion"]
   assert isinstance(v_motion, GaitLibraryCommandCfg) and v_motion.fixed_clips
   assert set(validation.terminations) == {"time_out", "site_deviation"}
+
+  # Round 1 is unchanged: continuous sampling over the forward span, no DR.
+  assert motion.sampling == "continuous" and motion.rel_turn_envs == 0.0
+  assert not PHYSICAL_EVENTS & set(cfg.events) and "push_robot" not in cfg.events
+  assert set(_delays(cfg).values()) == {(0, 0)}
+
+
+def _delays(cfg: ManagerBasedRlEnvCfg) -> dict[str, tuple[int, int]]:
+  """(min, max) actuator lags in physics steps, OSL motors vs human actuators."""
+  entity = cfg.scene.entities["robot"]
+  assert entity.articulation is not None
+  lags = {}
+  for act in entity.articulation.actuators:
+    key = "osl" if tuple(act.target_names_expr) == OSL_TORQUE_JOINTS else "human"
+    lags[key] = (act.delay_min_lag, act.delay_max_lag)
+    if act.delay_max_lag > 0:
+      assert act.delay_hold_prob == 1.0  # one lag per episode
+  return lags
+
+
+@pytest.mark.parametrize("task", list(UNICYCLE_TASKS))
+def test_unicycle_task_contract(task: str) -> None:
+  model, socket, reward = UNICYCLE_TASKS[task]
+  cfg = load_env_cfg(task)
+  assert load_runner_cls(task) is GaitLibraryOnPolicyRunner
+  assert (cfg.rewards["mimic"].params["clf"] is not None) == (reward == "clf")
+  assert list(cfg.actions) == (
+    ["servos", "osl_motors"] if model == "robot" else ["osl_motors", "muscles"]
+  )
+  motion = cfg.commands["motion"]
+  assert isinstance(motion, GaitLibraryCommandCfg)
+  assert motion.sampling == "library" and motion.max_twist is None
+  fractions = (motion.rel_static_envs, motion.rel_turn_envs, motion.rel_back_envs)
+  assert fractions == (0.15, 0.3, 0.4)
+  assert motion.resampling_time_range == (3.0, 8.0) and motion.blend_time_s == 0.4
+
+  # Training: the physical draws (each actuator kind's strength), pushes, and the
+  # actuator delays (OSL 0-20 ms, human 20-40 ms at 2 ms steps). Perception DR off.
+  strength = {"servo_gains"} if model == "robot" else {"muscle_strength"}
+  physical = PHYSICAL_EVENTS | strength
+  assert physical | {"push_robot"} <= set(cfg.events)
+  assert not {"servo_gains", "muscle_strength"} - strength & set(cfg.events)
+  assert "osl_encoder_bias" not in set(cfg.events)
+  assert not cfg.observations["actor"].enable_corruption
+  assert _delays(cfg) == {"osl": (0, 10), "human": (10, 20)}
+
+  # Play keeps the draws and delays without pushes; validation runs the nominal
+  # model with each delay fixed at the middle of its range.
+  play = osl_gait_library_env_cfg(model, socket, reward, "play", "unicycle")
+  assert physical <= set(play.events) and "push_robot" not in play.events
+  assert _delays(play) == _delays(cfg)
+  validation = osl_gait_library_env_cfg(model, socket, reward, "validation", "unicycle")
+  assert not (physical | {"push_robot"}) & set(validation.events)
+  assert _delays(validation) == {"osl": (5, 5), "human": (15, 15)}
+
+  rl = load_rl_cfg(task)
+  assert isinstance(rl, GaitLibraryRunnerCfg)
+  v = rl.validation
+  assert (v.model, v.socket, v.reward, v.variant) == (model, socket, reward, "unicycle")
+  assert rl.experiment_name.startswith("osl_fullbody_unicycle")
+  assert "unicycle" in rl.wandb_tags
+
+
+def test_perception_switches() -> None:
+  """Encoder bias and observation noise, off by default, reach only the actor."""
+  dr_cfg = OslDrCfg(encoder_bias=True, obs_noise=True)
+  cfg = osl_gait_library_env_cfg("robot", "rigid", "mimic", "train", "unicycle", dr_cfg)
+  bias = cfg.events["osl_encoder_bias"].params
+  assert bias["asset_cfg"].joint_names == OSL_TORQUE_JOINTS  # sensing only
+  assert bias["bias_range"] == (-0.015, 0.015)
+  actor, critic = cfg.observations["actor"], cfg.observations["critic"]
+  assert actor.terms["joint_pos"].func is mdp.joint_pos_biased
+  assert critic.terms["joint_pos"].func is not mdp.joint_pos_biased
+  assert actor.enable_corruption and not critic.enable_corruption
+  noise = actor.terms["joint_pos"].noise
+  assert noise is not None
+  magnitudes = set(cast(Any, noise).n_max)
+  assert magnitudes == {0.01, 0.01 * SLIDE_SCALE}  # hinges vs slide joints
+  play = osl_gait_library_env_cfg("robot", "rigid", "mimic", "play", "unicycle", dr_cfg)
+  assert not play.observations["actor"].enable_corruption
 
 
 ##
@@ -188,7 +304,10 @@ def _fake_command(num_envs: int = 4) -> GaitLibraryCommand:
   )
   fake_robot: Any = SimpleNamespace(data=robot_data)
   cmd._env = fake_env
-  cmd.cfg = GaitLibraryCommandCfg(library_dir="synthetic", rel_static_envs=0.0)
+  # The clips are 0.3 m/s apart, so the continuous sampler's snap error reaches 0.15.
+  cmd.cfg = GaitLibraryCommandCfg(
+    library_dir="synthetic", rel_static_envs=0.0, max_snap_error=0.2
+  )
   cmd.robot = fake_robot
   cmd._step_dt = DT
   clips = [_synthetic_clip(100, 1.0), _synthetic_clip(80, 1.3, 0.2)]
@@ -210,13 +329,12 @@ def _fake_command(num_envs: int = 4) -> GaitLibraryCommand:
     )
   cmd.data["root_planar"] = planar_pose(cmd.data["root_pos"], cmd.data["root_quat"])
   cmd.num_clips = 3
+  cmd.clip_names = ["walk_a", "walk_b", "idle"]
   cmd.num_frames = torch.tensor(lengths)
   cmd.twists = torch.tensor([[1.0, 0.0, 0.0], [1.3, 0.0, 0.0], [0.0, 0.0, 0.0]])
   cmd.strides = torch.tensor([[1.0, 0.0, 0.0], [1.3 * 0.8, 0.0, 0.0], [0.0, 0.0, 0.0]])
-  cmd.idle_clip = 2
-  cmd.vx_fwd_range = (1.0, 1.3)
-  cmd._metric = torch.ones(3)
-  cmd._max_wraps = 4
+  cmd._index_library()
+  assert cmd.idle_clip == 2 and cmd.vx_fwd_range == pytest.approx((1.0, 1.3))
   n = num_envs
   cmd.clip = torch.zeros(n, dtype=torch.long)
   cmd.frame = torch.zeros(n, dtype=torch.long)
@@ -365,6 +483,201 @@ def test_idle_snaps_to_zero_twist() -> None:
 
 
 ##
+# Sampling: library draws, continuous boxes, the coverage check and the twist cap.
+##
+
+# idle, forward (two gentle, one tight), backward (two), pivots (two).
+UNICYCLE_TWISTS = [
+  [0.0, 0.0, 0.0],
+  [1.0, 0.0, 0.0],
+  [1.0, 0.0, 0.5],
+  [0.8, 0.0, 1.0],
+  [-0.6, 0.0, 0.2],
+  [-0.6, 0.0, -0.2],
+  [0.0, 0.0, 0.8],
+  [0.0, 0.0, -1.5],
+]
+UNICYCLE_SPLIT = {"rel_static_envs": 0.15, "rel_turn_envs": 0.3, "rel_back_envs": 0.4}
+
+
+def _indexed_command(twists: list[list[float]], **cfg: Any) -> GaitLibraryCommand:
+  """A command over clips that exist only as twist labels (enough to sample)."""
+  cmd = GaitLibraryCommand.__new__(GaitLibraryCommand)
+  cmd._env = cast(Any, SimpleNamespace(num_envs=1, device="cpu", common_step_counter=0))
+  cmd.cfg = GaitLibraryCommandCfg(library_dir="synthetic", **cfg)
+  cmd.twists = torch.tensor(twists)
+  cmd.num_clips = len(twists)
+  cmd.num_frames = torch.full((len(twists),), 100)
+  cmd.clip_names = [f"clip{i}" for i in range(len(twists))]
+  cmd._index_library()
+  return cmd
+
+
+def _unicycle_grid() -> list[list[float]]:
+  """The unicycle_v001 grid: idle, both forward bands, backward arcs, pivots."""
+
+  def steps(lo: float, hi: float, step: float) -> list[float]:
+    return [round(lo + i * step, 3) for i in range(round((hi - lo) / step) + 1)]
+
+  grid = [[0.0, 0.0, 0.0]]
+  grid += [[x, 0.0, z] for x in steps(0.5, 1.5, 0.05) for z in steps(-0.5, 0.5, 0.05)]
+  grid += [
+    [x, 0.0, s * z]
+    for x in steps(0.6, 1.2, 0.1)
+    for z in steps(0.6, 1.5, 0.1)
+    for s in (1, -1)
+  ]
+  grid += [[x, 0.0, z] for x in steps(-0.8, -0.5, 0.05) for z in steps(-0.5, 0.5, 0.05)]
+  grid += [[0.0, 0.0, s * z] for z in steps(0.5, 1.7, 0.05) for s in (1, -1)]
+  return grid
+
+
+def test_library_sampling_draws_labels_in_the_mode_split() -> None:
+  cmd = _indexed_command(UNICYCLE_TWISTS, sampling="library", **UNICYCLE_SPLIT)
+  torch.manual_seed(0)
+  n = 40000
+  twist, clip = cmd._draw(n)
+  torch.testing.assert_close(twist, cmd.twists[clip])  # commanded at the label
+  share = {
+    g: c / n for g, c in Counter(cmd.clip_groups[c] for c in clip.tolist()).items()
+  }
+  # sesteban's split: idle 0.15, pivots 0.30, arcs 0.55 of which 40% backward.
+  assert share["idle"] == pytest.approx(0.15, abs=0.01)
+  assert share["turn"] == pytest.approx(0.30, abs=0.01)
+  assert share["bck"] == pytest.approx(0.22, abs=0.01)
+  assert share["fwd"] + share["fwd_tight"] == pytest.approx(0.33, abs=0.01)
+  # Uniform within a mode: three forward clips, a third each.
+  assert share["fwd_tight"] == pytest.approx(0.11, abs=0.01)
+
+
+def test_library_must_hold_every_drawn_mode() -> None:
+  no_pivots = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [-0.6, 0.0, 0.0]]
+  with pytest.raises(ValueError, match="pivot"):
+    _indexed_command(no_pivots, sampling="library", **UNICYCLE_SPLIT)
+  no_backward = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+  with pytest.raises(ValueError, match="backward arc"):
+    _indexed_command(no_backward, sampling="library", **UNICYCLE_SPLIT)
+  # Continuous pivots over 0.5-1.7 rad/s are far from the two pivot clips.
+  with pytest.raises(ValueError, match="does not cover"):
+    _indexed_command(
+      UNICYCLE_TWISTS, sampling="continuous", wz_range=(0.5, 1.7), **UNICYCLE_SPLIT
+    )
+
+
+def test_unicycle_regions_cover_the_library_grid() -> None:
+  """The unicycle config's continuous sampler fits the unicycle_v001 grid (the load
+  check passes), and draws its forward arcs from the two bands by their shares."""
+  cmd = _indexed_command(
+    _unicycle_grid(),
+    sampling="continuous",
+    fwd_arc_regions=UNICYCLE_FWD_ARC_REGIONS,
+    bck_arc_regions=UNICYCLE_BCK_ARC_REGIONS,
+    wz_range=UNICYCLE_WZ_RANGE,
+    twist_metric_weights=UNICYCLE_TWIST_METRIC_WEIGHTS,
+    **UNICYCLE_SPLIT,
+  )
+  torch.manual_seed(0)
+  vx, wz, available = cmd._sample_boxes("fwd", 20000)
+  assert available
+  gentle = (vx >= 0.5) & (vx <= 1.5) & (wz <= 0.5)
+  tight = (vx >= 0.6) & (vx <= 1.2) & (wz >= 0.5) & (wz <= 1.5)
+  assert bool((gentle | tight).all())
+  assert float((wz > 0.5).float().mean()) == pytest.approx(0.25, abs=0.015)
+  twist, clip = cmd._draw(2000)
+  error = (twist - cmd.twists[clip]).abs()
+  idle = clip == cmd.idle_clip
+  assert float(error[~idle].max()) <= cmd.cfg.max_snap_error
+
+
+def test_twist_limit_caps_draws() -> None:
+  cmd = _indexed_command(UNICYCLE_TWISTS, sampling="library", **UNICYCLE_SPLIT)
+  cmd.set_twist_limit((1.0, 0.6, 0.6))
+  torch.manual_seed(0)
+  twist, clip = cmd._draw(5000)
+  assert bool((twist[:, 0] <= 1.0).all() and (twist[:, 0] >= -0.6).all())
+  assert bool((twist[:, 2].abs() <= 0.6).all())
+  # No pivot is under the cap (|wz| >= 0.8), so pivot draws idle: 0.15 + 0.30.
+  assert cmd.idle_clip is not None
+  idle = float(clip.eq(cmd.idle_clip).float().mean())
+  assert idle == pytest.approx(0.45, abs=0.03)
+  cmd.set_twist_limit(None)
+  _, clip = cmd._draw(5000)
+  assert set(clip.tolist()) == set(range(cmd.num_clips))
+  # Continuous draws are clamped to the cap and snap among the clips under it.
+  fake = _fake_command()
+  fake.set_twist_limit((1.1, 0.0, 0.0))
+  twist, clip = fake._draw(500)
+  assert bool((twist[:, 0] <= 1.1).all()) and set(clip.tolist()) == {0}
+
+
+def test_continuous_cap_truncates_the_sampling_boxes() -> None:
+  """Under a cap, continuous draws come from the boxes cut down to it: an emptied
+  mode idles instead of snapping into another, and nothing piles up at the edge."""
+  cmd = _indexed_command(
+    _unicycle_grid(),
+    sampling="continuous",
+    fwd_arc_regions=UNICYCLE_FWD_ARC_REGIONS,
+    bck_arc_regions=UNICYCLE_BCK_ARC_REGIONS,
+    wz_range=UNICYCLE_WZ_RANGE,
+    twist_metric_weights=UNICYCLE_TWIST_METRIC_WEIGHTS,
+    **UNICYCLE_SPLIT,
+  )
+  torch.manual_seed(0)
+  n = 40000
+  cmd.set_twist_limit((1.5, 0.0, 1.7))  # no backward walking
+  twist, clip = cmd._draw(n)
+  share = Counter(cmd.clip_groups[c] for c in clip.tolist())
+  assert share["bck"] == 0
+  assert share["idle"] / n == pytest.approx(0.15 + 0.55 * 0.4, abs=0.01)
+  assert share["turn"] / n == pytest.approx(0.30, abs=0.01)
+  moving = clip != cmd.idle_clip
+  error = (twist - cmd.twists[clip]).abs()[moving]
+  assert float(error.max()) <= cmd.cfg.max_snap_error
+  cmd.set_twist_limit((0.8, 0.6, 0.5))
+  twist, clip = cmd._draw(n)
+  fwd = twist[:, 0] > 0
+  assert float(twist[fwd, 0].max()) <= 0.8 and float(twist[:, 2].abs().max()) <= 0.5
+  # Uniform over vx 0.5-0.8: the top 0.01 m/s holds about 1/30 of the draws.
+  assert float((twist[fwd, 0] > 0.79).float().mean()) < 0.06
+
+
+def test_twist_limit_curriculum_stages() -> None:
+  cmd = _indexed_command(UNICYCLE_TWISTS, sampling="library", **UNICYCLE_SPLIT)
+  env = SimpleNamespace(
+    common_step_counter=0, command_manager=SimpleNamespace(get_term=lambda _: cmd)
+  )
+  stages = [
+    {"step": 0, "max_twist": (1.0, 0.6, 0.6)},
+    {"step": 800, "max_twist": None},
+  ]
+  term_cfg = SimpleNamespace(params={"command_name": "motion", "stages": stages})
+  term = twist_limit_curriculum(cast(Any, term_cfg), cast(Any, env))
+  log = term(cast(Any, env), torch.arange(2), "motion", cast(Any, stages))
+  assert cmd.twist_limit == (1.0, 0.6, 0.6)
+  assert float(log["max_wz"]) == pytest.approx(0.6)
+  env.common_step_counter = 799
+  term(cast(Any, env), torch.arange(2), "motion", cast(Any, stages))
+  assert cmd.twist_limit == (1.0, 0.6, 0.6)
+  env.common_step_counter = 800
+  log = term(cast(Any, env), torch.arange(2), "motion", cast(Any, stages))
+  assert cmd.twist_limit is None and math.isinf(float(log["max_wz"]))
+
+
+def test_validation_groups_follow_clip_families() -> None:
+  cmd = _indexed_command(UNICYCLE_TWISTS, sampling="library", **UNICYCLE_SPLIT)
+  env = SimpleNamespace(
+    num_envs=10, device="cpu", command_manager=SimpleNamespace(get_term=lambda _: cmd)
+  )
+  runner = GaitLibraryOnPolicyRunner.__new__(GaitLibraryOnPolicyRunner)
+  groups = runner._validation_groups(cast(Any, env))
+  assert set(groups) == {"idle", "fwd", "fwd_tight", "bck", "turn"}
+  # Validation env i plays clip i % 8.
+  assert groups["idle"].nonzero().flatten().tolist() == [0, 8]
+  assert groups["fwd"].nonzero().flatten().tolist() == [1, 2, 9]
+  assert groups["turn"].nonzero().flatten().tolist() == [6, 7]
+
+
+##
 # The stride-averaged twist reward.
 ##
 
@@ -458,4 +771,122 @@ def test_library_env_rollout(model: Model, reward: Reward) -> None:
     p = cmd.data["root_pos"][c, : int(cmd.num_frames[c]), :2]
     peak = max(peak, float((p[1:] - p[:-1]).norm(dim=-1).max()))
   assert worst < 1.05 * peak + 1e-4
+  env.close()
+
+
+UNICYCLE_LIBRARY = os.environ.get("MJLAB_OSL_UNICYCLE_LIBRARY", "")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+  not UNICYCLE_LIBRARY, reason="set MJLAB_OSL_UNICYCLE_LIBRARY to a library dir"
+)
+@pytest.mark.parametrize("model, reward", [("robot", "mimic"), ("msk", "clf")])
+def test_unicycle_env_rollout(model: Model, reward: Reward) -> None:
+  """The unicycle task on the real library: every draw is in range per env, the
+  actuator lags are held per episode, pushes reach the CLF, rewards stay finite."""
+  from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.tasks.osl_gait_library.mdp.events import actuator_ctrl_ids
+
+  cfg = osl_gait_library_env_cfg(model, "rigid", reward, "train", "unicycle")
+  cfg.scene.num_envs = 8
+  motion = cfg.commands["motion"]
+  assert isinstance(motion, GaitLibraryCommandCfg)
+  motion.library_dir = UNICYCLE_LIBRARY
+  motion.resampling_time_range = (0.3, 0.6)
+  cfg.events["push_robot"].interval_range_s = (0.05, 0.1)
+  device = "cuda" if torch.cuda.is_available() else "cpu"
+  env = ManagerBasedRlEnv(cfg=cfg, device=device)
+  cmd = cast(GaitLibraryCommand, env.command_manager.get_term("motion"))
+  assert cmd.num_clips == 779 and set(cmd.clip_groups) == {
+    "idle",
+    "fwd",
+    "fwd_tight",
+    "bck",
+    "turn",
+  }
+  dr_cfg = OslDrCfg()
+  robot = env.scene["robot"]
+
+  def ratio(field: str, ids: torch.Tensor, slot: int) -> torch.Tensor:
+    value = getattr(env.sim.model, field)[:, ids, slot]
+    return value / env.sim.get_default_field(field)[ids, slot]
+
+  def within(x: torch.Tensor, bounds: tuple[float, float]) -> bool:
+    return bool((x >= bounds[0] - 1e-5).all() and (x <= bounds[1] + 1e-5).all())
+
+  motors = actuator_ctrl_ids(env, robot, "motor")
+  assert motors.numel() == 2
+  assert within(ratio("actuator_gainprm", motors, 0), dr_cfg.osl_motor_strength)
+  servos = actuator_ctrl_ids(env, robot, "servo")
+  if model == "robot":
+    assert servos.numel() == 27
+    assert within(ratio("actuator_gainprm", servos, 0), dr_cfg.servo_kp)
+    assert within(ratio("actuator_biasprm", servos, 2), dr_cfg.servo_kd)
+  else:
+    muscles = actuator_ctrl_ids(env, robot, "muscle")
+    assert muscles.numel() == 339
+    force = ratio("actuator_gainprm", muscles, 2)
+    assert within(force, dr_cfg.muscle_strength)
+    torch.testing.assert_close(force, ratio("actuator_biasprm", muscles, 2))
+  foot = [re.fullmatch(FOOT_GEOMS, name) is not None for name in robot.geom_names]
+  ids = robot.indexing.geom_ids.long()
+  friction = env.sim.model.geom_friction[:, ids, 0]
+  feet = friction[:, torch.tensor(foot, device=device)]
+  assert sum(foot) == 9 and within(feet, dr_cfg.foot_friction)
+  assert bool((feet == feet[:, :1]).all())  # one draw per env, shared by the feet
+  assert float(feet[:, 0].std()) > 0.0
+  default = env.sim.get_default_field("geom_friction")[ids, 0]
+  others = ~torch.tensor(foot, device=device)
+  torch.testing.assert_close(friction[:, others], default[others].expand(8, -1))
+  priority = env.sim.mj_model.geom_priority[robot.indexing.geom_ids.cpu().numpy()]
+  foot_mask = np.array(foot)
+  assert set(priority[foot_mask].tolist()) == {1}
+  assert set(priority[~foot_mask].tolist()) == {0}
+  torso = int(robot.indexing.body_ids[robot.body_names.index("torso")])
+  com = (
+    env.sim.model.body_ipos[:, torso] - env.sim.get_default_field("body_ipos")[torso]
+  )
+  assert within(com, dr_cfg.torso_com) and float(com.abs().max()) > 1e-3
+  mass = (
+    env.sim.model.body_mass[:, torso] / env.sim.get_default_field("body_mass")[torso]
+  )
+  assert within(mass, dr_cfg.torso_mass)
+
+  env.reset()
+  zero = torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=device)
+  # The delayed commands start from the start pose, not from zero: every human lag
+  # (>= 10 substeps) outlasts the first step's 5, so the servos still hold it.
+  if model == "robot":
+    start = env.sim.data.qpos.clone()
+    joints = env.sim.mj_model.actuator_trnid[servos.cpu().numpy(), 0]
+    adr = torch.as_tensor(env.sim.mj_model.jnt_qposadr[joints], device=device)
+    env.step(zero)
+    torch.testing.assert_close(
+      env.sim.data.ctrl[:, servos], start[:, adr], atol=1e-5, rtol=0
+    )
+  pushed = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+  for _ in range(150):
+    _, reward_t, _, _, _ = env.step(zero)
+    assert torch.isfinite(reward_t).all()
+    pushed |= cmd._jump_step == env.common_step_counter
+  assert bool(pushed.all())
+  # The feet's own friction reaches their floor contacts (foot priority 1).
+  data = env.sim.wp_data
+  n = int(data.nacon.numpy()[0])
+  pair = wp.to_torch(data.contact.geom)[:n].long()
+  world = wp.to_torch(data.contact.worldid)[:n].long()
+  contact_mu = wp.to_torch(data.contact.friction)[:n, 0]
+  foot_ids = ids[torch.tensor(foot, device=device)]
+  on_robot = torch.isin(pair, ids)
+  on_foot = torch.isin(pair, foot_ids)
+  floor = (on_foot[:, 0] & ~on_robot[:, 1]) | (on_foot[:, 1] & ~on_robot[:, 0])
+  assert bool(floor.any())
+  torch.testing.assert_close(contact_mu[floor], feet[world[floor], 0])
+  for act in robot.actuators:
+    buffer = act._delay_buffer
+    assert buffer is not None
+    lags = buffer.current_lags
+    osl = tuple(act.cfg.target_names_expr) == OSL_TORQUE_JOINTS
+    assert within(lags.float(), (0, 10) if osl else (10, 20))
   env.close()

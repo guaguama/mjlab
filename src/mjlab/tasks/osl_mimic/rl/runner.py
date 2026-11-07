@@ -34,6 +34,10 @@ from .ppo import MuscleMimicPPO
 class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
   alg: MuscleMimicPPO
 
+  validation_group_keys: tuple[str, ...] = ()
+  """Diagnostics also reported per validation group (``<key>/<group>``), next to
+  each group's early-termination rate and episode length."""
+
   def __init__(
     self,
     env: VecEnv,
@@ -135,6 +139,11 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     """One clip length."""
     return int(env.command_manager.get_term("motion").num_frames)  # type: ignore[attr-defined]
 
+  def _validation_groups(self, env: ManagerBasedRlEnv) -> dict[str, torch.Tensor]:
+    """(B,) boolean masks of validation envs reported separately. None here."""
+    del env
+    return {}
+
   def validate(self, it: int) -> dict[str, float]:
     if self._validation_env is None:
       self._validation_env = self._make_validation_env()
@@ -162,6 +171,10 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     finished_lengths: list[torch.Tensor] = []
     num_done = 0
     num_early = 0
+    groups = {g: m for g, m in self._validation_groups(env).items() if bool(m.any())}
+    group_done = dict.fromkeys(groups, 0)
+    group_early = dict.fromkeys(groups, 0)
+    group_lengths: dict[str, list[torch.Tensor]] = {g: [] for g in groups}
 
     policy.set_norm_mode("update")
     # Reset inside inference mode too: stepping there turns the env's state tensors
@@ -177,6 +190,12 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
           for key, value in term.components.items():
             mean = value.float().mean()
             sums[key] = sums[key] + mean if key in sums else mean
+            if key not in self.validation_group_keys:
+              continue
+            for group, mask in groups.items():
+              name = f"{key}/{group}"
+              mean = value[mask].float().mean()
+              sums[name] = sums[name] + mean if name in sums else mean
         episode_return += reward
         episode_length += 1
         done = terminated | truncated
@@ -185,6 +204,10 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
           num_early += int((terminated & ~truncated).sum())
           finished_returns.append(episode_return[done].clone())
           finished_lengths.append(episode_length[done].clone())
+          for group, mask in groups.items():
+            group_done[group] += int((done & mask).sum())
+            group_early[group] += int((terminated & ~truncated & mask).sum())
+            group_lengths[group].append(episode_length[done & mask].clone())
           episode_return[done] = 0.0
           episode_length[done] = 0.0
     normalizer.load_state_dict(snapshot)
@@ -195,6 +218,14 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     if finished_lengths:
       metrics["mean_episode_length"] = float(torch.cat(finished_lengths).mean())
       metrics["mean_episode_return"] = float(torch.cat(finished_returns).mean())
+    for group in groups:
+      done_g = group_done[group]
+      metrics[f"early_termination_rate/{group}"] = (
+        group_early[group] / done_g if done_g else 0.0
+      )
+      lengths = torch.cat(group_lengths[group]) if group_lengths[group] else None
+      if lengths is not None and lengths.numel():
+        metrics[f"mean_episode_length/{group}"] = float(lengths.mean())
     writer = self.logger.writer
     if writer is not None:
       for key, value in metrics.items():

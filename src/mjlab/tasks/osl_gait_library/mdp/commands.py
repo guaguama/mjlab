@@ -9,10 +9,20 @@ pose with a zero twist.
 The command follows sesteban's G1 unicycle task (``jog_unicycle`` over
 ``crawling_fwd_blending``):
 
-* **Sampling.** A per-env timer draws a twist: zero for ``rel_static_envs``,
-  otherwise the unicycle modes (pivot, forward or backward arc). The twist snaps to
-  the nearest clip under a weighted L2 metric. A command that snaps to the idle clip
-  is zeroed, so idle, zero twist and a blanked phase always coincide.
+* **Sampling.** A per-env timer draws a mode: idle for ``rel_static_envs``,
+  otherwise the unicycle modes (pivot, forward or backward arc). Then either
+  (``sampling="library"``) a clip of that mode uniformly at random, commanding its
+  label exactly, or (``"continuous"``, sesteban's sampler) a continuous twist from
+  the mode's ranges, snapped to the nearest clip under a weighted L2 metric. An arc's
+  speed and yaw rate come from one box, or from a union of boxes when the library's
+  grid is not a rectangle. A command that snaps to the idle clip is zeroed, so idle,
+  zero twist and a blanked phase always coincide. At load, the library must hold
+  every mode the sampler draws, and in continuous mode every commandable twist must
+  snap within ``max_snap_error`` of its clip, so a library that does not cover the
+  sampler fails loudly instead of silently serving its edge clips.
+* **Twist cap.** ``set_twist_limit`` (or ``max_twist``) restricts draws to clips
+  under a speed and yaw-rate cap, which a curriculum can raise during training
+  (:class:`~.curriculums.twist_limit_curriculum`).
 * **Switching.** The new clip keeps the stride phase (``frame / T``). Over
   ``blend_time_s`` the reference fades from the outgoing clip, read at the shared
   phase, to the new one. Positions lerp, orientations nlerp, and velocities lerp plus
@@ -43,7 +53,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import torch
@@ -74,6 +84,9 @@ if TYPE_CHECKING:
 
 Frame = dict[str, torch.Tensor]
 """Reference fields of one frame per env, before :class:`MimicReference` is built."""
+
+TwistBox = tuple[tuple[float, float], tuple[float, float], float]
+"""One sampling box of the arc modes: ``((vx_lo, vx_hi), (wz_lo, wz_hi), share)``."""
 
 # Fields that interpolate linearly, and each velocity with the position it is the
 # derivative of (for the blend's ``alpha_dot`` term).
@@ -180,6 +193,13 @@ class GaitLibraryCommandCfg(CommandTermCfg):
   twist_metric_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)
   """Weights of the nearest-clip metric on (vx, vy, wz). Use
   ``span_normalized_weights`` once a library spans both vx and wz."""
+  sampling: Literal["library", "continuous"] = "continuous"
+  """``"library"``: a clip of the drawn mode uniformly at random, commanded at its
+  label. ``"continuous"``: sesteban's sampler, a twist from the mode's ranges (the
+  fields below) snapped to the nearest clip."""
+  max_twist: tuple[float, float, float] | None = None
+  """Initial twist cap (forward vx, backward |vx|, |wz|): draws pick only clips under
+  it, and a mode with none idles. None: no cap. See ``set_twist_limit``."""
   rel_static_envs: float = 0.15
   """Fraction of draws that command a zero twist (the idle clip)."""
   rel_turn_envs: float = 0.0
@@ -193,6 +213,17 @@ class GaitLibraryCommandCfg(CommandTermCfg):
   """Arc yaw-rate magnitude (rad/s), random sign; 0 walks straight."""
   wz_range: tuple[float, float] = (0.0, 0.0)
   """Pivot yaw-rate magnitude (rad/s), random sign."""
+  fwd_arc_regions: tuple[TwistBox, ...] = ()
+  """Forward arcs drawn from a union of boxes ``((vx_lo, vx_hi), (wz_lo, wz_hi),
+  share)``, wz a magnitude with random sign: a box is picked with probability
+  ``share``, then a point uniformly inside it. Empty: the single box
+  ``vx_fwd_range`` x ``arc_wz_range``."""
+  bck_arc_regions: tuple[TwistBox, ...] = ()
+  """Backward arcs, as ``fwd_arc_regions``. Empty: ``vx_bck_range`` x
+  ``arc_wz_range``."""
+  max_snap_error: float = 0.1
+  """Largest per-axis gap allowed at load between a commandable twist and the label
+  of the clip it snaps to."""
   fixed_clips: bool = False
   """Validation: env ``i`` plays clip ``i % num_clips`` from phase 0 at its label,
   forever (set ``resampling_time_range`` past the episode)."""
@@ -209,6 +240,22 @@ def span_normalized_weights(
   wz = 1.0 / max(abs(wz_range[1] - wz_range[0]), 1e-6) ** 2
   m = max(wx, wz)
   return (wx / m, wx / m, wz / m)
+
+
+TIGHT_ARC_WZ = 0.5
+"""Yaw rate (rad/s) above which a forward arc counts as tight: sesteban's G1 boundary
+between the arc and pivot modes, and the edge of unicycle_v001's 0.05-step band."""
+
+
+def clip_group(twist: np.ndarray) -> str:
+  """A clip's family from its twist label, for per-family validation metrics:
+  ``idle``, ``turn`` (pivot), ``bck``, ``fwd`` or ``fwd_tight``."""
+  vx, wz = float(twist[0]), float(twist[2])
+  if abs(vx) < 1e-6:
+    return "idle" if abs(wz) < 1e-6 else "turn"
+  if vx < 0.0:
+    return "bck"
+  return "fwd_tight" if abs(wz) > TIGHT_ARC_WZ + 1e-6 else "fwd"
 
 
 class GaitLibraryCommand(CommandTerm):
@@ -340,7 +387,11 @@ class GaitLibraryCommand(CommandTerm):
     self.data["root_planar"] = planar_pose(
       self.data["root_pos"], self.data["root_quat"]
     )
+    self._index_library()
 
+  def _index_library(self) -> None:
+    """Everything derived from the loaded clips (``twists``, ``num_frames``): the idle
+    clip, the speed span, the sampling tables and the coverage check."""
     zero = self.twists.norm(dim=-1) < 1e-6
     idle = torch.nonzero(zero).flatten()
     self.idle_clip: int | None = int(idle[0]) if idle.numel() else None
@@ -353,11 +404,182 @@ class GaitLibraryCommand(CommandTerm):
       self.vx_fwd_range = (float(forward.min()), float(forward.max()))
     else:
       self.vx_fwd_range = (0.0, 0.0)
-    self._metric = torch.tensor(self.cfg.twist_metric_weights, device=dev)
+    self._metric = torch.tensor(self.cfg.twist_metric_weights, device=self.device)
+    self.clip_groups = [clip_group(t) for t in self.twists.cpu().numpy()]
 
     # Loops any served offset can cross: lookahead plus the blend's +1 interpolation.
     reach = (self.cfg.lookahead_steps - 1) * self.cfg.lookahead_stride + 2
-    self._max_wraps = max((n - 1 + reach) // n for n in lengths) + 1
+    self._max_wraps = max((n - 1 + reach) // n for n in self.num_frames.tolist()) + 1
+
+    self._fwd_boxes = self.cfg.fwd_arc_regions or (
+      (self.vx_fwd_range, self.cfg.arc_wz_range, 1.0),
+    )
+    self._bck_boxes = self.cfg.bck_arc_regions or (
+      (self.cfg.vx_bck_range, self.cfg.arc_wz_range, 1.0),
+    )
+    self._full_boxes = {
+      "fwd": self._boxes_to_tensors(self._fwd_boxes),
+      "bck": self._boxes_to_tensors(self._bck_boxes),
+    }
+    # The clips of each sampling mode, by label: idle, pivot, forward, backward.
+    vx, wz = self.twists[:, 0], self.twists[:, 2]
+    self._mode_masks = (
+      zero,
+      (vx.abs() < 1e-6) & (wz.abs() > 1e-6),
+      vx > 1e-6,
+      vx < -1e-6,
+    )
+    self.set_twist_limit(self.cfg.max_twist)
+    self._check_coverage()
+
+  def _boxes_to_tensors(
+    self, boxes: tuple[TwistBox, ...]
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(K, 2) lower and upper (vx, |wz|) corners and (K,) normalized shares."""
+    for (vx_lo, vx_hi), (wz_lo, wz_hi), share in boxes:
+      if vx_lo > vx_hi or wz_lo > wz_hi or wz_lo < 0.0 or share <= 0.0:
+        raise ValueError(
+          f"Bad twist box {((vx_lo, vx_hi), (wz_lo, wz_hi), share)}: need lo <= hi, "
+          "a non-negative yaw-rate magnitude and a positive share."
+        )
+    lo = torch.tensor([[b[0][0], b[1][0]] for b in boxes], device=self.device)
+    hi = torch.tensor([[b[0][1], b[1][1]] for b in boxes], device=self.device)
+    share = torch.tensor([b[2] for b in boxes], device=self.device)
+    return lo, hi, share / share.sum()
+
+  def _commandable_twists(self, step: float = 0.01) -> torch.Tensor:
+    """(M, 3) a grid of spacing ``step`` over every twist the sampler can draw."""
+    cfg = self.cfg
+
+    def box(vx: tuple[float, float], wz: tuple[float, float]) -> torch.Tensor:
+      gx = torch.linspace(vx[0], vx[1], max(2, math.ceil((vx[1] - vx[0]) / step) + 1))
+      gz = torch.linspace(wz[0], wz[1], max(2, math.ceil((wz[1] - wz[0]) / step) + 1))
+      x, z = torch.meshgrid(gx, gz, indexing="ij")
+      grid = torch.stack([x.flatten(), torch.zeros(x.numel()), z.flatten()], dim=-1)
+      return torch.cat([grid, grid * torch.tensor([1.0, 1.0, -1.0])])
+
+    parts = []
+    if cfg.rel_turn_envs > 0.0:
+      parts.append(box((0.0, 0.0), cfg.wz_range))
+    if cfg.rel_static_envs + cfg.rel_turn_envs < 1.0:
+      if cfg.rel_back_envs < 1.0:
+        parts += [box(vx, wz) for vx, wz, _ in self._fwd_boxes]
+      if cfg.rel_back_envs > 0.0:
+        parts += [box(vx, wz) for vx, wz, _ in self._bck_boxes]
+    if not parts:
+      return torch.zeros(0, 3, device=self.device)
+    return torch.cat(parts).to(self.device)
+
+  def _check_coverage(self) -> None:
+    """The library must hold a clip of every mode the sampler draws, and in
+    continuous mode every twist the sampler can draw must snap to a clip within
+    ``max_snap_error`` per axis. Outside the library's grid a command silently snaps
+    to an edge clip, and the twist reward then chases a twist no clip shows. The
+    twist cap is ignored here: it only ever narrows what is drawn."""
+    cfg = self.cfg
+    if cfg.fixed_clips:
+      return
+    arc = cfg.rel_static_envs + cfg.rel_turn_envs < 1.0
+    drawn = {
+      "pivot": (cfg.rel_turn_envs > 0.0, 1),
+      "forward arc": (arc and cfg.rel_back_envs < 1.0, 2),
+      "backward arc": (arc and cfg.rel_back_envs > 0.0, 3),
+    }
+    for name, (needed, mode) in drawn.items():
+      if needed and not bool(self._mode_masks[mode].any()):
+        raise ValueError(
+          f"The sampler draws {name} commands, but the gait library has no {name} "
+          "clip. Use a library that holds them or set that mode's fraction to 0."
+        )
+    if cfg.sampling == "library":
+      return
+    commands = self._commandable_twists()
+    if commands.shape[0] == 0:
+      return
+    errors = []
+    for chunk in commands.split(4096):
+      snapped = self._snap(chunk, capped=False)
+      errors.append((chunk - self.twists[snapped]).abs().amax(-1))
+    error = torch.cat(errors)
+    worst = int(error.argmax())
+    if float(error[worst]) > cfg.max_snap_error:
+      command = commands[worst]
+      clip = int(self._snap(command[None], capped=False)[0])
+      raise ValueError(
+        f"The gait library does not cover the commanded twists: "
+        f"{[round(v, 3) for v in command.tolist()]} snaps to {self.clip_names[clip]} "
+        f"(label {[round(v, 3) for v in self.twists[clip].tolist()]}), "
+        f"{float(error[worst]):.3f} off on one axis (max_snap_error "
+        f"{cfg.max_snap_error}). Read the sampler's ranges off the library."
+      )
+
+  def set_twist_limit(self, limit: tuple[float, float, float] | None) -> None:
+    """Cap the clips a draw may pick: forward vx <= ``limit[0]``, backward |vx| <=
+    ``limit[1]`` and |wz| <= ``limit[2]``, the idle clip always included. None lifts
+    the cap. Takes effect at the next draw; clips already playing are kept.
+
+    Library sampling draws only clips under the cap. Continuous sampling draws from
+    the sampling boxes and pivot range cut down to the cap, each box keeping its
+    share times the fraction of it left, and snaps among the clips under the cap.
+    Either way a mode left with nothing idles, so a cap never piles draws onto its
+    edge or turns one mode into another.
+    """
+    vx, wz = self.twists[:, 0], self.twists[:, 2]
+    eligible = torch.ones(self.num_clips, dtype=torch.bool, device=self.device)
+    capped = (
+      None if limit is None else (float(limit[0]), float(limit[1]), float(limit[2]))
+    )
+    if capped is not None:
+      fwd, bck, yaw = capped
+      eligible = (vx <= fwd + 1e-6) & (-vx <= bck + 1e-6) & (wz.abs() <= yaw + 1e-6)
+    if self.idle_clip is not None:
+      eligible[self.idle_clip] = True
+    self.twist_limit = capped
+    self._eligible = eligible
+    self._box_tensors = {
+      kind: self._cap_boxes(boxes, capped) for kind, boxes in self._full_boxes.items()
+    }
+    lo, hi = self.cfg.wz_range
+    if capped is not None:
+      hi = min(hi, capped[2])
+    self._pivot_range = (lo, hi) if lo <= hi else None
+    # One row of eligible clips per mode, and a last row of every eligible clip (the
+    # fallback of a library without an idle clip), zero-padded.
+    tables = [torch.nonzero(m & eligible).flatten() for m in self._mode_masks]
+    tables.append(torch.nonzero(eligible).flatten())
+    width = max(1, max(t.numel() for t in tables))
+    self._mode_clips = torch.zeros(
+      len(tables), width, dtype=torch.long, device=self.device
+    )
+    for row, table in enumerate(tables):
+      self._mode_clips[row, : table.numel()] = table
+    self._mode_counts = torch.tensor(
+      [t.numel() for t in tables], dtype=torch.long, device=self.device
+    )
+
+  @staticmethod
+  def _cap_boxes(
+    boxes: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    limit: tuple[float, float, float] | None,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Sampling boxes cut down to a twist cap, each share scaled by the fraction of
+    the box left (an axis of zero width counts as kept while inside the cap). None
+    when nothing is left."""
+    lo, hi, share = boxes
+    if limit is None:
+      return boxes
+    fwd, bck, yaw = limit
+    cap_lo = torch.tensor([-bck, 0.0], device=lo.device)
+    cap_hi = torch.tensor([fwd, yaw], device=lo.device)
+    new_lo, new_hi = torch.maximum(lo, cap_lo), torch.minimum(hi, cap_hi)
+    width, new_width = hi - lo, new_hi - new_lo
+    kept = torch.where(
+      width > 0, new_width.clamp(min=0) / width.clamp(min=1e-12), torch.ones_like(width)
+    ).prod(-1) * (new_width >= 0).all(-1)
+    new_share = share * kept
+    if float(new_share.sum()) <= 0.0:
+      return None
+    return new_lo, new_hi, new_share / new_share.sum()
 
   def _check_loop(
     self, name: str, clip: dict[str, torch.Tensor], stride: tuple[float, float, float]
@@ -586,6 +808,12 @@ class GaitLibraryCommand(CommandTerm):
   def reference_jumped(self) -> torch.Tensor:
     return (self._env.common_step_counter - self._jump_step) == 1
 
+  def mark_discontinuity(self, env_ids: torch.Tensor | slice) -> None:
+    """Flag a jump of the robot's state, such as a push, made after this step's
+    reward. The next reward then sees ``reference_jumped`` and the CLF skips the
+    finite difference across it, as it does across a reference jump."""
+    self._jump_step[env_ids] = self._env.common_step_counter
+
   @property
   def root_qpos(self) -> torch.Tensor:
     return self.robot.data.data.qpos[:, self.robot.indexing.free_joint_q_adr]
@@ -618,7 +846,24 @@ class GaitLibraryCommand(CommandTerm):
   def _sign(self, n: int) -> torch.Tensor:
     return torch.where(torch.rand(n, device=self.device) < 0.5, -1.0, 1.0)
 
+  def _sample_boxes(self, kind: str, n: int) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """(n,) vx and (n,) yaw-rate magnitudes, uniform over the ``kind`` boxes'
+    union weighted by their shares, and whether any box is left under the cap."""
+    boxes = self._box_tensors[kind]
+    if boxes is None:
+      zero = torch.zeros(n, device=self.device)
+      return zero, zero, False
+    lo, hi, share = boxes
+    if share.numel() == 1:
+      idx = torch.zeros(n, dtype=torch.long, device=self.device)
+    else:
+      idx = torch.multinomial(share, n, replacement=True)
+    point = lo[idx] + (hi[idx] - lo[idx]) * torch.rand(n, 2, device=self.device)
+    return point[:, 0], point[:, 1], True
+
   def _sample_twist(self, n: int) -> torch.Tensor:
+    """sesteban's unicycle draw. A mode left empty by the twist cap draws a zero
+    twist, which snaps to the idle clip."""
     cfg = self.cfg
     twist = torch.zeros(n, 3, device=self.device)
     mode = torch.rand(n, device=self.device)
@@ -627,18 +872,55 @@ class GaitLibraryCommand(CommandTerm):
     )
     is_arc = mode >= cfg.rel_static_envs + cfg.rel_turn_envs
     back = torch.rand(n, device=self.device) < cfg.rel_back_envs
-    vx = torch.where(
-      back, self._uniform(cfg.vx_bck_range, n), self._uniform(self.vx_fwd_range, n)
-    )
-    arc_wz = self._uniform(cfg.arc_wz_range, n) * self._sign(n)
-    pivot_wz = self._uniform(cfg.wz_range, n) * self._sign(n)
+    fwd_vx, fwd_wz, fwd_ok = self._sample_boxes("fwd", n)
+    bck_vx, bck_wz, bck_ok = self._sample_boxes("bck", n)
+    vx = torch.where(back, bck_vx, fwd_vx)
+    arc_wz = torch.where(back, bck_wz, fwd_wz) * self._sign(n)
+    is_arc = is_arc & ((back & bck_ok) | (~back & fwd_ok))
+    if self._pivot_range is None:
+      pivot_wz = torch.zeros(n, device=self.device)
+      is_turn = torch.zeros_like(is_turn)
+    else:
+      pivot_wz = self._uniform(self._pivot_range, n) * self._sign(n)
     twist[:, 0] = torch.where(is_arc, vx, twist[:, 0])
     twist[:, 2] = torch.where(is_arc, arc_wz, torch.where(is_turn, pivot_wz, 0.0))
     return twist
 
-  def _snap(self, twist: torch.Tensor) -> torch.Tensor:
+  def _snap(self, twist: torch.Tensor, capped: bool = True) -> torch.Tensor:
+    """(n,) the nearest clip to each twist, among the clips under the twist cap."""
     dist = ((self.twists[None] - twist[:, None]) ** 2 * self._metric).sum(-1)
+    if capped:
+      dist = dist.masked_fill(~self._eligible[None], float("inf"))
     return torch.argmin(dist, dim=-1)
+
+  def _draw_modes(self, n: int) -> torch.Tensor:
+    """(n,) sampling modes: 0 idle, 1 pivot, 2 forward arc, 3 backward arc."""
+    cfg = self.cfg
+    u = torch.rand(n, device=self.device)
+    back = torch.rand(n, device=self.device) < cfg.rel_back_envs
+    mode = torch.zeros(n, dtype=torch.long, device=self.device)
+    mode = torch.where(u >= cfg.rel_static_envs, 1, mode)
+    arc = u >= cfg.rel_static_envs + cfg.rel_turn_envs
+    return torch.where(arc, torch.where(back, 3, 2), mode)
+
+  def _draw_library(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A clip of each drawn mode, uniformly among those under the twist cap, and its
+    label as the command. A mode with no such clip idles (or, in a library without
+    an idle clip, takes any clip under the cap)."""
+    mode = self._draw_modes(n)
+    fallback = 0 if self.idle_clip is not None else len(self._mode_masks)
+    mode = torch.where(self._mode_counts[mode] == 0, fallback, mode)
+    count = self._mode_counts[mode].clamp(min=1)
+    pick = (torch.rand(n, device=self.device) * count).long()
+    clip = self._mode_clips[mode, torch.minimum(pick, count - 1)]
+    return self.twists[clip].clone(), clip
+
+  def _draw(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """(n, 3) commanded twists and (n,) the clips that play them."""
+    if self.cfg.sampling == "library":
+      return self._draw_library(n)
+    twist = self._sample_twist(n)
+    return twist, self._snap(twist)
 
   ##
   # CommandTerm interface.
@@ -670,8 +952,7 @@ class GaitLibraryCommand(CommandTerm):
       twist = self.twists[clip].clone()
       frame = torch.zeros(n, dtype=torch.long, device=self.device)
     else:
-      twist = self._sample_twist(n)
-      clip = self._snap(twist)
+      twist, clip = self._draw(n)
       length = self.num_frames[clip]
       frame = (torch.rand(n, device=self.device) * length).long().clamp(max=length - 1)
     if self.idle_clip is not None:
@@ -705,6 +986,12 @@ class GaitLibraryCommand(CommandTerm):
     )
     self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
     self.robot.reset(env_ids=env_ids)
+    # The reset zeroes the joint targets, and the env writes them to the actuators
+    # once more before the policy acts. With actuator delays, that write fills the
+    # freshly reset delay history, so the first delayed substeps would drive the
+    # servos toward the all-zero pose. Holding the start pose instead is what a
+    # servo running before the episode would do.
+    self.robot.set_joint_position_target(ref["joint_pos"], env_ids=env_ids)
 
   def _switch(self, env_ids: torch.Tensor) -> None:
     """Timer resample: new twist, phase-preserving clip switch, blend, re-base."""
@@ -720,8 +1007,7 @@ class GaitLibraryCommand(CommandTerm):
       served = self._serve(0, env_ids)
       target = planar_pose(served["root_pos"], served["root_quat"])
 
-    twist = self._sample_twist(len(env_ids))
-    clip = self._snap(twist)
+    twist, clip = self._draw(len(env_ids))
     if self.idle_clip is not None:
       twist[clip == self.idle_clip] = 0.0
     n_old, n_new = self.num_frames[old_clip], self.num_frames[clip]

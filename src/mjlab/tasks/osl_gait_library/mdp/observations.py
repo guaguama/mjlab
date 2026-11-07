@@ -22,6 +22,12 @@ def twist_command(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
   return _command(env, command_name).twist_command
 
 
+def joint_pos_biased(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+  """musclemimic's ``joint_pos`` as the encoders read it: the true positions plus
+  each env's encoder bias (zero unless an ``encoder_bias`` event draws one)."""
+  return _command(env, command_name).robot.data.joint_pos_biased
+
+
 def stride_phase(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
   """(B, 2) the stride clock ``(sin, cos)(2 pi phase)``, blanked to (0, 0) while idle,
   as in sesteban's ``motion_phase``."""

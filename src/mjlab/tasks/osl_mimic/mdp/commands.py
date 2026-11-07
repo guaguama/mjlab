@@ -25,6 +25,7 @@ body's orientation, so their reference comes straight from the NPZ body arrays.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -67,12 +68,17 @@ MIMIC_BODIES: tuple[str, ...] = (
 ROOT_BODY = "Full Body"
 
 
-def _clip_joint_names() -> list[str]:
-  """The joints a clip names: the rigid robot's 73, in model order."""
+@lru_cache(maxsize=1)
+def _clip_joint_names() -> tuple[str, ...]:
+  """The joints a clip names: the rigid robot's 73, in model order.
+
+  Cached: loading the spec takes about 0.3 s, and a library pads every clip (779
+  clips took four minutes per env before).
+  """
   spec = get_spec(
     "robot", "rigid"
   )  # Bind: iterating a temporary spec reads freed memory.
-  return [j.name for j in spec.joints if j.name != "root"]
+  return tuple(str(j.name) for j in spec.joints if j.name != "root")
 
 
 def pad_clip_joints(
