@@ -121,6 +121,11 @@ class mimic_reward(ManagerTermBase):
     self._torque_weights = torch.tensor(list(torque.values()), device=env.device)
 
     self.components: dict[str, torch.Tensor] = {}
+    # The last call's intermediates, for subclasses that recombine them (the stage-2
+    # split reward, ``osl_split.mdp.rewards``). Read-only, and valid only until the
+    # env steps or resets again: "action" is the action manager's live buffer.
+    self._cache: dict[str, torch.Tensor | None] = {}
+    self._clf_cache: dict[str, torch.Tensor] = {}
 
     self._clf: ClfCfg | None = params.get("clf")
     if self._clf is not None:
@@ -182,10 +187,12 @@ class mimic_reward(ManagerTermBase):
     # qpos: every non-quaternion coordinate (root xyz and all joints), plus the root
     # quaternion's geodesic angle -- added unsquared, as musclemimic does.
     qpos_err = torch.cat([root_q[:, :3] - ref_root_pos, joint_q - ref_joint_q], -1)
-    qpos_dist = qpos_err.square().mean(-1) + quat_angle(root_q[:, 3:7], ref_root_quat)
+    root_angle = quat_angle(root_q[:, 3:7], ref_root_quat)
+    qpos_dist = qpos_err.square().mean(-1) + root_angle
     qvel_err = torch.cat([root_v - ref_root_v, joint_v - ref_joint_v], -1)
     qvel_dist = qvel_err.square().mean(-1)
-    root_pos_dist = (root_q[:, :3] - ref_root_pos).square().mean(-1)
+    root_pos_err = root_q[:, :3] - ref_root_pos
+    root_pos_dist = root_pos_err.square().mean(-1)
 
     # Root velocity: linear in the root frame, angular as stored (body frame).
     sim_root_vel = torch.cat(
@@ -194,15 +201,18 @@ class mimic_reward(ManagerTermBase):
     ref_root_vel = torch.cat(
       [quat_apply_inverse(ref_root_quat, ref_root_v[:, :3]), ref_root_v[:, 3:]], -1
     )
-    root_vel_dist = (sim_root_vel - ref_root_vel).square().mean(-1)
+    root_vel_err = sim_root_vel - ref_root_vel
+    root_vel_dist = root_vel_err.square().mean(-1)
 
     site_pos, site_mat, site_ang, site_lin = cmd.site_state()
     rpos, rangles, rvel = relative_site_quantities(
       site_pos, site_mat, site_ang, site_lin
     )
     ref_rpos, ref_rangles, ref_rvel = ref.rpos, ref.rangles, ref.rvel
-    rpos_dist = (rpos - ref_rpos).square().mean((-1, -2))
-    rangles_dist = (rangles - ref_rangles).square().mean((-1, -2))
+    rpos_err = rpos - ref_rpos
+    rangles_err = rangles - ref_rangles
+    rpos_dist = rpos_err.square().mean((-1, -2))
+    rangles_dist = rangles_err.square().mean((-1, -2))
     rvel_rot_dist = (rvel[..., :3] - ref_rvel[..., :3]).square().mean((-1, -2))
     rvel_lin_dist = (rvel[..., 3:] - ref_rvel[..., 3:]).square().mean((-1, -2))
 
@@ -230,10 +240,12 @@ class mimic_reward(ManagerTermBase):
     action = env.action_manager.action
     excess = (-1.0 - action).clamp(min=0.0) + (action - 1.0).clamp(min=0.0)
     penalty = -self._oob_coeff * excess.square().sum(-1) / action.shape[-1]
+    qfrc = None
     if self._torque_dofs.numel():
       qfrc = env.sim.data.qfrc_actuator[:, self._torque_dofs]
       penalty = penalty - (self._torque_weights * qfrc.square()).sum(-1)
     penalty = penalty.clamp(min=-1.0)
+    floored_penalty = penalty
 
     clf_terms: dict[str, torch.Tensor] = {}
     if self._clf is not None:
@@ -274,6 +286,29 @@ class mimic_reward(ManagerTermBase):
       "dist_rel_site_vel": (rvel - ref_rvel).norm(dim=-1).mean(-1),
     }
     self.components.update({f"clf_{k}": v for k, v in clf_terms.items()})
+    self._cache = {
+      "qpos_err": qpos_err,
+      "quat_angle": root_angle,
+      "qvel_err": qvel_err,
+      "root_pos_err": root_pos_err,
+      "root_vel_err": root_vel_err,
+      "rpos_err": rpos_err,
+      "rangles_err": rangles_err,
+      "rvel_err": rvel - ref_rvel,
+      "action": action,
+      "qfrc": qfrc,
+      "penalty": floored_penalty,  # Before the CLF violation is subtracted.
+      "joint_q_err": joint_err,
+      "joint_v_err": qvel_err[:, 6:],
+      "r_qpos": r_qpos,
+      "r_qvel": r_qvel,
+      "r_root_pos": r_root_pos,
+      "r_root_vel": r_root_vel,
+      "r_rpos": r_rpos,
+      "r_rquat": r_rquat,
+      "r_rvel_rot": r_rvel_rot,
+      "r_rvel_lin": r_rvel_lin,
+    }
     return reward
 
   def _clf_terms(
@@ -339,6 +374,13 @@ class mimic_reward(ManagerTermBase):
       torch.isfinite(v_norm), torch.exp(-v_norm.clamp(max=5.0)), torch.zeros_like(v)
     )
 
+    self._clf_cache = {
+      "e": e,
+      "ed": ed,
+      "edd": edd,
+      "first": first,
+      "valid": self._clf_valid.clone(),
+    }
     self._ed_prev = ed.detach().clone()
     self._clf_valid.fill_(1.0)
     return {

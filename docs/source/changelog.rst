@@ -51,6 +51,21 @@ Added
 - The gait-library command gained a library sampling mode, a union of sampling boxes
   for libraries whose twist grid is not a rectangle, and a load-time check that the
   library covers every twist the sampler can command.
+- ``Mjlab-Split-Unicycle-OSL-Fullbody`` tasks (``-MSK``, ``-CLF``, ``-Compliant``),
+  stage 2 of the OSL plan: the unified unicycle policy's human part, warm-started
+  exactly from a stage-1 run, trains beside a fresh OSL actor that sees only the
+  prosthesis's own sensors, each with its own critic, PPO clip, optimizer and reward
+  channel. ``osl_split.scripts.split`` converts a stage-1 run on the CPU, and
+  ``osl_split.scripts.two_stage`` runs stage 1, the split and stage 2 as subprocesses.
+- Deployment export for the OSL gait-library and imitation policies, robot and
+  musculoskeletal alike. ``python -m mjlab.tasks.osl_gait_library.export
+  <checkpoint>`` turns a checkpoint into a self-contained CPU MuJoCo bundle (ONNX
+  actor, compiled model, preprocessed reference, manifest) for osl_deploy, after
+  checking the run's saved configs against this checkout; ``--hf-repo`` uploads it to
+  Hugging Face. The manifest names each policy's default inference: the raw mean for
+  the robot model, the noise-averaged clipped-Gaussian action for the musculoskeletal
+  one, and records the actuator delays it trained with. The OSL training runners now
+  also export ``<run>.onnx`` with this metadata at every checkpoint.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and

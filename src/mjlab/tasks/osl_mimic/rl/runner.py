@@ -10,6 +10,11 @@ completed episodes' length and return. They are logged under ``Validation/``.
 
 Two other departures from rsl_rl's loop, both musclemimic's: initial episode lengths
 are never randomized, and the rollout uses the algorithm's own normalization modes.
+
+Every checkpoint also exports the actor, as mjlab's stock runners do: the run
+directory's ``<run>.onnx`` (overwritten at each save) with its deployment metadata
+embedded and next to it as ``<run>.json`` (see :mod:`.export`). A deployment bundle
+for a chosen checkpoint comes from ``mjlab.tasks.osl_gait_library.export``.
 """
 
 from __future__ import annotations
@@ -21,12 +26,14 @@ from typing import cast
 import torch
 from rsl_rl.env import VecEnv
 from rsl_rl.utils import check_nan
+from rsl_rl.utils.log_writer import LogWriter
 
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.osl_mimic.mdp import MimicMotionCommandCfg, mimic_reward
 
+from .export import export_policy
 from .models import MuscleMimicMLPModel
 from .ppo import MuscleMimicPPO
 
@@ -115,6 +122,22 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
         os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt")  # type: ignore[arg-type]
       )
       self.logger.stop_logging_writer()
+
+  def save(self, path: str, infos=None) -> None:
+    """Checkpoint, then export the actor (ONNX + metadata) into the run directory.
+
+    A failed export never ends the run: the checkpoint holds the actor."""
+    super().save(path, infos)
+    _, _, onnx_path = self._get_export_paths(path)
+    try:
+      export_policy(self.env.unwrapped, self.alg.get_policy(), onnx_path)
+    except Exception as err:
+      print(f"[WARN] ONNX export failed (training continues): {err}")
+      return
+    writer = self.logger.writer
+    if self.cfg.get("upload_model", False) and isinstance(writer, LogWriter):
+      writer.save_file(str(onnx_path))
+      writer.save_file(str(onnx_path.with_suffix(".json")))
 
   ##
   # Validation.
