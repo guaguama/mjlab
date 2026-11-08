@@ -1,4 +1,6 @@
-"""Deployable exports of the musclemimic-style OSL policies, robot and MSK alike.
+"""The deployment contract of the musclemimic-style OSL policies, robot and MSK.
+
+The deployment bundle (:mod:`mjlab.tasks.osl_gait_library.export`) is built on it.
 
 The actor leaves as an ONNX graph from the raw observation to the raw action mean.
 The frozen observation statistics are part of the graph; nothing else is. Its
@@ -47,7 +49,6 @@ from mjlab.tasks.osl_mimic.mdp.observations import TOUCH_SENSORS
 
 if TYPE_CHECKING:
   from mjlab.entity import EntityCfg
-  from mjlab.envs import ManagerBasedRlEnv
   from mjlab.envs.mdp.actions.actions import BaseAction
 
 Inference = Literal["mean", "expected"]
@@ -72,7 +73,7 @@ input only, and deployment reads the clean value it was added to."""
 
 @dataclasses.dataclass(frozen=True)
 class PolicyParts:
-  """What a policy's metadata is read from, in a live env or a CPU rebuild."""
+  """What a policy's metadata is read from: the task rebuilt on CPU."""
 
   model: mujoco.MjModel
   """The compiled scene model."""
@@ -92,29 +93,6 @@ class PolicyParts:
   """The entity config, for the actuator delays it trained with."""
   obs_group_history: int | None = None
   """The actor group's own ``history_length`` (it stacks every term)."""
-
-  @classmethod
-  def from_env(cls, env: ManagerBasedRlEnv) -> PolicyParts:
-    env = getattr(env, "unwrapped", env)
-    manager = env.observation_manager
-    terms = list(manager.active_terms["actor"])
-    command = env.command_manager.get_term("motion")
-    return cls(
-      model=env.sim.mj_model,
-      joint_names=list(env.scene[ENTITY].joint_names),
-      obs_terms=terms,
-      obs_term_cfgs={name: manager.get_term_cfg("actor", name) for name in terms},
-      actions={
-        name: cast("BaseAction", env.action_manager.get_term(name))
-        for name in env.action_manager.active_terms
-      },
-      site_bodies=list(command.cfg.site_bodies),  # type: ignore[attr-defined]
-      lookahead_steps=int(command.cfg.lookahead_steps),  # type: ignore[attr-defined]
-      decimation=int(env.cfg.decimation),
-      step_dt=float(env.step_dt),
-      entity_cfg=env.cfg.scene.entities.get(ENTITY),
-      obs_group_history=env.cfg.observations["actor"].history_length,
-    )
 
 
 def _prefixed(name: str) -> str:
@@ -494,24 +472,3 @@ def normalizer_samples(actor: torch.nn.Module, count: int, seed: int = 0) -> np.
   z = np.random.default_rng(seed).standard_normal((count, mean_np.size))
   z[0] = 0.0
   return (mean_np + std_np * z).astype(np.float32)
-
-
-def export_policy(
-  env: ManagerBasedRlEnv,
-  actor: torch.nn.Module,
-  onnx_path: str | Path,
-  inference: Inference | None = None,
-) -> Path:
-  """Export a live env's actor: ``onnx_path`` with the metadata embedded, and the
-  same metadata next to it as ``.json``. What the training runners write at every
-  checkpoint; a deployment bundle adds the model and the reference to it."""
-  onnx_path = Path(onnx_path)
-  onnx_path.parent.mkdir(parents=True, exist_ok=True)
-  parts = PolicyParts.from_env(env)
-  action_dim = sum(term.action_dim for term in parts.actions.values())
-  std = action_std(actor, action_dim)
-  obs_dim = export_actor_onnx(actor, onnx_path)
-  metadata = policy_metadata(parts, std, obs_dim, inference)
-  attach_metadata(onnx_path, metadata)
-  onnx_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n")
-  return onnx_path

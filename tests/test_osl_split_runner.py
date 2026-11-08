@@ -49,6 +49,7 @@ from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
 from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.mdp.rewards import mimic_reward
+from mjlab.tasks.osl_mimic.rl import runner as mimic_runner
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel, RunningMeanStd
 from mjlab.tasks.osl_split.config import (
   SPLIT_TASKS,
@@ -90,7 +91,6 @@ from mjlab.tasks.osl_split.mdp import (
   split_mimic_reward,
 )
 from mjlab.tasks.osl_split.mdp.rewards import stage1_channel_weights
-from mjlab.tasks.osl_split.rl import runner as split_runner
 from mjlab.tasks.osl_split.rl.export import (
   export_osl_policy,
   osl_policy_metadata,
@@ -150,7 +150,7 @@ musculoskeletal model's gain, both of which the export must read."""
 
 STAGE1_UNICYCLE_TASKS: dict[str, tuple[Model, Socket, Reward]] = {
   "Mjlab-Gait-Library-Unicycle-OSL-Fullbody"
-  + ("-MSK" if model == "msk" else "")
+  + ("-MSK" if model == "msk" else "-ROBOT")
   + ("-CLF" if reward == "clf" else "")
   + ("-Compliant" if socket == "compliant" else ""): (model, socket, reward)
   for model, socket, reward in SPLIT_TASKS.values()
@@ -474,14 +474,19 @@ def _states(runner: SplitOnPolicyRunner) -> dict[str, dict[str, torch.Tensor]]:
 def test_split_tasks_are_registered() -> None:
   ids = sorted(t for t in list_tasks() if t.startswith("Mjlab-Split-"))
   tags = [
-    m + r + s for m in ("", "-MSK") for r in ("", "-CLF") for s in ("", "-Compliant")
+    m + r + s
+    for m in ("-ROBOT", "-MSK")
+    for r in ("", "-CLF")
+    for s in ("", "-Compliant")
   ]
   assert ids == sorted(SPLIT_TASKS) == sorted(TASK_PREFIX + t for t in tags)
   for task_id, (model, socket, reward) in SPLIT_TASKS.items():
     assert split_task_id(model, socket, reward) == task_id
     assert load_runner_cls(task_id) is SplitOnPolicyRunner
-    # The experiment name follows the id's tags: -MSK-CLF -> _msk_clf.
-    suffix = task_id.removeprefix(TASK_PREFIX).lower().replace("-", "_")
+    # The experiment name follows the id's tags: -MSK-CLF -> _msk_clf. The robot's
+    # tag is in the id only (its log directories keep the untagged name).
+    suffix = task_id.removeprefix(TASK_PREFIX).removeprefix("-ROBOT")
+    suffix = suffix.lower().replace("-", "_")
     experiment = "osl_fullbody_split_unicycle" + suffix
     assert split_experiment_name(model, socket, reward) == experiment
 
@@ -517,6 +522,9 @@ def test_stage1_tasks_are_unchanged() -> None:
   """Stage 2 registers its own tasks and leaves the ones it starts from alone."""
   for task_id, (model, socket, reward) in STAGE1_UNICYCLE_TASKS.items():
     suffix = task_id.removeprefix("Mjlab-Gait-Library-Unicycle-OSL-Fullbody")
+    # The model tag names the robot in the task id only: its runs' log
+    # directories keep the untagged experiment name.
+    suffix = suffix.removeprefix("-ROBOT")
     experiment = "osl_fullbody_unicycle" + suffix.lower().replace("-", "_")
     assert load_runner_cls(task_id) is GaitLibraryOnPolicyRunner
     assert load_rl_cfg(task_id) == osl_gait_library_runner_cfg(
@@ -1065,13 +1073,14 @@ def test_validation_env_follows_the_training_env(
   built: its constructor records the config."""
   built: list[Any] = []
 
-  def build(cfg: Any, device: str) -> _FakeEnv:  # Stands in for ManagerBasedRlEnv.
-    del device
+  def build(cfg: Any, device: str, **kwargs: Any) -> _FakeEnv:  # ManagerBasedRlEnv.
+    del device, kwargs
     built.append(cfg)
     return _FakeEnv(num_envs=cfg.scene.num_envs, seed=1)
 
-  monkeypatch.setattr(split_runner, "ManagerBasedRlEnv", build)
-  monkeypatch.setattr(split_runner, "RslRlVecEnvWrapper", lambda env: env)
+  # The runners build their evaluation envs in stage 1's base runner.
+  monkeypatch.setattr(mimic_runner, "ManagerBasedRlEnv", build)
+  monkeypatch.setattr(mimic_runner, "RslRlVecEnvWrapper", lambda env: env)
   env = _FakeEnv()
   runner = SplitOnPolicyRunner(cast(Any, env), _quick_cfg(None), None, "cpu")
 

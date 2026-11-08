@@ -46,18 +46,31 @@ looping clips break (their root jumps back one stride at every loop):
 
 Timing is :class:`~mjlab.tasks.osl_mimic.mdp.MimicMotionCommand`'s: ``frame`` is the
 frame the last observation was built at, and rewards compare with ``reference(1)``.
+
+For play (sesteban's ``play.py`` additions), the twist can be pinned for every env
+(``fixed_twist``, ``set_fixed_twist``; the viewer's keyboard and slider controls go
+through it), and with ``debug_vis`` on the viewer draws the served reference as a
+ghost of the robot model.
 """
 
 from __future__ import annotations
 
 import math
+from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+import mujoco
 import numpy as np
 import torch
 
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  SOCKET_JOINTS,
+  Socket,
+  get_spec,
+)
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 from mjlab.tasks.osl_mimic.mdp import (
   MIMIC_BODIES,
@@ -79,8 +92,11 @@ from mjlab.utils.lab_api.math import (
 )
 
 if TYPE_CHECKING:
+  import viser
+
   from mjlab.entity import Entity
   from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 Frame = dict[str, torch.Tensor]
 """Reference fields of one frame per env, before :class:`MimicReference` is built."""
@@ -98,6 +114,35 @@ _VELOCITY_OF = {
   "omega_rel": "rangles",
 }
 _VELOCITIES = (*_VELOCITY_OF, "root_ang_vel_w", "rvel")
+
+GHOST_GEOM_GROUP = 0
+"""The geom group the reference ghost shows: the visible anatomy and the socket and
+OSL meshes. All but the foot shell collide, so the stock tracking ghost's filter
+(hide every colliding geom) would drop them. Wrapping geometry and the collision
+proxies sit in groups 3-5."""
+GUI_TWIST_STEP = 0.05
+"""Slider step of the viewer's twist controls: the unicycle library's finest grid."""
+
+
+@dataclass(frozen=True)
+class _Ghost:
+  """The reference ghost: a recoloured robot model and where the reference goes."""
+
+  model: mujoco.MjModel
+  root_adr: int
+  """qpos address of the free joint."""
+  qpos_adr: np.ndarray
+  """qpos address of each mapped joint."""
+  joint_cols: torch.Tensor
+  """The reference ``joint_pos`` column of each mapped joint."""
+
+
+def _as_twist(twist: Sequence[float] | None) -> tuple[float, float, float] | None:
+  if twist is None:
+    return None
+  if len(twist) != 3:
+    raise ValueError(f"A twist is (vx, vy, wz); got {tuple(twist)}.")
+  return float(twist[0]), float(twist[1]), float(twist[2])
 
 
 ##
@@ -227,6 +272,14 @@ class GaitLibraryCommandCfg(CommandTermCfg):
   fixed_clips: bool = False
   """Validation: env ``i`` plays clip ``i % num_clips`` from phase 0 at its label,
   forever (set ``resampling_time_range`` past the episode)."""
+  fixed_twist: tuple[float, float, float] | None = None
+  """Pin every env to this twist ``(vx, vy, wz)``: each draw takes the clip nearest
+  to it (the twist cap ignored) in place of the sampler. Library sampling commands
+  that clip's label, as such a policy saw in training; continuous sampling commands
+  the twist itself. None: the sampler. Play's ``--twist`` sets it; the viewer's
+  twist controls change it at run time through ``set_fixed_twist``."""
+  ghost_color: tuple[float, float, float, float] = (0.5, 0.7, 0.5, 0.5)
+  """Colour of the reference ghost drawn when ``debug_vis`` is on."""
 
   def build(self, env: ManagerBasedRlEnv) -> GaitLibraryCommand:
     return GaitLibraryCommand(self, env)
@@ -260,6 +313,8 @@ def clip_group(twist: np.ndarray) -> str:
 
 class GaitLibraryCommand(CommandTerm):
   cfg: GaitLibraryCommandCfg
+  _ghost: _Ghost | None = None
+  """Built on the first debug draw: only viewers and video renders need it."""
 
   def __init__(self, cfg: GaitLibraryCommandCfg, env: ManagerBasedRlEnv):
     super().__init__(cfg, env)
@@ -391,7 +446,7 @@ class GaitLibraryCommand(CommandTerm):
 
   def _index_library(self) -> None:
     """Everything derived from the loaded clips (``twists``, ``num_frames``): the idle
-    clip, the speed span, the sampling tables and the coverage check."""
+    clip, the speed span, the sampling tables, the coverage check and the pin."""
     zero = self.twists.norm(dim=-1) < 1e-6
     idle = torch.nonzero(zero).flatten()
     self.idle_clip: int | None = int(idle[0]) if idle.numel() else None
@@ -431,6 +486,14 @@ class GaitLibraryCommand(CommandTerm):
     )
     self.set_twist_limit(self.cfg.max_twist)
     self._check_coverage()
+    # The pin. Labels and metric are kept on the CPU as well, so viewer threads can
+    # snap without touching the device; they post pin changes to the mailbox, which
+    # the sim thread drains in ``_update_command``.
+    self.twist_labels: np.ndarray = self.twists.cpu().numpy().astype(np.float64)
+    """(C, 3) ``twists`` on the CPU, for viewer threads."""
+    self._metric_np = np.asarray(self.cfg.twist_metric_weights, dtype=np.float64)
+    self._fixed_twist = _as_twist(self.cfg.fixed_twist)
+    self._twist_requests: deque[tuple[float, float, float] | None] = deque(maxlen=1)
 
   def _boxes_to_tensors(
     self, boxes: tuple[TwistBox, ...]
@@ -915,12 +978,55 @@ class GaitLibraryCommand(CommandTerm):
     clip = self._mode_clips[mode, torch.minimum(pick, count - 1)]
     return self.twists[clip].clone(), clip
 
+  def _draw_pinned(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pinned twist's clip for every draw, commanded as ``fixed_twist`` says."""
+    assert self._fixed_twist is not None
+    index = self.nearest_clip(self._fixed_twist)
+    clip = torch.full((n,), index, dtype=torch.long, device=self.device)
+    if self.cfg.sampling == "library":
+      return self.twists[clip].clone(), clip
+    twist = torch.tensor(self._fixed_twist, device=self.device).repeat(n, 1)
+    return twist, clip
+
   def _draw(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
     """(n, 3) commanded twists and (n,) the clips that play them."""
+    if self._fixed_twist is not None:
+      return self._draw_pinned(n)
     if self.cfg.sampling == "library":
       return self._draw_library(n)
     twist = self._sample_twist(n)
     return twist, self._snap(twist)
+
+  ##
+  # Pinning the twist (play's --twist and the viewer's twist controls).
+  ##
+
+  @property
+  def fixed_twist(self) -> tuple[float, float, float] | None:
+    return self._fixed_twist
+
+  @property
+  def twist_bounds(self) -> tuple[list[float], list[float]]:
+    """Per-axis lower and upper bounds of the library's twist labels."""
+    lo, hi = self.twist_labels.min(0), self.twist_labels.max(0)
+    # Labels are float32: round off the noise (-0.800000011920929).
+    return np.round(lo, 6).tolist(), np.round(hi, 6).tolist()
+
+  def nearest_clip(self, twist: Sequence[float]) -> int:
+    """The clip a pin of ``twist`` plays: the nearest label under the twist metric,
+    the twist cap ignored. CPU only, so viewer threads may call it."""
+    gap = self.twist_labels - np.asarray(twist, dtype=np.float64)
+    return int(np.argmin((gap**2 * self._metric_np).sum(-1)))
+
+  def set_fixed_twist(self, twist: Sequence[float] | None) -> None:
+    """Pin every env's twist from the next step on, or release the pin with None.
+
+    The change takes the timer-resample path for every env: the pinned clip at the
+    shared phase, blended in, the target re-based on the robot; no episode reset.
+    Later resamples keep the pin until it is released. Only a request is posted
+    here, so viewer and GUI threads may call it.
+    """
+    self._twist_requests.append(_as_twist(twist))
 
   ##
   # CommandTerm interface.
@@ -1061,6 +1167,10 @@ class GaitLibraryCommand(CommandTerm):
     return out
 
   def _update_command(self, env_ids: torch.Tensor | None) -> None:
+    if env_ids is None and self._twist_requests:
+      # A pin change from set_fixed_twist, applied as a timer resample of every env.
+      self._fixed_twist = self._twist_requests.popleft()
+      self._switch(torch.arange(self.num_envs, device=self.device))
     if env_ids is None:
       step = (~self._just_reset).long()
       advanced = self.frame + step
@@ -1105,3 +1215,125 @@ class GaitLibraryCommand(CommandTerm):
     else:
       self._just_reset[env_ids] = False
     self._cache.clear()
+
+  ##
+  # Viewer: the reference ghost and the twist controls.
+  ##
+
+  def _build_ghost(self) -> _Ghost:
+    """The robot model at this entity's socket, recoloured, showing geom group 0.
+
+    The musculoskeletal tasks get the robot model too: the same skeleton, socket
+    and OSL, without the muscles. Joints map by name; joints the robot model lacks
+    (kept fingers) are left out.
+    """
+    joints = list(self.robot.joint_names)
+    socket: Socket = "compliant" if set(SOCKET_JOINTS) <= set(joints) else "rigid"
+    spec = get_spec("robot", socket)
+    model = spec.compile()
+    shown = model.geom_group == GHOST_GEOM_GROUP
+    model.geom_rgba[shown] = self.cfg.ghost_color
+    model.geom_rgba[~shown, 3] = 0.0
+    model.site_rgba[:, 3] = 0.0
+    model.tendon_rgba[:, 3] = 0.0
+    free = mujoco.mjtJoint.mjJNT_FREE
+    root = int(model.jnt_qposadr[np.flatnonzero(model.jnt_type == free)[0]])
+    cols, adrs = [], []
+    for col, name in enumerate(joints):
+      jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+      if jid >= 0 and model.jnt_type[jid] != free:
+        cols.append(col)
+        adrs.append(int(model.jnt_qposadr[jid]))
+    return _Ghost(
+      model=model,
+      root_adr=root,
+      qpos_adr=np.asarray(adrs, dtype=np.int64),
+      joint_cols=torch.tensor(cols, dtype=torch.long, device=self.device),
+    )
+
+  def ghost_qpos(self, env_ids: Sequence[int]) -> np.ndarray:
+    """(len(env_ids), nq) the ghost model's qpos at the served reference."""
+    if self._ghost is None:
+      self._ghost = self._build_ghost()
+    ghost = self._ghost
+    ref = self._serve(0, torch.tensor(list(env_ids), device=self.device))
+    qpos = np.tile(ghost.model.qpos0, (len(env_ids), 1))
+    r = ghost.root_adr
+    qpos[:, r : r + 3] = ref["root_pos"].cpu().numpy()
+    qpos[:, r + 3 : r + 7] = ref["root_quat"].cpu().numpy()
+    qpos[:, ghost.qpos_adr] = ref["joint_pos"][:, ghost.joint_cols].cpu().numpy()
+    return qpos
+
+  def _debug_vis_impl(self, visualizer: DebugVisualizer) -> None:
+    """The served reference (what the reward compares the robot with now) as a
+    ghost, at the egocentric target rather than the clip's looping pose."""
+    env_ids = list(visualizer.get_env_indices(self.num_envs))
+    if not env_ids:
+      return
+    qpos = self.ghost_qpos(env_ids)
+    assert self._ghost is not None
+    for row, env in enumerate(env_ids):
+      visualizer.add_ghost_mesh(
+        qpos[row], model=self._ghost.model, label=f"ghost_{env}"
+      )
+
+  def create_gui(
+    self,
+    name: str,
+    server: viser.ViserServer,
+    get_env_idx: Callable[[], int],
+    on_change: Callable[[], None] | None = None,
+    request_action: Callable[[str, Any], None] | None = None,
+  ) -> None:
+    """A "Twist command" folder: a "Pin twist" checkbox, one slider per axis over
+    the library's labels and the clip they snap to. While pinned, every env plays
+    that clip (``set_fixed_twist``); unpinning returns to the sampler. An axis the
+    library never varies shows as a fixed number."""
+    del name, get_env_idx, request_action
+    lo, hi = self.twist_bounds
+    values = list(self._fixed_twist or (0.0, 0.0, 0.0))
+    sliders = []
+    with server.gui.add_folder("Twist command"):
+      pin = server.gui.add_checkbox(
+        "Pin twist", initial_value=self._fixed_twist is not None
+      )
+      for axis, label in enumerate(("vx [m/s]", "vy [m/s]", "wz [rad/s]")):
+        low, high = min(lo[axis], 0.0), max(hi[axis], 0.0)
+        if high - low < 1e-9:
+          values[axis] = low
+          server.gui.add_number(label, initial_value=low, disabled=True)
+          continue
+        values[axis] = min(max(values[axis], low), high)
+        slider = server.gui.add_slider(
+          label,
+          min=low,
+          max=high,
+          step=GUI_TWIST_STEP,
+          initial_value=values[axis],
+          disabled=not pin.value,
+        )
+        sliders.append((axis, slider))
+      clip = self.clip_names[self.nearest_clip(values)]
+      snapped = server.gui.add_text("Clip", initial_value=clip, disabled=True)
+
+    def push() -> None:
+      for axis, slider in sliders:
+        values[axis] = float(slider.value)
+      twist = (values[0], values[1], values[2])
+      snapped.value = self.clip_names[self.nearest_clip(twist)]
+      if pin.value:
+        self.set_fixed_twist(twist)
+      if on_change is not None:
+        on_change()
+
+    for _, slider in sliders:
+      slider.on_update(lambda _: push())
+
+    @pin.on_update
+    def _(_) -> None:
+      for _, slider in sliders:
+        slider.disabled = not pin.value
+      if pin.value:
+        push()
+      else:
+        self.set_fixed_twist(None)

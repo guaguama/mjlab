@@ -7,16 +7,20 @@ to float precision. The simulation test needs a 100 Hz clipper clip
 (``MJLAB_OSL_MIMIC_MOTION_FILE``) and is slow.
 """
 
+import contextlib
 import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
+from unittest import mock
 
+import mediapy as media
 import numpy as np
 import pytest
 import torch
 from conftest import get_test_device
+from rsl_rl.utils.log_writer import LogWriter
 from scipy.linalg import eigh, solve_continuous_are
 from scipy.spatial.transform import Rotation
 
@@ -42,10 +46,10 @@ from mjlab.tasks.osl_mimic.rl.runner import OslMimicOnPolicyRunner
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 
 TASKS = {
-  "Mjlab-Mimic-OSL-Fullbody": ("robot", "rigid", "mimic"),
-  "Mjlab-Mimic-OSL-Fullbody-Compliant": ("robot", "compliant", "mimic"),
-  "Mjlab-Mimic-OSL-Fullbody-CLF": ("robot", "rigid", "clf"),
-  "Mjlab-Mimic-OSL-Fullbody-CLF-Compliant": ("robot", "compliant", "clf"),
+  "Mjlab-Mimic-OSL-Fullbody-ROBOT": ("robot", "rigid", "mimic"),
+  "Mjlab-Mimic-OSL-Fullbody-ROBOT-Compliant": ("robot", "compliant", "mimic"),
+  "Mjlab-Mimic-OSL-Fullbody-ROBOT-CLF": ("robot", "rigid", "clf"),
+  "Mjlab-Mimic-OSL-Fullbody-ROBOT-CLF-Compliant": ("robot", "compliant", "clf"),
   "Mjlab-Mimic-OSL-Fullbody-MSK": ("msk", "rigid", "mimic"),
   "Mjlab-Mimic-OSL-Fullbody-MSK-Compliant": ("msk", "compliant", "mimic"),
   "Mjlab-Mimic-OSL-Fullbody-MSK-CLF": ("msk", "rigid", "clf"),
@@ -331,3 +335,73 @@ def test_reference_start_and_first_step(model: str) -> None:
     assert cmd.frame.tolist() == [1, 1]
   finally:
     env.close()
+
+
+##
+# Checkpoint videos.
+##
+
+
+def _video_runner(tmp_path: Path, fail: bool = False) -> tuple[Any, list[float]]:
+  """A runner whose video env renders numbered frames and records its reset draw."""
+  runner = OslMimicOnPolicyRunner.__new__(OslMimicOnPolicyRunner)
+  draws: list[float] = []
+  count = iter(range(10_000))
+
+  def render() -> np.ndarray:
+    return np.full((48, 64, 3), next(count) % 256, dtype=np.uint8)
+
+  def reset() -> tuple[torch.Tensor, dict]:
+    draws.append(float(torch.rand(1)))
+    return torch.zeros(1, 3), {}
+
+  def step(
+    actions: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    if fail:
+      raise RuntimeError("renderer lost")
+    return torch.zeros(1, 3), torch.zeros(1), torch.zeros(1), {}
+
+  env = SimpleNamespace(device="cpu", step_dt=0.01, render=render)
+  vec = SimpleNamespace(unwrapped=env, device="cpu", reset=reset, step=step)
+  runner._video_env = cast(Any, vec)
+  runner.video_cfg = {"enabled": True, "num_steps": 5, "seed": 3}
+  runner.device = "cpu"
+  runner.logger = cast(
+    Any, SimpleNamespace(log_dir=str(tmp_path), writer=mock.Mock(spec=LogWriter))
+  )
+  setattr(  # noqa: B010  (an instance override of the method)
+    runner,
+    "_video_policy",
+    lambda env: contextlib.nullcontext(lambda obs: torch.zeros(1, 2)),
+  )
+  return runner, draws
+
+
+def test_record_video_writes_uploads_and_leaves_training_rng(tmp_path: Path) -> None:
+  runner, draws = _video_runner(tmp_path)
+  torch.manual_seed(123)
+  state = torch.get_rng_state()
+  path = runner.record_video(7)
+  assert path == tmp_path / "videos" / "model_7.mp4"
+  video = media.read_video(path)
+  assert video.metadata is not None and video.metadata.fps == 100
+  assert video.shape[:3] == (5, 48, 64)
+  runner.logger.writer.save_video.assert_called_once_with(path, 7)
+  # Training's random state is untouched, and the video's draws are seeded alike
+  # at every checkpoint.
+  assert torch.equal(torch.get_rng_state(), state)
+  runner.record_video(8)
+  torch.manual_seed(3)
+  assert draws == [float(torch.rand(1))] * 2
+  # A checkpoint saved twice (the final re-save) is recorded once.
+  assert runner.record_video(7) == path and len(draws) == 2
+
+
+def test_record_video_failure_never_raises(tmp_path: Path) -> None:
+  runner, _ = _video_runner(tmp_path, fail=True)
+  assert runner.record_video(3) is None
+  assert not (tmp_path / "videos" / "model_3.mp4").exists()
+  runner.logger.writer.save_video.assert_not_called()
+  runner.video_cfg["enabled"] = False
+  assert runner.record_video(4) is None

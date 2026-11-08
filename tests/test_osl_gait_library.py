@@ -18,6 +18,7 @@ from collections import Counter
 from types import SimpleNamespace
 from typing import Any, cast
 
+import mujoco
 import numpy as np
 import pytest
 import torch
@@ -27,8 +28,10 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   OSL_TORQUE_JOINTS,
   Model,
   Socket,
+  get_spec,
 )
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.scripts.play import strip_disturbances
 from mjlab.tasks.osl_gait_library import mdp
 from mjlab.tasks.osl_gait_library.config.dr import FOOT_GEOMS, SLIDE_SCALE, OslDrCfg
 from mjlab.tasks.osl_gait_library.config.env_cfgs import (
@@ -57,15 +60,16 @@ from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.config.rl_cfg import MuscleMimicPpoCfg, OslMimicRunnerCfg
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
+from mjlab.viewer.native.visualizer import MujocoNativeDebugVisualizer
 
 # task id -> (model, socket, reward)
 TASKS: dict[str, tuple[Model, Socket, Reward]] = {
-  "Mjlab-Gait-Library-OSL-Fullbody": ("robot", "rigid", "mimic"),
-  "Mjlab-Gait-Library-OSL-Fullbody-Compliant": ("robot", "compliant", "mimic"),
+  "Mjlab-Gait-Library-OSL-Fullbody-ROBOT": ("robot", "rigid", "mimic"),
+  "Mjlab-Gait-Library-OSL-Fullbody-ROBOT-Compliant": ("robot", "compliant", "mimic"),
   "Mjlab-Gait-Library-OSL-Fullbody-MSK-CLF": ("msk", "rigid", "clf"),
   "Mjlab-Gait-Library-OSL-Fullbody-MSK-CLF-Compliant": ("msk", "compliant", "clf"),
 }
-_MODELS: tuple[tuple[Model, str], ...] = (("robot", ""), ("msk", "-MSK"))
+_MODELS: tuple[tuple[Model, str], ...] = (("robot", "-ROBOT"), ("msk", "-MSK"))
 _REWARDS: tuple[tuple[Reward, str], ...] = (("mimic", ""), ("clf", "-CLF"))
 _SOCKETS: tuple[tuple[Socket, str], ...] = (("rigid", ""), ("compliant", "-Compliant"))
 UNICYCLE_TASKS: dict[str, tuple[Model, Socket, Reward]] = {
@@ -663,6 +667,131 @@ def test_twist_limit_curriculum_stages() -> None:
   assert cmd.twist_limit is None and math.isinf(float(log["max_wz"]))
 
 
+##
+# Play: the twist pin, the reference ghost, the nominal plant.
+##
+
+
+def test_pinned_twist_replaces_the_sampler() -> None:
+  cmd = _indexed_command(
+    _unicycle_grid(),
+    sampling="library",
+    twist_metric_weights=UNICYCLE_TWIST_METRIC_WEIGHTS,
+    fixed_twist=(0.53, 0.0, 0.22),
+    **UNICYCLE_SPLIT,
+  )
+  # Library sampling commands the nearest clip's label, as in training.
+  twist, clip = cmd._draw(64)
+  assert set(clip.tolist()) == {cmd.nearest_clip((0.53, 0.0, 0.22))}
+  torch.testing.assert_close(twist, torch.tensor([[0.55, 0.0, 0.2]]).repeat(64, 1))
+  # The pin ignores the twist cap: it is an explicit choice.
+  cmd.set_twist_limit((0.6, 0.6, 0.1))
+  cmd._fixed_twist = (1.0, 0.0, 0.4)
+  twist, _ = cmd._draw(4)
+  torch.testing.assert_close(twist, torch.tensor([[1.0, 0.0, 0.4]]).repeat(4, 1))
+
+
+def test_set_fixed_twist_switches_every_env_at_the_next_step() -> None:
+  cmd = _fake_command()
+  cmd.frame[:] = torch.tensor([50, 25, 75, 99])
+  # Continuous sampling commands the pinned twist itself; walk_b (1.3) is nearest.
+  cmd.set_fixed_twist((1.2, 0.0, 0.0))
+  assert cmd.fixed_twist is None and cmd.clip.tolist() == [0, 0, 0, 0]  # posted only
+  cmd._update_command(None)
+  assert cmd.fixed_twist == (1.2, 0.0, 0.0)
+  assert cmd.clip.tolist() == [1, 1, 1, 1]
+  torch.testing.assert_close(cmd.twist_command, torch.tensor([[1.2, 0.0, 0.0]] * 4))
+  # The timer-resample path: phase kept (then one step on), blending in.
+  assert cmd.frame.tolist() == [41, 21, 61, 0]
+  assert bool((cmd.alpha < 1.0).all())
+  # Later timer resamples keep the pin; releasing it returns to the sampler.
+  cmd._sample_twist = lambda n: torch.tensor([[1.0, 0.0, 0.0]]).repeat(n, 1)  # type: ignore[method-assign]
+  cmd._switch(torch.arange(4))
+  assert cmd.clip.tolist() == [1, 1, 1, 1]
+  cmd.set_fixed_twist(None)
+  cmd._update_command(None)
+  assert cmd.fixed_twist is None and cmd.clip.tolist() == [0, 0, 0, 0]
+
+
+@pytest.mark.parametrize(
+  "model, socket", [("robot", "rigid"), ("msk", "rigid"), ("msk", "compliant")]
+)
+def test_reference_ghost_is_the_robot_model_with_socket_and_osl(
+  model: Model, socket: Socket
+) -> None:
+  spec = get_spec(model, socket)
+  task_model = spec.compile()
+  free = mujoco.mjtJoint.mjJNT_FREE
+  joints = [
+    task_model.joint(j).name
+    for j in range(task_model.njnt)
+    if task_model.jnt_type[j] != free
+  ]
+  cmd = GaitLibraryCommand.__new__(GaitLibraryCommand)
+  cmd._env = cast(Any, SimpleNamespace(device="cpu"))
+  cmd.cfg = GaitLibraryCommandCfg(library_dir="synthetic")
+  cmd.robot = cast(Any, SimpleNamespace(joint_names=joints))
+  ghost = cmd._build_ghost()
+  g = ghost.model
+  assert g.nu == 29 and g.nq == task_model.nq  # the robot model, at the socket
+
+  # Shown: geom group 0 alone, the socket and OSL included, whether they collide or
+  # not (the stock tracking ghost shows only non-colliding geoms).
+  shown = g.geom_rgba[:, 3] > 0
+  assert np.array_equal(shown, g.geom_group == 0)
+  osl = [i for i in np.flatnonzero(shown) if g.geom(i).name.startswith("OSL_KA_L1_")]
+  assert len(osl) == 7
+  # The socket mesh collides and the foot shell does not: neither decides visibility.
+  assert g.geom("OSL_KA_L1_osl_generic_socket").contype[0] == 1
+  assert g.geom("OSL_KA_L1_osl_foot_assembly_geom_1").contype[0] == 0
+  assert not g.site_rgba[:, 3].any() and not g.tendon_rgba[:, 3].any()
+
+  # The ghost puts every body where the task's model has it, at any pose.
+  rng = np.random.default_rng(0)
+  task_data = mujoco.MjData(task_model)
+  root = np.r_[0.3, -0.2, 0.95, 0.9, 0.1, -0.2, 0.3]
+  root[3:] /= np.linalg.norm(root[3:])
+  task_data.qpos[:7] = root
+  joint_pos = rng.uniform(-0.3, 0.3, len(joints))
+  for name, q in zip(joints, joint_pos, strict=True):
+    task_data.qpos[task_model.joint(name).qposadr[0]] = q
+  ghost_data = mujoco.MjData(g)
+  ghost_data.qpos[ghost.root_adr : ghost.root_adr + 7] = root
+  ghost_data.qpos[ghost.qpos_adr] = joint_pos[ghost.joint_cols.numpy()]
+  mujoco.mj_kinematics(task_model, task_data)
+  mujoco.mj_kinematics(g, ghost_data)
+  for b in range(1, g.nbody):
+    task_body = task_model.body(g.body(b).name).id
+    np.testing.assert_allclose(ghost_data.xpos[b], task_data.xpos[task_body], atol=1e-9)
+
+  # The native viewer draws it on any task's scene, muscles or not.
+  scene = mujoco.MjvScene(task_model, maxgeom=1000)
+  MujocoNativeDebugVisualizer(scene, task_model, env_idx=0).add_ghost_mesh(
+    ghost_data.qpos.copy(), model=g
+  )
+  drawn = [geom for geom in scene.geoms[: scene.ngeom]]
+  geoms = {geom.objid for geom in drawn if geom.objtype == mujoco.mjtObj.mjOBJ_GEOM}
+  assert geoms == set(np.flatnonzero(shown).tolist())
+
+
+def test_no_disturbances_runs_the_validation_plant() -> None:
+  play = osl_gait_library_env_cfg("robot", "compliant", "mimic", "play", "unicycle")
+  motion = play.commands["motion"]
+  assert isinstance(motion, GaitLibraryCommandCfg) and motion.debug_vis  # ghost
+  assert (
+    not load_env_cfg("Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT")
+    .commands["motion"]
+    .debug_vis
+  )
+  removed = strip_disturbances(play)
+  assert set(removed) == PHYSICAL_EVENTS | {"servo_gains"}
+  validation = osl_gait_library_env_cfg(
+    "robot", "compliant", "mimic", "validation", "unicycle"
+  )
+  assert set(play.events) == set(validation.events)
+  assert _delays(play) == _delays(validation) == {"osl": (5, 5), "human": (15, 15)}
+
+
 def test_validation_groups_follow_clip_families() -> None:
   cmd = _indexed_command(UNICYCLE_TWISTS, sampling="library", **UNICYCLE_SPLIT)
   env = SimpleNamespace(
@@ -833,7 +962,7 @@ def test_unicycle_env_rollout(model: Model, reward: Reward) -> None:
   ids = robot.indexing.geom_ids.long()
   friction = env.sim.model.geom_friction[:, ids, 0]
   feet = friction[:, torch.tensor(foot, device=device)]
-  assert sum(foot) == 9 and within(feet, dr_cfg.foot_friction)
+  assert sum(foot) == 8 and within(feet, dr_cfg.foot_friction)
   assert bool((feet == feet[:, :1]).all())  # one draw per env, shared by the feet
   assert float(feet[:, 0].std()) > 0.0
   default = env.sim.get_default_field("geom_friction")[ids, 0]

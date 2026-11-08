@@ -37,13 +37,13 @@ from mjlab.utils.noise import UniformNoiseCfg
 
 # task id -> (model, socket, number of non-free joints, action dims by term)
 TASKS = {
-  "Mjlab-Tracking-Flat-OSL-Fullbody": (
+  "Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT": (
     "robot",
     "rigid",
     73,
     {"joint_pos": 27, "osl_effort": 2},
   ),
-  "Mjlab-Tracking-Flat-OSL-Fullbody-Compliant": (
+  "Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT-Compliant": (
     "robot",
     "compliant",
     77,
@@ -225,7 +225,7 @@ def test_padding_rejects_unknown_width(tmp_path: Path, synthetic_clip: Path) -> 
   arrays["joint_vel"] = arrays["joint_vel"][:, :70]
   bad = tmp_path / "bad.npz"
   np.savez(bad, **arrays)
-  cfg = load_env_cfg("Mjlab-Tracking-Flat-OSL-Fullbody-Compliant", play=True)
+  cfg = load_env_cfg("Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT-Compliant", play=True)
   motion = cfg.commands["motion"]
   assert isinstance(motion, MotionCommandCfg)
   motion.motion_file = str(bad)

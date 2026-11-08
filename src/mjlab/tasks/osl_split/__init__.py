@@ -17,8 +17,8 @@ Stage 2 splits it:
 * physics randomization is stage 1's; perception randomization (sensor noise, bias,
   latency) applies to the OSL actor's observations only.
 
-``config`` registers the tasks (``Mjlab-Split-Unicycle-OSL-Fullbody[-MSK][-CLF]
-[-Compliant]``), ``mdp`` holds the OSL sensors' observation terms and the two-channel
+``config`` registers the tasks (``Mjlab-Split-Unicycle-OSL-Fullbody-{ROBOT,MSK}
+[-CLF][-Compliant]``), ``mdp`` holds the OSL sensors' observation terms and the two-channel
 reward, ``rl`` the two-agent PPO, its runner and the stage-1 warm-start converter, and
 ``scripts`` the converter's command line and the two-stage pipeline driver.
 """

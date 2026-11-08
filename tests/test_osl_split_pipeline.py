@@ -476,6 +476,7 @@ def test_literals_mirror_mjlab() -> None:
   assert set(get_args(two_stage.Model)) == set(get_args(osl_constants.Model))
   assert set(get_args(two_stage.Socket)) == set(get_args(osl_constants.Socket))
   assert set(get_args(two_stage.Reward)) == set(get_args(mimic_env_cfgs.Reward))
+  assert two_stage.MODEL_TAGS == osl_constants.MODEL_TAGS
 
 
 @pytest.mark.parametrize(("model", "socket", "reward"), COMBOS)
@@ -501,7 +502,7 @@ def test_stage2_task_ids() -> None:
     "Mjlab-Split-Unicycle-OSL-Fullbody-MSK-CLF-Compliant"
   )
   assert two_stage.stage2_task_id("robot", "rigid", "mimic") == (
-    "Mjlab-Split-Unicycle-OSL-Fullbody"
+    "Mjlab-Split-Unicycle-OSL-Fullbody-ROBOT"
   )
   for model, socket, reward in COMBOS:
     stage1 = two_stage.stage1_task_id(model, socket, reward)

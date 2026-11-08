@@ -48,6 +48,9 @@ Model = Literal["robot", "msk"]
 Socket = Literal["rigid", "compliant"]
 Collision = Literal["mjlab", "xml"]
 
+MODEL_TAGS: dict[Model, str] = {"robot": "-ROBOT", "msk": "-MSK"}
+"""Each model's tag in the OSL task ids, right after ``OSL-Fullbody``."""
+
 ##
 # MJCF and assets.
 ##
@@ -111,6 +114,22 @@ SOCKET_JOINTS: tuple[str, ...] = (
   "socket_rotation_2",
   "socket_rotation_3",
 )
+
+CONTACT_CONE: Literal["pyramidal", "elliptic"] = "elliptic"
+CONTACT_IMPRATIO = 3.0
+"""The contact solver settings of every OSL task: mj-nlp's, under which the gait
+library's clips are solved. The elliptic cone is exact Coulomb friction, the same
+grip in every direction; MuJoCo's default pyramidal cone grants 0.71-1.0 times the
+coefficient depending on direction. impratio 3 makes friction three times harder
+than the normal direction, so loaded feet stop creeping without stiffer impacts
+(mj-nlp's contact tuning: its biggest single improvement). It applies only to the
+elliptic cone. Measured at 4096 envs: physics steps cost 16% (MSK) to 30% (robot)
+more than pyramidal with impratio 1."""
+
+OSL_FOOT_SHELL_GEOM = "OSL_KA_L1_osl_foot_assembly_geom_1"
+"""The OSL foot's visual shell mesh, which collides in the source XML."""
+OSL_SOCKET_BODY = "OSL_KA_L1_osl_generic_socket"
+PELVIS_BODY = "pelvis"
 
 # musclemimic's exact finger lists (``environments/humanoids/osl_fullbody.py``).
 # Exact names, never patterns: the v3 export renamed four right-hand joints (no
@@ -262,6 +281,30 @@ def _delete_fingers(spec: mujoco.MjSpec) -> None:
     spec.delete(element)
 
 
+def _fix_osl_contacts(spec: mujoco.MjSpec) -> None:
+  """Take the OSL foot shell out of collision and stop the socket hitting the pelvis.
+
+  The source gives the OSL two colliding sets: its seven visual geoms (meshes and
+  pylon cylinders, contype/conaffinity 1/1) and the foot's three capsules, its
+  intended floor contact. The shell's flat sole sits 1.6-2.5 mm above the capsules,
+  so it carries part of every stance once the feet sink into the soft floor (up to
+  45% of the OSL's floor force in pivots under a trained policy). mj-nlp solves the
+  gait library with the shell out of collision, so the reference never leans on it.
+
+  The socket and the pelvis's ``pelvis_col_r`` ellipsoid are not parent and child, so
+  MuJoCo does not filter them. The reference never brings them together, but the
+  compliant socket does once it pistons up at hip extension, pressing hundreds of
+  newtons into the pelvis. The pair is excluded in both sockets. Only these two
+  bodies are affected: the socket body carries no other geom.
+  """
+  shell = spec.geom(OSL_FOOT_SHELL_GEOM)
+  if shell is None:
+    raise ValueError(f"No geom {OSL_FOOT_SHELL_GEOM!r}. Was the model regenerated?")
+  shell.contype = 0
+  shell.conaffinity = 0
+  spec.add_exclude(bodyname1=PELVIS_BODY, bodyname2=OSL_SOCKET_BODY)
+
+
 def get_spec(
   model: Model = "robot", socket: Socket = "rigid", fingers: bool = False
 ) -> mujoco.MjSpec:
@@ -283,6 +326,7 @@ def get_spec(
   _strip_keyframes(spec)
   if model == "msk" and not fingers:
     _delete_fingers(spec)
+  _fix_osl_contacts(spec)
   return spec
 
 

@@ -11,9 +11,12 @@ from typing import Literal
 import torch
 import tyro
 
-from mjlab.envs import ManagerBasedRlEnv
+from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
 from mjlab.scripts._cli import maybe_print_top_level_help
+from mjlab.tasks.osl_gait_library.config.dr import nominal_plant
+from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommand, GaitLibraryCommandCfg
+from mjlab.tasks.osl_gait_library.play import TELEOP_HELP, make_twist_teleop
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.os import get_wandb_checkpoint_path
@@ -51,9 +54,35 @@ class PlayConfig:
   """Disable all termination conditions (useful for viewing motions with dummy agents)."""
   log_root: str = "logs/rsl_rl"
   """Root directory under which experiment logs are written."""
+  no_disturbances: bool = False
+  """Replay on the nominal plant: drop every event but the resets (startup domain
+  randomization, pushes). Tracking tasks also zero the reference-state-init noise;
+  gait-library tasks fix each actuator delay at the middle of its range, as their
+  validation does."""
+  twist: tuple[float, float, float] | None = None
+  """Gait-library tasks only: pin every env to this twist, comma-separated
+  ``vx,vy,wz`` (e.g. ``--twist 0,0,1.0`` to turn left, ``--twist 0,0,0`` to stand).
+  The native viewer also drives the twist from the keyboard (key map printed at
+  start-up), viser from the "Twist command" sliders."""
 
   # Internal flag used by demo script.
   _demo_mode: tyro.conf.Suppress[bool] = False
+
+
+def strip_disturbances(env_cfg: ManagerBasedRlEnvCfg) -> list[str]:
+  """Make ``env_cfg`` a nominal-plant replay (``PlayConfig.no_disturbances``), in
+  place. Returns the names of the removed event terms."""
+  motion = env_cfg.commands.get("motion")
+  if isinstance(motion, GaitLibraryCommandCfg):
+    return nominal_plant(env_cfg)
+  removed = [name for name, term in env_cfg.events.items() if term.mode != "reset"]
+  for name in removed:
+    del env_cfg.events[name]
+  if isinstance(motion, MotionCommandCfg):
+    motion.joint_position_range = (0.0, 0.0)
+    motion.pose_range = {}
+    motion.velocity_range = {}
+  return removed
 
 
 def run_play(task_id: str, cfg: PlayConfig):
@@ -71,6 +100,20 @@ def run_play(task_id: str, cfg: PlayConfig):
   if cfg.no_terminations:
     env_cfg.terminations = {}
     print("[INFO]: Terminations disabled")
+
+  if cfg.no_disturbances:
+    removed = strip_disturbances(env_cfg)
+    print(f"[INFO]: Disturbances disabled (removed events: {removed})")
+
+  if cfg.twist is not None:
+    library_cfg = env_cfg.commands.get("motion")
+    if not isinstance(library_cfg, GaitLibraryCommandCfg):
+      raise ValueError(
+        f"--twist needs a gait-library task (GaitLibraryCommandCfg); {task_id} has "
+        f"{type(library_cfg).__name__}."
+      )
+    library_cfg.fixed_twist = cfg.twist
+    print(f"[INFO]: Twist pinned to {cfg.twist} for every env")
 
   # Check if this is a tracking task by checking for motion command.
   is_tracking_task = "motion" in env_cfg.commands and isinstance(
@@ -288,7 +331,13 @@ def run_play(task_id: str, cfg: PlayConfig):
     resolved_viewer = cfg.viewer
 
   if resolved_viewer == "native":
-    NativeMujocoViewer(env, policy).run()
+    key_callback = None
+    if "motion" in env.unwrapped.command_manager.active_terms:
+      term = env.unwrapped.command_manager.get_term("motion")
+      if isinstance(term, GaitLibraryCommand):
+        key_callback = make_twist_teleop(term)
+        print(TELEOP_HELP)
+    NativeMujocoViewer(env, policy, key_callback=key_callback).run()
   elif resolved_viewer == "viser":
     ViserPlayViewer(env, policy, checkpoint_manager=ckpt_manager).run()
   else:

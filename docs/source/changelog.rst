@@ -14,7 +14,7 @@ Added
 - Added ``SimulationCfg.graph_conditional`` to toggle MuJoCo Warp's CUDA graph
   conditional nodes, which require CUDA 12.4 or newer.
 - OSL full-body walking tracking tasks for the ``osl_fullbody`` robot model:
-  ``Mjlab-Tracking-Flat-OSL-Fullbody`` and ``-Compliant`` (position servos and
+  ``Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT`` and ``-Compliant`` (position servos and
   prosthesis motors). Stock tracking rewards, with coupled joint resets, one motion
   clip shared across sockets, pelvis IMUs, a self-collision penalty over the model's
   explicit contact pairs, a gravity-direction tilt termination (the stock check is
@@ -23,7 +23,7 @@ Added
 - ``Mjlab-Mimic-OSL-Fullbody`` tasks: musclemimic's three ``osl_fullbody`` imitation
   configs (robot and musculoskeletal model with MimicReward, musculoskeletal model
   with CLFReward) plus a robot CLFReward variant, each with a rigid or compliant
-  socket (``-MSK``, ``-CLF`` and ``-Compliant`` suffixes). The ``tasks/osl_mimic``
+  socket (``-ROBOT``/``-MSK``, ``-CLF`` and ``-Compliant`` suffixes). The ``tasks/osl_mimic``
   package reproduces musclemimic's simulation settings (100 Hz Euler control, its
   contact model), observations (muscle state, touch, a 1 s reference lookahead),
   reward, terminations and exact-reference random starts, and trains with its PPO:
@@ -32,8 +32,8 @@ Added
   validation.
 - ``Mjlab-Gait-Library-OSL-Fullbody`` tasks: twist-commanded imitation over a
   looping clipper gait library (``--env.commands.motion.library-dir``), for the
-  robot model with MimicReward and the musculoskeletal model with CLFReward
-  (``-MSK-CLF``), each with a rigid or compliant socket (``-Compliant``). Each is
+  robot model with MimicReward (``-ROBOT``) and the musculoskeletal model with
+  CLFReward (``-MSK-CLF``), each with a rigid or compliant socket (``-Compliant``). Each is
   the matching ``Mjlab-Mimic-OSL-Fullbody`` task with a unicycle twist command that
   snaps to the nearest clip, keeps the stride phase across blended switches and
   unrolls each loop by its stride displacement, plus a stride-averaged twist reward,
@@ -41,7 +41,8 @@ Added
   bootstrapping, and validation over every clip.
 - ``Mjlab-Gait-Library-Unicycle-OSL-Fullbody`` tasks: the gait-library task over a
   full unicycle library (forward and backward arcs, pivots, idle), for every
-  combination of model (``-MSK``), reward (``-CLF``) and socket (``-Compliant``).
+  combination of model (``-ROBOT``, ``-MSK``), reward (``-CLF``) and socket
+  (``-Compliant``).
   Commands are drawn at random from the library's clips in sesteban's G1 unicycle
   mode split, and the command takes a twist cap that a curriculum can raise
   (``twist_limit_curriculum``). Training randomizes the physical properties (torso
@@ -51,7 +52,8 @@ Added
 - The gait-library command gained a library sampling mode, a union of sampling boxes
   for libraries whose twist grid is not a rectangle, and a load-time check that the
   library covers every twist the sampler can command.
-- ``Mjlab-Split-Unicycle-OSL-Fullbody`` tasks (``-MSK``, ``-CLF``, ``-Compliant``),
+- ``Mjlab-Split-Unicycle-OSL-Fullbody`` tasks (``-ROBOT``/``-MSK``, ``-CLF``,
+  ``-Compliant``),
   stage 2 of the OSL plan: the unified unicycle policy's human part, warm-started
   exactly from a stage-1 run, trains beside a fresh OSL actor that sees only the
   prosthesis's own sensors, each with its own critic, PPO clip, optimizer and reward
@@ -64,8 +66,23 @@ Added
   checking the run's saved configs against this checkout; ``--hf-repo`` uploads it to
   Hugging Face. The manifest names each policy's default inference: the raw mean for
   the robot model, the noise-averaged clipped-Gaussian action for the musculoskeletal
-  one, and records the actuator delays it trained with. The OSL training runners now
-  also export ``<run>.onnx`` with this metadata at every checkpoint.
+  one, and records the actuator delays it trained with.
+- Play controls for the gait-library tasks, after sesteban's G1 unicycle play:
+  ``--twist vx,vy,wz`` pins every env to the clip nearest a twist, the native viewer
+  drives the pin from the keyboard (arrow keys, Page Up/Down, Delete, Home) and viser
+  from a "Twist command" panel, and the viewer draws the served reference as a ghost
+  of the robot model (socket and OSL included, for the musculoskeletal tasks too).
+  ``--no-disturbances`` replays on the nominal plant: every event but the resets is
+  removed, tracking tasks zero their reset noise, and gait-library tasks fix each
+  actuator delay at the middle of its range, as their validation does.
+- A video at every checkpoint of the OSL imitation, gait-library and split runners,
+  as musclemimic records at its validations: one env of the task's play mode on the
+  nominal plant runs the deterministic policy for 30 s (``--agent.video.num-steps``,
+  3000 control steps) with the reference ghost. It is saved as
+  ``videos/model_<it>.mp4`` in the run directory and uploaded to W&B (``video``, at
+  the checkpoint's iteration). Its draws are seeded, so every checkpoint plays the
+  same command sequence, and training's random state is untouched; a failed
+  recording never ends the run. ``--agent.video.enabled False`` turns it off.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and
@@ -80,6 +97,26 @@ Added
 
 Changed
 ^^^^^^^
+
+- The OSL robot-model task ids name their model like the musculoskeletal ones:
+  ``-ROBOT`` after ``OSL-Fullbody`` (e.g.
+  ``Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT-CLF-Compliant``,
+  ``Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT``). Experiment names, and so the runs'
+  log directories, are unchanged.
+- ``osl_fullbody``'s ``get_spec`` takes the OSL foot shell mesh out of collision, so
+  the prosthetic foot touches the floor only through its three capsules, as in the
+  mj-nlp solves that produce the gait library, and excludes contacts between the
+  socket and the pelvis, which the compliant socket drove together at hip extension.
+  This changes the physics of every ``collision="xml"`` task (imitation, gait library,
+  split); the foot-friction randomization no longer includes the shell.
+- Every OSL task (imitation, gait library, split and the G1-style tracking tasks)
+  simulates contacts with an elliptic friction cone and ``impratio`` 3, mj-nlp's
+  settings for the gait library's solves, instead of MuJoCo's default pyramidal cone
+  and ``impratio`` 1: friction is the same in every direction and loaded feet stop
+  creeping. Physics steps cost 16% (musculoskeletal) to 30% (robot) more at 4096
+  environments.
+- ``DebugVisualizer.add_ghost_mesh`` accepts a model other than the scene's in the
+  native and viser viewers: each ghost model gets its own ``MjData``.
 
 - Bumped ``rsl-rl-lib`` from 5.5.0 to 5.5.1. This removes the need for capping
   ``wandb`` below 0.29.

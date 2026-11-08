@@ -1,18 +1,25 @@
 """Task registration: the gait-library tasks.
 
 The forward-walking tasks of round 1: the robot model with MimicReward
-(``Mjlab-Gait-Library-OSL-Fullbody``) and the musculoskeletal model with CLFReward
+(``Mjlab-Gait-Library-OSL-Fullbody-ROBOT``) and the musculoskeletal model with CLFReward
 (``-MSK-CLF``), rigid and compliant socket. The unicycle tasks, with domain
-randomization: every combination of model (robot, ``-MSK``), reward (MimicReward,
-``-CLF``) and socket (rigid, ``-Compliant``). Train with, e.g.::
+randomization: every combination of model (``-ROBOT``, ``-MSK``), reward
+(MimicReward, ``-CLF``) and socket (rigid, ``-Compliant``). Train with, e.g.::
 
-  uv run train Mjlab-Gait-Library-OSL-Fullbody \\
+  uv run train Mjlab-Gait-Library-OSL-Fullbody-ROBOT \\
     --env.commands.motion.library-dir <100 Hz clipper forward library folder>
   uv run train Mjlab-Gait-Library-Unicycle-OSL-Fullbody-MSK-CLF \\
     --env.commands.motion.library-dir <100 Hz clipper unicycle library folder>
+
+Play takes no ``--env`` overrides, so it reads the library from
+``MJLAB_OSL_GAIT_LIBRARY`` (forward) or ``MJLAB_OSL_UNICYCLE_LIBRARY`` (unicycle)::
+
+  MJLAB_OSL_UNICYCLE_LIBRARY=<folder> uv run play \\
+    Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT --checkpoint-file <model_N.pt> \\
+    [--twist 1.0,0,0.3] [--no-disturbances True]
 """
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import MODEL_TAGS, Model, Socket
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.registry import register_mjlab_task
 
@@ -22,14 +29,14 @@ from .rl_cfg import osl_gait_library_runner_cfg
 
 # task id -> (model, socket, reward, variant, experiment name)
 _VARIANTS: dict[str, tuple[Model, Socket, Reward, Variant, str]] = {
-  "Mjlab-Gait-Library-OSL-Fullbody": (
+  "Mjlab-Gait-Library-OSL-Fullbody-ROBOT": (
     "robot",
     "rigid",
     "mimic",
     "walk_fwd",
     "osl_fullbody_gait_library",
   ),
-  "Mjlab-Gait-Library-OSL-Fullbody-Compliant": (
+  "Mjlab-Gait-Library-OSL-Fullbody-ROBOT-Compliant": (
     "robot",
     "compliant",
     "mimic",
@@ -51,7 +58,7 @@ _VARIANTS: dict[str, tuple[Model, Socket, Reward, Variant, str]] = {
     "osl_fullbody_gait_library_msk_clf_compliant",
   ),
 }
-_MODELS: tuple[tuple[Model, str], ...] = (("robot", ""), ("msk", "-MSK"))
+_MODELS: tuple[tuple[Model, str], ...] = tuple(MODEL_TAGS.items())
 _REWARDS: tuple[tuple[Reward, str], ...] = (("mimic", ""), ("clf", "-CLF"))
 _SOCKETS: tuple[tuple[Socket, str], ...] = (("rigid", ""), ("compliant", "-Compliant"))
 for _model, _model_tag in _MODELS:

@@ -41,9 +41,11 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
 
     # State used only by the ghost visualization. The model is a shared
     # reference and must not be modified; ghost transparency is controlled
-    # through the mjVIS_TRANSPARENT flag rather than per-geom alpha.
+    # through the mjVIS_TRANSPARENT flag rather than per-geom alpha. Each ghost
+    # model gets its own MjData, made on first use, so a ghost may use a model
+    # other than the scene's.
     self._ref_mj_model = mj_model
-    self._mj_data = mujoco.MjData(mj_model)
+    self._ghost_data: dict[int, tuple[mujoco.MjModel, mujoco.MjData]] = {}
     self._vopt = mujoco.MjvOption()
     self._vopt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True
     self._pert = mujoco.MjvPerturb()
@@ -102,8 +104,8 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
     Args:
       qpos: Joint positions for the ghost pose
       model: MuJoCo model with pre-configured appearance (geom_rgba for colors).
-        Must be structurally identical to the model this visualizer was
-        created with, since it is evaluated against the internal MjData.
+        It may differ from the model this visualizer was created with: each
+        ghost model is evaluated against its own MjData.
       mocap_pos: Optional mocap position(s) for fixed-base entities
       mocap_quat: Optional mocap quaternion(s) for fixed-base entities
       alpha: Transparency override (not used in MuJoCo implementation)
@@ -111,24 +113,29 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
     """
     del alpha, label  # Unused.
 
-    self._mj_data.qpos[:] = qpos
+    # The model is held with its data, so its id cannot be reused while cached.
+    entry = self._ghost_data.get(id(model))
+    if entry is None:
+      entry = self._ghost_data[id(model)] = (model, mujoco.MjData(model))
+    data = entry[1]
+    data.qpos[:] = qpos
     if mocap_pos is not None and model.nmocap > 0:
       mocap_pos_arr = np.asarray(mocap_pos)
       if mocap_pos_arr.ndim == 1:
-        self._mj_data.mocap_pos[0] = mocap_pos_arr
+        data.mocap_pos[0] = mocap_pos_arr
       else:
-        self._mj_data.mocap_pos[:] = mocap_pos_arr
+        data.mocap_pos[:] = mocap_pos_arr
     if mocap_quat is not None and model.nmocap > 0:
       mocap_quat_arr = np.asarray(mocap_quat)
       if mocap_quat_arr.ndim == 1:
-        self._mj_data.mocap_quat[0] = mocap_quat_arr
+        data.mocap_quat[0] = mocap_quat_arr
       else:
-        self._mj_data.mocap_quat[:] = mocap_quat_arr
-    mujoco.mj_forward(model, self._mj_data)
+        data.mocap_quat[:] = mocap_quat_arr
+    mujoco.mj_forward(model, data)
 
     mujoco.mjv_addGeoms(
       model,
-      self._mj_data,
+      data,
       self._vopt,
       self._pert,
       mujoco.mjtCatBit.mjCAT_DYNAMIC.value,

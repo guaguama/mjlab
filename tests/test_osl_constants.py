@@ -7,8 +7,10 @@ import mujoco
 import numpy as np
 import pytest
 
+import mjlab.tasks  # noqa: F401  (registers the tasks)
 from mjlab.asset_zoo.robots.osl_fullbody import osl_constants
 from mjlab.entity import Entity
+from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.utils.mujoco import detect_command_field, is_position_actuator
 
 MUSCLEMIMIC_MODEL = (
@@ -234,6 +236,34 @@ def test_collision_set(model: mujoco.MjModel) -> None:
     i = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
     assert model.geom_condim[i] == 3
     assert model.geom_friction[i][0] == pytest.approx(0.6)
+
+
+def test_xml_contacts_drop_the_shell_and_socket_pelvis(variant: Variant) -> None:
+  """With the model's own contacts (``collision="xml"``), the OSL foot touches the
+  floor only through its capsules, and the socket never touches the pelvis."""
+  model = osl_constants.get_spec(*variant).compile()
+  geom = model.geom(osl_constants.OSL_FOOT_SHELL_GEOM)
+  assert (int(geom.contype[0]), int(geom.conaffinity[0])) == (0, 0)
+  for i in range(3):
+    capsule = model.geom(f"OSL_KA_L1_osl_foot_col{i + 1}")
+    assert int(capsule.contype[0]) == 1
+  pelvis = model.body(osl_constants.PELVIS_BODY).id
+  socket = model.body(osl_constants.OSL_SOCKET_BODY).id
+  signatures = set(model.exclude_signature.tolist())
+  assert (pelvis << 16) + socket in signatures or (socket << 16) + pelvis in signatures
+  # The socket body carries nothing but the socket mesh, so the exclude drops no
+  # other contact.
+  assert int(model.body_geomnum[socket]) == 1
+
+
+def test_every_osl_task_uses_the_contact_solver_settings() -> None:
+  """mj-nlp's elliptic cone and impratio, in training and play, for all 30 tasks."""
+  tasks = [task for task in list_tasks() if "OSL" in task]
+  assert len(tasks) == 30
+  for task in tasks:
+    for play in (False, True):
+      sim = load_env_cfg(task, play=play).sim.mujoco
+      assert (sim.cone, sim.impratio) == ("elliptic", 3.0), task
 
 
 def test_initial_pose_is_on_equality_manifold(keyframe_data: mujoco.MjData) -> None:

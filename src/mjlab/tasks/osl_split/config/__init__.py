@@ -1,6 +1,6 @@
 """Task registration: the stage-2 split tasks.
 
-Every combination of model (robot, ``-MSK``), reward (MimicReward, ``-CLF``) and
+Every combination of model (``-ROBOT``, ``-MSK``), reward (MimicReward, ``-CLF``) and
 socket (rigid, ``-Compliant``) over the unicycle library, as stage 1's unicycle tasks
 (``Mjlab-Gait-Library-Unicycle-OSL-Fullbody...``). A split task starts from a
 stage-1 run of the same model and socket; the reward may differ (the reward switch:
@@ -30,7 +30,7 @@ python src/mjlab/tasks/osl_split/scripts/two_stage.py`` (a file, not ``-m``: see
 docstring) runs stage 1, the conversion and stage 2 in sequence.
 """
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import MODEL_TAGS, Model, Socket
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.registry import register_mjlab_task
 
@@ -44,7 +44,7 @@ EXPERIMENT_PREFIX = "osl_fullbody_split_unicycle"
 
 def split_task_id(model: Model, socket: Socket, reward: Reward) -> str:
   """``TASK_PREFIX`` plus the model, reward and socket tags, in stage 1's order."""
-  tags = ("-MSK" if model == "msk" else "") + ("-CLF" if reward == "clf" else "")
+  tags = MODEL_TAGS[model] + ("-CLF" if reward == "clf" else "")
   return TASK_PREFIX + tags + ("-Compliant" if socket == "compliant" else "")
 
 

@@ -11,6 +11,8 @@ from dataclasses import fields
 import mujoco
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  CONTACT_CONE,
+  CONTACT_IMPRATIO,
   FULL_COLLISION,
   OSL_TORQUE_JOINTS,
   SERVO_JOINTS,
@@ -209,6 +211,8 @@ def osl_fullbody_tracking_env_cfg(
   cfg.viewer.body_name = "pelvis"
 
   cfg.sim.mujoco.timestep = TIMESTEP
+  cfg.sim.mujoco.cone = CONTACT_CONE
+  cfg.sim.mujoco.impratio = CONTACT_IMPRATIO
   cfg.decimation = DECIMATION
   # The 44 equality rows are unconditional, so the stock 250/35 budget leaves too
   # little room under RSI; overflow silently drops constraints.

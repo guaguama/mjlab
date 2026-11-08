@@ -35,6 +35,7 @@ from mjlab.tasks.osl_mimic.config.rl_cfg import (
   INIT_STD,
   MuscleMimicModelCfg,
   MuscleMimicPpoCfg,
+  OslMimicVideoCfg,
 )
 
 STAGE2_ITERATIONS = 1000
@@ -234,6 +235,7 @@ class SplitRunnerCfg(RslRlOnPolicyRunnerCfg):
   """The OSL critic: a copy of the stage-1 critic, so stage 1's architecture."""
   algorithm: SplitPpoCfg = field(default_factory=SplitPpoCfg)  # pyright: ignore
   validation: SplitValidationCfg = field(default_factory=SplitValidationCfg)
+  video: OslMimicVideoCfg = field(default_factory=OslMimicVideoCfg)
   warm_start: WarmStartCfg = field(default_factory=WarmStartCfg)
   freeze: SplitFreezeCfg = field(default_factory=SplitFreezeCfg)
   blend: SplitBlendCfg = field(default_factory=SplitBlendCfg)

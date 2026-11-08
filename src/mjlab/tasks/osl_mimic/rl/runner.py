@@ -11,31 +11,41 @@ completed episodes' length and return. They are logged under ``Validation/``.
 Two other departures from rsl_rl's loop, both musclemimic's: initial episode lengths
 are never randomized, and the rollout uses the algorithm's own normalization modes.
 
-Every checkpoint also exports the actor, as mjlab's stock runners do: the run
-directory's ``<run>.onnx`` (overwritten at each save) with its deployment metadata
-embedded and next to it as ``<run>.json`` (see :mod:`.export`). A deployment bundle
-for a chosen checkpoint comes from ``mjlab.tasks.osl_gait_library.export``.
+Every checkpoint also gets a video, as musclemimic records at its validations: one
+env of the task's play mode on the nominal plant (the reference ghost on, where the
+task draws one) runs the deterministic policy for ``video.num_steps`` control steps
+at the control rate. It is written next to the checkpoint as
+``videos/model_<it>.mp4`` and uploaded through the run's logger (W&B: ``video`` at
+the checkpoint's iteration). A failed recording never ends the run.
 """
 
 from __future__ import annotations
 
 import os
 import time
-from typing import cast
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Literal, cast
 
+import mediapy as media
 import torch
 from rsl_rl.env import VecEnv
 from rsl_rl.utils import check_nan
 from rsl_rl.utils.log_writer import LogWriter
+from tensordict import TensorDict
 
-from mjlab.envs import ManagerBasedRlEnv
+from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.osl_mimic.mdp import MimicMotionCommandCfg, mimic_reward
 
-from .export import export_policy
 from .models import MuscleMimicMLPModel
 from .ppo import MuscleMimicPPO
+
+EvalPurpose = Literal["validation", "video"]
+"""What an evaluation env is built for: validation runs the task's validation mode,
+videos its play mode."""
 
 
 class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
@@ -55,8 +65,10 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
   ) -> None:
     kwargs.pop("registry_name", None)  # Passed to tracking runners; unused here.
     self.validation_cfg: dict = dict(train_cfg.get("validation") or {})
+    self.video_cfg: dict = dict(train_cfg.get("video") or {})
     super().__init__(env, train_cfg, log_dir, device)
     self._validation_env: RslRlVecEnvWrapper | None = None
+    self._video_env: RslRlVecEnvWrapper | None = None
 
   ##
   # Training loop: rsl_rl's, plus validation.
@@ -116,47 +128,50 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
 
       if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
         self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore[arg-type]
+        self.record_video(it)
 
     if self.logger.writer is not None:
-      self.save(
-        os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt")  # type: ignore[arg-type]
-      )
+      it = self.current_learning_iteration
+      self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore[arg-type]
+      self.record_video(it)
+      self.close_video_env()
       self.logger.stop_logging_writer()
-
-  def save(self, path: str, infos=None) -> None:
-    """Checkpoint, then export the actor (ONNX + metadata) into the run directory.
-
-    A failed export never ends the run: the checkpoint holds the actor."""
-    super().save(path, infos)
-    _, _, onnx_path = self._get_export_paths(path)
-    try:
-      export_policy(self.env.unwrapped, self.alg.get_policy(), onnx_path)
-    except Exception as err:
-      print(f"[WARN] ONNX export failed (training continues): {err}")
-      return
-    writer = self.logger.writer
-    if self.cfg.get("upload_model", False) and isinstance(writer, LogWriter):
-      writer.save_file(str(onnx_path))
-      writer.save_file(str(onnx_path.with_suffix(".json")))
 
   ##
   # Validation.
   ##
 
-  def _make_validation_env(self) -> RslRlVecEnvWrapper:
+  def _eval_env_cfg(self, purpose: EvalPurpose) -> ManagerBasedRlEnvCfg:
+    """The task's config for an evaluation env, with the training env's motion."""
     from mjlab.tasks.osl_mimic.config.env_cfgs import osl_mimic_env_cfg
 
     v = self.validation_cfg
-    cfg = osl_mimic_env_cfg(v["model"], v["socket"], v["reward"], mode="validation")
-    cfg.scene.num_envs = int(v.get("num_envs", 100))
+    mode = "validation" if purpose == "validation" else "play"
+    cfg = osl_mimic_env_cfg(v["model"], v["socket"], v["reward"], mode=mode)
     train_motion = self.env.unwrapped.cfg.commands["motion"]
     motion = cfg.commands["motion"]
     assert isinstance(train_motion, MimicMotionCommandCfg)
     assert isinstance(motion, MimicMotionCommandCfg)
     motion.motion_file = train_motion.motion_file
-    return RslRlVecEnvWrapper(
-      ManagerBasedRlEnv(cfg=cfg, device=self.env.unwrapped.device)
+    return cfg
+
+  def _validation_num_envs(self) -> int:
+    return int(self.validation_cfg.get("num_envs", 100))
+
+  def _build_eval_env(
+    self, cfg: ManagerBasedRlEnvCfg, render: bool = False
+  ) -> RslRlVecEnvWrapper:
+    env = ManagerBasedRlEnv(
+      cfg=cfg,
+      device=self.env.unwrapped.device,
+      render_mode="rgb_array" if render else None,
     )
+    return RslRlVecEnvWrapper(env)
+
+  def _make_validation_env(self) -> RslRlVecEnvWrapper:
+    cfg = self._eval_env_cfg("validation")
+    cfg.scene.num_envs = self._validation_num_envs()
+    return self._build_eval_env(cfg)
 
   def _default_validation_steps(self, env: ManagerBasedRlEnv) -> int:
     """One clip length."""
@@ -262,7 +277,87 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     )
     return metrics
 
+  ##
+  # Checkpoint videos.
+  ##
+
+  def _make_video_env(self) -> RslRlVecEnvWrapper:
+    cfg = self._eval_env_cfg("video")
+    cfg.scene.num_envs = 1
+    cfg.viewer.width = int(self.video_cfg.get("width", 640))
+    cfg.viewer.height = int(self.video_cfg.get("height", 480))
+    return self._build_eval_env(cfg, render=True)
+
+  @contextmanager
+  def _video_policy(
+    self, env: ManagerBasedRlEnv
+  ) -> Iterator[Callable[[TensorDict], torch.Tensor]]:
+    """The deterministic policy (the distribution mean), as validation runs it, with
+    its observation statistics frozen."""
+    del env
+    policy = cast(MuscleMimicMLPModel, self.alg.get_policy())
+    policy.set_norm_mode("frozen")
+    try:
+      yield policy
+    finally:
+      policy.set_norm_mode("update")
+
+  def record_video(self, it: int) -> Path | None:
+    """Record the checkpoint of iteration ``it`` (see the module docstring) and
+    upload it. Returns the video's path, or None when disabled or failed."""
+    if not self.video_cfg.get("enabled", True) or self.logger.log_dir is None:
+      return None
+    path = Path(self.logger.log_dir) / "videos" / f"model_{it}.mp4"
+    if path.exists():  # This checkpoint already has its video (a final re-save).
+      return path
+    num_steps = int(self.video_cfg.get("num_steps", 3000))
+    start = time.time()
+    try:
+      if self._video_env is None:
+        self._video_env = self._make_video_env()
+      vec = self._video_env
+      env = vec.unwrapped
+      path.parent.mkdir(parents=True, exist_ok=True)
+      device = torch.device(env.device)
+      cuda = [device.index or 0] if device.type == "cuda" else []
+      # The video env's draws are seeded, and training's random state is restored.
+      with (
+        torch.random.fork_rng(devices=cuda),
+        torch.inference_mode(),
+        self._video_policy(env) as policy,
+      ):
+        torch.manual_seed(int(self.video_cfg.get("seed", 0)))
+        obs, _ = vec.reset()
+        frame = env.render()
+        assert frame is not None
+        fps = round(1.0 / env.step_dt)
+        with media.VideoWriter(path, shape=frame.shape[:2], fps=fps) as video:
+          video.add_image(frame)
+          for _ in range(num_steps - 1):
+            actions = policy(obs.to(self.device))
+            obs, _, _, _ = vec.step(actions.to(vec.device))
+            frame = env.render()
+            assert frame is not None
+            video.add_image(frame)
+    except Exception as err:
+      path.unlink(missing_ok=True)
+      print(f"[WARN] Video of model_{it} failed (training continues): {err}")
+      return None
+    writer = self.logger.writer
+    if isinstance(writer, LogWriter):
+      writer.save_video(path, it)
+    print(f"[Video] it={it} {path} ({time.time() - start:.0f} s)", flush=True)
+    return path
+
+  def close_video_env(self) -> None:
+    """Release the video env and its renderer. Training calls it after the last
+    video: an EGL renderer left to the garbage collector at exit raises there."""
+    if self._video_env is not None:
+      self._video_env.close()
+      self._video_env = None
+
   def close(self) -> None:
     if self._validation_env is not None:
       self._validation_env.close()
       self._validation_env = None
+    self.close_video_env()

@@ -47,13 +47,10 @@ from mjlab.utils.noise import UniformNoiseCfg
 
 TORSO_BODY = "torso"
 """The thorax, 18.6 of the model's 82.3 kg: the analogue of G1's ``torso_link``."""
-FOOT_GEOMS = (
-  r"^(foot_col[134]_l|bofoot_col[12]_l|OSL_KA_L1_osl_foot_col[123]"
-  r"|OSL_KA_L1_osl_foot_assembly_geom_1)$"
-)
-"""Every geom that carries a foot's floor contact: the intact foot's capsules, the OSL
-foot's three capsules, and the OSL foot shell mesh, which also touches the floor (in
-54-65% of the library's frames)."""
+FOOT_GEOMS = r"^(foot_col[134]_l|bofoot_col[12]_l|OSL_KA_L1_osl_foot_col[123])$"
+"""Every geom that carries a foot's floor contact: the intact foot's capsules and the
+OSL foot's three capsules. The OSL foot shell mesh is out of collision
+(``osl_constants._fix_osl_contacts``)."""
 FOOT_PRIORITY = 1
 """Contact priority of the foot geoms, above the floor's 0. At equal priority MuJoCo
 takes the larger of the two frictions, and the floor's is 1.0, so a foot draw below
@@ -75,9 +72,9 @@ class OslDrCfg:
   foot_friction: tuple[float, float] = (0.6, 1.2)
   """Absolute foot friction, one draw per env shared by both feet. G1's upper bound.
   The lower bound keeps every library gait feasible: the tightest arcs need 0.5 of
-  the vertical force horizontally, and mjlab's pyramidal cone grants 0.71-1.0 times
-  the coefficient depending on direction (level walking needs only 0.2-0.3). The
-  model's own value, which the library was solved at, is 1.0."""
+  the vertical force horizontally (level walking only 0.2-0.3), and the OSL tasks'
+  elliptic cone grants the full coefficient in every direction. The model's own
+  value, which the library was solved at, is 1.0."""
   joint_armature: tuple[float, float] = (0.95, 1.05)
   """Joint armature scale: G1's."""
   servo_kp: tuple[float, float] = (0.8, 1.2)
@@ -151,6 +148,35 @@ def _with_delays(
   )
 
 
+def nominal_delays(entity: EntityCfg) -> EntityCfg:
+  """The entity with every actuator delay fixed at the middle of its range:
+  validation's setting, and play's ``--no-disturbances``."""
+  assert entity.articulation is not None
+  actuators = tuple(
+    replace(
+      act,
+      delay_min_lag=(act.delay_min_lag + act.delay_max_lag) // 2,
+      delay_max_lag=(act.delay_min_lag + act.delay_max_lag) // 2,
+    )
+    for act in entity.articulation.actuators
+  )
+  return replace(entity, articulation=replace(entity.articulation, actuators=actuators))
+
+
+def nominal_plant(cfg: ManagerBasedRlEnvCfg) -> list[str]:
+  """Make a gait-library env config the nominal plant validation runs, in place:
+  every event but the resets removed (the physical draws, pushes and encoder bias)
+  and each actuator delay fixed at the middle of its range. Returns the removed
+  event names."""
+  removed = [name for name, term in cfg.events.items() if term.mode != "reset"]
+  for name in removed:
+    del cfg.events[name]
+  entity = cfg.scene.entities["robot"]
+  assert isinstance(entity, EntityCfg)
+  cfg.scene.entities["robot"] = nominal_delays(entity)
+  return removed
+
+
 def _foot_priority(
   spec_fn: Callable[[], mujoco.MjSpec],
 ) -> Callable[[], mujoco.MjSpec]:
@@ -206,15 +232,14 @@ def apply_osl_dr(
   timestep = cfg.sim.mujoco.timestep
   osl_lags = _lags(dr_cfg.osl_delay_s, timestep)
   human_lags = _lags(dr_cfg.human_delay_s, timestep)
-  if mode == "validation":
-    osl_mid, human_mid = sum(osl_lags) // 2, sum(human_lags) // 2
-    osl_lags, human_lags = (osl_mid, osl_mid), (human_mid, human_mid)
   entity = cfg.scene.entities["robot"]
   assert isinstance(entity, EntityCfg) and entity.spec_fn is not None
   entity = replace(entity, spec_fn=_foot_priority(entity.spec_fn))
-  cfg.scene.entities["robot"] = _with_delays(entity, osl_lags, human_lags)
+  entity = _with_delays(entity, osl_lags, human_lags)
   if mode == "validation":
+    cfg.scene.entities["robot"] = nominal_delays(entity)
     return
+  cfg.scene.entities["robot"] = entity
 
   robot = "robot"
   events = cfg.events

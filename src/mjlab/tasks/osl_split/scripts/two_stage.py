@@ -21,7 +21,7 @@ W&B runs and ``play``) and any step can be redone on its own:
    one directory as one run, and stage 2's steps start after stage 1's, so every
    curve continues across the handover. The links follow stage 2 while it runs.
 
-The tags are ``-MSK``, ``-CLF`` and ``-Compliant``. Model and socket are given once,
+The tags are ``-ROBOT`` or ``-MSK``, then ``-CLF`` and ``-Compliant``. Model and socket are given once,
 for both stages, because a warm-started human actor can change neither (its inputs
 would change; the stage-2 runner refuses it too). Only the reward may switch
 (``--stage2.reward``; empty keeps stage 1's), and the stage-2 critics then start
@@ -133,6 +133,8 @@ Model = Literal["robot", "msk"]
 Socket = Literal["rigid", "compliant"]
 Reward = Literal["mimic", "clf"]
 Curves = Literal["offset", "none"]
+MODEL_TAGS: dict[Model, str] = {"robot": "-ROBOT", "msk": "-MSK"}
+"""Mirror of ``osl_constants.MODEL_TAGS``."""
 
 STAGE1_TASK = "Mjlab-Gait-Library-Unicycle-OSL-Fullbody"
 STAGE2_TASK = "Mjlab-Split-Unicycle-OSL-Fullbody"
@@ -245,9 +247,10 @@ class GpuBusyError(PipelineError):
 
 
 def task_tags(model: Model, socket: Socket, reward: Reward) -> str:
-  """The task-id suffix, in registration order: ``-MSK``, ``-CLF``, ``-Compliant``."""
+  """The task-id suffix, in registration order: ``-ROBOT``/``-MSK``, ``-CLF``,
+  ``-Compliant``."""
   return (
-    ("-MSK" if model == "msk" else "")
+    MODEL_TAGS[model]
     + ("-CLF" if reward == "clf" else "")
     + ("-Compliant" if socket == "compliant" else "")
   )

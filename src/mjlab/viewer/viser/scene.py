@@ -307,8 +307,10 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
     self._ghost_handles: dict[tuple[int, int], viser.BatchedMeshHandle] = {}
     self._ghost_meshes: dict[int, dict[int, trimesh.Trimesh]] = {}
 
-    # MjData used for ghost forward kinematics.
-    self._viz_data = mujoco.MjData(mj_model)
+    # MjData for ghost forward kinematics, one per ghost model (made on first use),
+    # so a ghost may use a model other than the scene's. Each model is held with
+    # its data, so its id cannot be reused while cached.
+    self._ghost_data: dict[int, tuple[mujoco.MjModel, mujoco.MjData]] = {}
 
   # Properties.
 
@@ -1201,19 +1203,23 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
       model_id = id(model)
       alpha_by_model[model_id] = alpha
 
-      # Forward kinematics on the visualization-only MjData.
-      self._viz_data.qpos[:] = qpos
+      # Forward kinematics on the model's visualization-only MjData.
+      entry = self._ghost_data.get(model_id)
+      if entry is None:
+        entry = self._ghost_data[model_id] = (model, mujoco.MjData(model))
+      viz_data = entry[1]
+      viz_data.qpos[:] = qpos
       if mocap_pos is not None and model.nmocap > 0:
         if mocap_pos.ndim == 1:
-          self._viz_data.mocap_pos[0] = mocap_pos
+          viz_data.mocap_pos[0] = mocap_pos
         else:
-          self._viz_data.mocap_pos[:] = mocap_pos
+          viz_data.mocap_pos[:] = mocap_pos
       if mocap_quat is not None and model.nmocap > 0:
         if mocap_quat.ndim == 1:
-          self._viz_data.mocap_quat[0] = mocap_quat
+          viz_data.mocap_quat[0] = mocap_quat
         else:
-          self._viz_data.mocap_quat[:] = mocap_quat
-      mujoco.mj_forward(model, self._viz_data)
+          viz_data.mocap_quat[:] = mocap_quat
+      mujoco.mj_forward(model, viz_data)
 
       # Group visible ghost geoms by body.
       body_geoms: dict[int, list[int]] = {}
@@ -1229,8 +1235,8 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
         key = (model_id, bid)
         body_data.setdefault(key, []).append(
           (
-            (self._viz_data.xpos[bid] + self._scene_offset).copy(),
-            vtf.SO3.from_matrix(self._viz_data.xmat[bid].reshape(3, 3)).wxyz.copy(),
+            (viz_data.xpos[bid] + self._scene_offset).copy(),
+            vtf.SO3.from_matrix(viz_data.xmat[bid].reshape(3, 3)).wxyz.copy(),
             (model.geom_rgba[bid_geom_ids[0]][:3] * 255).astype(np.uint8),
           )
         )

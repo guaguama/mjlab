@@ -18,8 +18,8 @@ class OslTrackingOnPolicyRunner(MotionTrackingOnPolicyRunner):
 # musclemimic's recipe instead (tasks/osl_mimic): G1's rewards give it a negative
 # per-step reward, under which ending the episode early is optimal.
 _VARIANTS: dict[str, tuple[Socket, str]] = {
-  "Mjlab-Tracking-Flat-OSL-Fullbody": ("rigid", "osl_fullbody_tracking"),
-  "Mjlab-Tracking-Flat-OSL-Fullbody-Compliant": (
+  "Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT": ("rigid", "osl_fullbody_tracking"),
+  "Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT-Compliant": (
     "compliant",
     "osl_fullbody_compliant_tracking",
   ),

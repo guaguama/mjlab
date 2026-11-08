@@ -9,8 +9,8 @@ imitation reward), with sesteban's G1 unicycle command in place of the single cl
 a stride-averaged twist reward, the commanded twist and the stride phase as extra
 observations, and 10 s episodes.
 
-Two variants: round 1's forward-walking tasks (``Mjlab-Gait-Library-OSL-Fullbody``),
-and the unicycle tasks (``Mjlab-Gait-Library-Unicycle-OSL-Fullbody``) over the full
+Two variants: round 1's forward-walking tasks (``Mjlab-Gait-Library-OSL-Fullbody-*``),
+and the unicycle tasks (``Mjlab-Gait-Library-Unicycle-OSL-Fullbody-*``) over the full
 library with domain randomization. Both are stage 1 of the plan, the unified policy
 that stage 2 splits into separate human and OSL actors.
 

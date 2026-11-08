@@ -123,6 +123,7 @@ def osl_gait_library_env_cfg(
     fixed_clips=validation,
     resampling_time_range=(1.0e9, 1.0e9) if validation else (3.0, 8.0),
     rel_static_envs=REL_STATIC_ENVS,
+    debug_vis=mode == "play",  # The reference ghost.
   )
   if variant == "unicycle":
     motion_cfg.sampling = "library"

@@ -785,7 +785,7 @@ def test_env_cfg_spec_fn_adds_the_sensors_over_the_foot_priority() -> None:
   # By name, not spec.sensor(): see add_osl_sensors.
   assert set(sensors.OSL_SENSORS) <= {sensor.name for sensor in spec.sensors}
   feet = [g for g in spec.geoms if re.fullmatch(FOOT_GEOMS, g.name)]
-  assert len(feet) == 9 and {int(g.priority) for g in feet} == {1}
+  assert len(feet) == 8 and {int(g.priority) for g in feet} == {1}
 
 
 def test_env_cfg_options_and_refusals() -> None:

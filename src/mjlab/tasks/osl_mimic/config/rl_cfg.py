@@ -83,8 +83,24 @@ class OslMimicValidationCfg:
 
 
 @dataclass
+class OslMimicVideoCfg:
+  """A video of the deterministic policy at every checkpoint, as musclemimic records
+  at its validations; see :meth:`~mjlab.tasks.osl_mimic.rl.runner.OslMimicOnPolicyRunner.record_video`."""
+
+  enabled: bool = True
+  num_steps: int = 3000
+  """Control steps per video: musclemimic's OSL ``video_length`` (30 s at 100 Hz)."""
+  width: int = 640
+  height: int = 480
+  seed: int = 0
+  """Seeds the video env's draws (commands, resets), so every checkpoint's video
+  plays the same command sequence. Training's random state is left untouched."""
+
+
+@dataclass
 class OslMimicRunnerCfg(RslRlOnPolicyRunnerCfg):
   validation: OslMimicValidationCfg = field(default_factory=OslMimicValidationCfg)
+  video: OslMimicVideoCfg = field(default_factory=OslMimicVideoCfg)
 
 
 def osl_mimic_runner_cfg(

@@ -6,7 +6,7 @@ Each comes with the rigid and the compliant socket. Train with, e.g.::
     --env.commands.motion.motion-file <100 Hz clipper --format mjlab clip>
 """
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import MODEL_TAGS, Model, Socket
 from mjlab.tasks.registry import register_mjlab_task
 
 from ..rl.runner import OslMimicOnPolicyRunner
@@ -15,7 +15,7 @@ from .rl_cfg import osl_mimic_runner_cfg
 
 # task id -> (model, socket, reward, experiment name)
 _VARIANTS: dict[str, tuple[Model, Socket, Reward, str]] = {}
-for _model, _model_tag in (("robot", ""), ("msk", "-MSK")):
+for _model, _model_tag in MODEL_TAGS.items():
   for _reward, _reward_tag in (("mimic", ""), ("clf", "-CLF")):
     for _socket, _socket_tag in (("rigid", ""), ("compliant", "-Compliant")):
       _task_id = f"Mjlab-Mimic-OSL-Fullbody{_model_tag}{_reward_tag}{_socket_tag}"

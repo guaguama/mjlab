@@ -24,6 +24,8 @@ from functools import lru_cache
 from typing import Literal
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  CONTACT_CONE,
+  CONTACT_IMPRATIO,
   MUSCLE_TENDONS_EXPR,
   OSL_TORQUE_JOINTS,
   SERVO_JOINTS,
@@ -283,6 +285,10 @@ def osl_mimic_env_cfg(
         # mujoco_warp 3.11 turns it on by default and then rejects the model's
         # 1 mm geom margins on mesh pairs; turning it off restores 3.4's contacts.
         disableflags=("multiccd", "eulerdamp") if socket == "rigid" else ("multiccd",),
+        # Not musclemimic's (MuJoCo's default pyramidal cone, impratio 1): mj-nlp's,
+        # which solves the gait library.
+        cone=CONTACT_CONE,
+        impratio=CONTACT_IMPRATIO,
       ),
     ),
     viewer=ViewerConfig(

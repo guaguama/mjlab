@@ -133,7 +133,7 @@ def test_bundle_contract(exported) -> None:
   m = json.loads((bundle / "manifest.json").read_text())
   assert m["run"]["task"] == (
     "Mjlab-Gait-Library-Unicycle-OSL-Fullbody"
-    + ("-MSK" if model == "msk" else "")
+    + ("-MSK" if model == "msk" else "-ROBOT")
     + ("-CLF" if reward == "clf" else "")
     + ("-Compliant" if socket == "compliant" else "")
   )
@@ -194,28 +194,6 @@ def test_bundle_files_and_onnx(exported) -> None:
     np.testing.assert_allclose(mean, parity["mean"], atol=1e-6)
   with pytest.raises(FileExistsError):
     gl_export.export_bundle(checkpoint)
-
-
-def test_runner_save_export_matches_the_bundle(exported, tmp_path) -> None:
-  """The training runners' per-checkpoint export: the same contract, from a
-  live env's managers."""
-  case, checkpoint, bundle = exported
-  c = gl_export.build_components(checkpoint)
-  actor_terms = c.cfg.observations["actor"].terms
-  env = c.env
-  env.observation_manager = SimpleNamespace(
-    active_terms={"actor": list(actor_terms)},
-    get_term_cfg=lambda group, name: actor_terms[name],
-  )
-  env.action_manager = SimpleNamespace(
-    active_terms=list(c.parts.actions), get_term=c.parts.actions.__getitem__
-  )
-  actor = gl_export.load_actor(checkpoint, CASES[case][1])
-  onnx_path = policy_export.export_policy(env, actor, tmp_path / "run.onnx")  # type: ignore[arg-type]
-  saved = json.loads(onnx_path.with_suffix(".json").read_text())
-  m = json.loads((bundle / "manifest.json").read_text())
-  for key in ("observation", "action", "training", "joint_names", "decimation"):
-    assert saved[key] == m[key]
 
 
 def test_config_drift_and_missing_library_refuse(exported, tmp_path) -> None:

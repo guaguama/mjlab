@@ -50,7 +50,8 @@ import shlex
 import statistics
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
@@ -60,11 +61,14 @@ import torch
 from rsl_rl.env import VecEnv
 from rsl_rl.utils import check_nan
 from rsl_rl.utils.log_writer import LogWriter
+from tensordict import TensorDict
 
-from mjlab.envs import ManagerBasedRlEnv
+from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.tasks.osl_gait_library.config.dr import nominal_plant
 from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
 from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
+from mjlab.tasks.osl_mimic.rl.runner import EvalPurpose
 from mjlab.tasks.osl_split.config.env_cfgs import REWARD_NAME, osl_split_env_cfg
 from mjlab.tasks.osl_split.mdp import osl_validation_group, split_mimic_reward
 
@@ -531,11 +535,14 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
         self.validate(it)
       if writer is not None and save_interval > 0 and k % save_interval == 0:
         self.save(os.path.join(log_dir, f"model_{it}.pt"))
+        self.record_video(it)
 
     if writer is not None:
       if total_it > start_it:  # Never a checkpoint of an iteration that did not run.
         path = f"model_{self.current_learning_iteration}.pt"
         self.save(os.path.join(log_dir, path))
+        self.record_video(self.current_learning_iteration)
+      self.close_video_env()
       flush = getattr(writer, "flush", None)
       if callable(flush):
         flush()  # TensorBoard's writer only flushes every 10 s on its own.
@@ -584,8 +591,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
   # Validation.
   ##
 
-  def _make_validation_env(self) -> RslRlVecEnvWrapper:
-    """The task's validation env, made to score and observe what training does.
+  def _eval_env_cfg(self, purpose: EvalPurpose) -> ManagerBasedRlEnvCfg:
+    """The task's validation mode, or for videos its play mode on validation's
+    nominal plant, made to score and observe what training does.
 
     From the training env's config it takes the motion library, the imitation
     reward's params (the channels' settings, e.g. ``owner_penalties``, decide the
@@ -596,23 +604,35 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     """
     v = self.validation_cfg
     train = self.env.unwrapped.cfg
-    cfg = osl_split_env_cfg(v["model"], v["socket"], v["reward"], mode="validation")
+    mode = "validation" if purpose == "validation" else "play"
+    cfg = osl_split_env_cfg(v["model"], v["socket"], v["reward"], mode=mode)
+    if purpose == "video":
+      nominal_plant(cfg)
     train_motion = train.commands["motion"]
     motion = cfg.commands["motion"]
     assert isinstance(train_motion, GaitLibraryCommandCfg)
     assert isinstance(motion, GaitLibraryCommandCfg)
     motion.library_dir = train_motion.library_dir
-    clips = len(list(Path(motion.library_dir).glob("*.npz")))
-    cfg.scene.num_envs = int(v.get("num_envs", 0)) or clips
     cfg.rewards[REWARD_NAME].params = deepcopy(train.rewards[REWARD_NAME].params)
     cfg.observations[OSL_OBS_GROUP] = osl_validation_group(
       train.observations[OSL_OBS_GROUP]
     )
-    vec = RslRlVecEnvWrapper(
-      ManagerBasedRlEnv(cfg=cfg, device=self.env.unwrapped.device)
-    )
+    return cfg
+
+  def _build_eval_env(
+    self, cfg: ManagerBasedRlEnvCfg, render: bool = False
+  ) -> RslRlVecEnvWrapper:
+    vec = super()._build_eval_env(cfg, render)
     _check_same_observations(self.env.unwrapped, vec.unwrapped)
     return vec
+
+  @contextmanager
+  def _video_policy(
+    self, env: ManagerBasedRlEnv
+  ) -> Iterator[Callable[[TensorDict], torch.Tensor]]:
+    """Both actors' means, the human's raw (``Validation/``'s); both observation
+    normalizers stay frozen."""
+    yield self.alg.inference_policy("mean", env.action_manager)
 
   def validate(self, it: int) -> dict[str, float]:
     """Both validation families at global iteration ``it``; returns their metrics
