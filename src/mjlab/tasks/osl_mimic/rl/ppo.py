@@ -18,10 +18,30 @@ Differences from stock rsl_rl PPO, each reproducing musclemimic:
   the loss (see :class:`~.models.RunningMeanStd`).
 * **actor_bias_init="qpos0"** starts each position servo's mean command at the
   model's ``qpos0`` (``PPOJax._resolve_actor_bias_init``), capped at +-0.95.
+
+Tuning knobs that are not musclemimic's (all off by default):
+
+* **An action-std cap** that falls geometrically from ``std_cap_start`` to
+  ``std_cap_end`` between two update counts, and a floor ``std_floor``. Both are
+  projections of the learnable std parameter after every optimizer step, so the std
+  stays learnable below the cap (a clamp inside the distribution would pass no
+  gradient at the bound). Update ``k``'s cap is applied before the rollout it
+  learns from, and held through its steps. With clipped muscle commands a large std drives the plant
+  by itself (see :mod:`.expected`), so a policy that keeps it learns to lean on the
+  noise and its raw mean fails; the cap makes the mean carry the drive.
+* **The linear rate schedule** can start counting after ``lr_schedule_offset``
+  updates (a resumed run's count, for a fresh schedule) and end at
+  ``lr_final_ratio`` of the rate instead of 0.
+* **Newton-Schulz in bfloat16** (``muon_ns_dtype``), as the reference Muon runs it.
+
+Every update also records :attr:`MuscleMimicPPO.policy_stats` (the std per action
+term, the cap, and how far the noise moves the effective action away from the
+clipped mean), which the runner logs under ``Policy/``.
 """
 
 from __future__ import annotations
 
+import math
 from itertools import chain
 
 import torch
@@ -30,7 +50,8 @@ from rsl_rl.env import VecEnv
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
-from .models import MuscleMimicMLPModel, NormMode
+from .expected import action_bounds, action_term_slices, expected_clipped_gaussian
+from .models import MuscleMimicMLPModel, NormMode, gaussian_std, gaussian_std_parameter
 from .muon import MuonAdam
 
 
@@ -65,6 +86,20 @@ def qpos0_action_bias(env) -> torch.Tensor:
   return torch.cat(biases)
 
 
+def geometric_schedule(
+  update: int, start: float, end: float, begin: int, finish: int
+) -> float:
+  """``start`` through update ``begin``, ``end`` from ``finish`` on, and the
+  geometric interpolation in between (linear in log space). ``finish <= begin`` is a
+  step from ``start`` to ``end`` after ``begin``."""
+  if update <= begin:
+    return start
+  if update >= finish:
+    return end
+  t = (update - begin) / (finish - begin)
+  return math.exp((1.0 - t) * math.log(start) + t * math.log(end))
+
+
 class MuscleMimicPPO(PPO):
   actor: MuscleMimicMLPModel
   critic: MuscleMimicMLPModel
@@ -80,14 +115,32 @@ class MuscleMimicPPO(PPO):
     muon_ns_steps: int = 5,
     lr_schedule: str = "linear",
     lr_schedule_updates: int = 0,
+    lr_schedule_offset: int = 0,
+    lr_final_ratio: float = 0.0,
     reward_normalization: bool = True,
     actor_bias_init: str = "none",
     bootstrap_time_outs: bool = False,
+    std_cap_start: float = 0.0,
+    std_cap_end: float = 0.0,
+    std_cap_begin_update: int = 0,
+    std_cap_end_update: int = 0,
+    std_floor: float = 0.0,
+    init_std_terms: dict[str, float] | None = None,
+    muon_ns_dtype: str = "float32",
     **kwargs,
   ) -> None:
     super().__init__(actor, critic, storage, **kwargs)
     if lr_schedule not in ("linear", "constant"):
       raise ValueError(f"Unknown lr_schedule {lr_schedule!r}")
+    if not 0.0 <= lr_final_ratio <= 1.0:
+      raise ValueError(f"lr_final_ratio must be in [0, 1], got {lr_final_ratio}")
+    if std_cap_start < 0.0 or std_cap_end < 0.0 or std_floor < 0.0:
+      raise ValueError("std_cap_start, std_cap_end and std_floor must be >= 0.")
+    if std_cap_start == 0.0 and std_cap_end > 0.0:
+      raise ValueError("std_cap_end needs std_cap_start (0 disables the cap).")
+    cap_end = std_cap_end if std_cap_end > 0.0 else std_cap_start
+    if std_floor > 0.0 and std_cap_start > 0.0 and std_floor > cap_end:
+      raise ValueError(f"std_floor {std_floor} exceeds the final std cap {cap_end}.")
     self.optimizer = MuonAdam(
       chain(self.actor.parameters(), self.critic.parameters()),
       lr=self.learning_rate,
@@ -95,13 +148,36 @@ class MuscleMimicPPO(PPO):
       beta=muon_beta,
       nesterov=muon_nesterov,
       ns_steps=muon_ns_steps,
+      ns_dtype=muon_ns_dtype,
     )
+    # Loading an optimizer state restores its groups' settings too; a resumed run
+    # keeps this run's (see load).
+    self._muon_settings = {
+      "beta": muon_beta,
+      "nesterov": muon_nesterov,
+      "ns_steps": muon_ns_steps,
+    }
     self.base_learning_rate = float(self.learning_rate)
     self.lr_schedule = lr_schedule
     self.lr_schedule_updates = int(lr_schedule_updates)
+    self.lr_schedule_offset = int(lr_schedule_offset)
+    self.lr_final_ratio = float(lr_final_ratio)
     self.num_updates_done = 0
     self.actor_bias_init = actor_bias_init
     self.bootstrap_time_outs = bootstrap_time_outs
+    self.std_cap_start = float(std_cap_start)
+    self.std_cap_end = float(cap_end)
+    self.std_cap_begin_update = int(std_cap_begin_update)
+    self.std_cap_end_update = int(std_cap_end_update)
+    self.std_floor = float(std_floor)
+    self.init_std_terms = {str(k): float(v) for k, v in (init_std_terms or {}).items()}
+    if any(v <= 0.0 for v in self.init_std_terms.values()):
+      raise ValueError(f"init_std_terms must be positive: {self.init_std_terms}")
+    # Set by construct_algorithm from the env's action terms.
+    self.action_lo: torch.Tensor | None = None
+    self.action_hi: torch.Tensor | None = None
+    self.action_slices: dict[str, slice] = {}
+    self.policy_stats: dict[str, float] = {}
 
     self.reward_normalization = reward_normalization
     num_envs = storage.num_envs
@@ -118,7 +194,82 @@ class MuscleMimicPPO(PPO):
       alg.actor.set_output_bias(qpos0_action_bias(env.unwrapped))  # type: ignore[attr-defined]
     elif alg.actor_bias_init != "none":
       raise ValueError(f"Unknown actor_bias_init {alg.actor_bias_init!r}")
+    manager = env.unwrapped.action_manager  # type: ignore[attr-defined]
+    alg.action_lo, alg.action_hi = action_bounds(manager, device=alg.device)
+    alg.action_slices = action_term_slices(manager)
+    alg.set_initial_std()
+    alg.apply_std_bounds()
     return alg
+
+  ##
+  # Action std.
+  ##
+
+  def std_cap(self, update: int | None = None) -> float | None:
+    """The std cap at ``update`` (default: the update in progress), or None."""
+    if self.std_cap_start <= 0.0:
+      return None
+    update = self.num_updates_done if update is None else update
+    return geometric_schedule(
+      update,
+      self.std_cap_start,
+      self.std_cap_end,
+      self.std_cap_begin_update,
+      self.std_cap_end_update,
+    )
+
+  def set_initial_std(self) -> None:
+    """Start each action term in ``init_std_terms`` at its own std (the rest keep the
+    distribution's ``init_std``). A resumed run's checkpoint overwrites it."""
+    unknown = sorted(set(self.init_std_terms) - set(self.action_slices))
+    if unknown:
+      raise ValueError(
+        f"init_std_terms names unknown action terms {unknown}; the policy's terms "
+        f"are {list(self.action_slices)}."
+      )
+    if not self.init_std_terms:
+      return
+    param, log_space = gaussian_std_parameter(self.actor)
+    with torch.no_grad():
+      for name, std in self.init_std_terms.items():
+        param[self.action_slices[name]] = math.log(std) if log_space else std
+
+  def apply_std_bounds(self) -> None:
+    """Project the actor's std parameter under the cap and above the floor."""
+    cap = self.std_cap()
+    floor = self.std_floor if self.std_floor > 0.0 else None
+    if cap is None and floor is None:
+      return
+    param, log_space = gaussian_std_parameter(self.actor)
+    to_param = math.log if log_space else float
+    with torch.no_grad():
+      if cap is not None:
+        param.clamp_(max=to_param(cap))
+      if floor is not None:
+        param.clamp_(min=to_param(floor))
+
+  def _record_policy_stats(self, mean: torch.Tensor) -> None:
+    """Per action term: the mean std, and how far the noise moves the effective
+    action from the clipped mean, ``|E[clip(mu + sigma eps)] - clip(mu)|``
+    (``noise_gap``), with the fraction of means outside the effective range
+    (``mean_outside``), over the batch ``mean`` (B, action_dim)."""
+    with torch.no_grad():
+      std = gaussian_std(self.actor)
+      stats: dict[str, float] = {}
+      cap = self.std_cap()
+      if cap is not None:
+        stats["std_cap"] = cap
+      if self.action_lo is not None and self.action_hi is not None:
+        lo, hi = self.action_lo, self.action_hi
+        expected = expected_clipped_gaussian(mean, std, lo, hi)
+        clipped = torch.minimum(torch.maximum(mean, lo), hi)
+        gap = (expected - clipped).abs()
+        outside = ((mean < lo) | (mean > hi)).float()
+        for name, cols in self.action_slices.items():
+          stats[f"std/{name}"] = float(std[cols].mean())
+          stats[f"noise_gap/{name}"] = float(gap[:, cols].mean())
+          stats[f"mean_outside/{name}"] = float(outside[:, cols].mean())
+      self.policy_stats = stats
 
   ##
   # Normalization modes.
@@ -194,8 +345,10 @@ class MuscleMimicPPO(PPO):
   def scheduled_learning_rate(self) -> float:
     if self.lr_schedule == "constant" or self.lr_schedule_updates <= 0:
       return self.base_learning_rate
-    frac = 1.0 - self.num_updates_done / self.lr_schedule_updates
-    return self.base_learning_rate * max(frac, 0.0)
+    done = max(self.num_updates_done - self.lr_schedule_offset, 0)
+    frac = max(1.0 - done / self.lr_schedule_updates, 0.0)
+    final = self.lr_final_ratio
+    return self.base_learning_rate * (final + (1.0 - final) * frac)
 
   def update(self) -> dict[str, float]:
     self.set_norm_mode("transient")
@@ -216,6 +369,8 @@ class MuscleMimicPPO(PPO):
       advantages = advantages.squeeze(-1)
 
       self.actor(batch.observations, stochastic_output=True)
+      if count == 0:
+        self._record_policy_stats(self.actor.output_mean.detach())
       log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore[arg-type]
       values = self.critic(batch.observations)
       entropy = self.actor.output_entropy
@@ -246,6 +401,7 @@ class MuscleMimicPPO(PPO):
       self.optimizer.zero_grad()
       loss.backward()
       self.optimizer.step()
+      self.apply_std_bounds()
 
       sums["value"] += value_loss.item()
       sums["surrogate"] += surrogate.item()
@@ -256,6 +412,10 @@ class MuscleMimicPPO(PPO):
       count += 1
 
     self.num_updates_done += 1
+    # The next rollout samples under the next update's cap, which that update's
+    # steps then hold: a falling cap never shifts the std between a rollout and the
+    # minibatches that score it.
+    self.apply_std_bounds()
     self.storage.clear()
     return {k: v / max(count, 1) for k, v in sums.items()}
 
@@ -275,10 +435,14 @@ class MuscleMimicPPO(PPO):
 
   def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
     iteration = super().load(loaded_dict, load_cfg, strict)
+    for group in self.optimizer.param_groups:
+      group.update(self._muon_settings)
     state = loaded_dict.get("muscle_mimic_state")
     if state is not None:
       self.num_updates_done = int(state["num_updates_done"])
       self._return_mean = state["return_mean"].to(self.device)
       self._return_var = state["return_var"].to(self.device)
       self._return_count = state["return_count"].to(self.device)
+    # A resumed run continues under this run's std schedule from the first rollout.
+    self.apply_std_bounds()
     return iteration

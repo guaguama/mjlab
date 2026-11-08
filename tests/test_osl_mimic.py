@@ -127,7 +127,8 @@ def test_task_contract(task: str) -> None:
 
   rl = load_rl_cfg(task)
   assert isinstance(rl, OslMimicRunnerCfg)
-  assert rl.num_steps_per_env == 80 and rl.max_iterations == NUM_UPDATES == 6103
+  # 1e9 steps / 80 / NUM_ENVS (4096): half musclemimic's 6103 updates at 2048 envs.
+  assert rl.num_steps_per_env == 80 and rl.max_iterations == NUM_UPDATES == 3051
   alg = rl.algorithm
   assert isinstance(alg, MuscleMimicPpoCfg)
   assert (alg.num_learning_epochs, alg.num_mini_batches) == (1, 128)
@@ -137,7 +138,14 @@ def test_task_contract(task: str) -> None:
   assert rl.actor.hidden_dims == HIDDEN_DIMS
   assert rl.actor.distribution_cfg is not None
   assert rl.actor.distribution_cfg["init_std"] == (0.2 if model == "robot" else 3.0)
-  assert rl.validation.interval == 61
+  assert rl.validation.interval == 30
+  # The MSK policy's raw mean fails while its std is large: validate the
+  # noise-averaged action too. The std schedule is off (musclemimic's learnable std).
+  modes = ("mean", "expected") if model == "msk" else ("mean",)
+  assert rl.validation.inference == modes and rl.validation.stress_interval == 0
+  assert alg.std_cap_start == 0.0 and alg.std_floor == 0.0
+  assert (alg.lr_schedule_offset, alg.lr_final_ratio) == (0, 0.0)
+  assert alg.muon_ns_dtype == "float32"
 
 
 ##
@@ -294,6 +302,8 @@ def test_linear_learning_rate() -> None:
   alg = SimpleNamespace(
     lr_schedule="linear",
     lr_schedule_updates=100,
+    lr_schedule_offset=0,
+    lr_final_ratio=0.0,
     base_learning_rate=4e-4,
     num_updates_done=0,
   )
@@ -303,6 +313,15 @@ def test_linear_learning_rate() -> None:
   assert schedule(cast(MuscleMimicPPO, alg)) == pytest.approx(2e-4)
   alg.num_updates_done = 100
   assert schedule(cast(MuscleMimicPPO, alg)) == 0.0
+  # A resumed run's fresh schedule: the decay counts from the offset, and ends at
+  # the final ratio instead of 0.
+  alg.lr_schedule_offset, alg.lr_final_ratio = 3051, 0.1
+  alg.num_updates_done = 3051
+  assert schedule(cast(MuscleMimicPPO, alg)) == pytest.approx(4e-4)
+  alg.num_updates_done = 3101
+  assert schedule(cast(MuscleMimicPPO, alg)) == pytest.approx(4e-4 * (0.1 + 0.9 * 0.5))
+  alg.num_updates_done = 9999
+  assert schedule(cast(MuscleMimicPPO, alg)) == pytest.approx(4e-5)
 
 
 ##

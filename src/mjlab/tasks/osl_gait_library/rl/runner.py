@@ -11,6 +11,7 @@ episode length and return. Key diagnostics are also reported per clip family
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import cast
 
@@ -18,7 +19,11 @@ import torch
 
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommand, GaitLibraryCommandCfg
-from mjlab.tasks.osl_mimic.rl.runner import EvalPurpose, OslMimicOnPolicyRunner
+from mjlab.tasks.osl_mimic.rl.runner import (
+  EvalPurpose,
+  OslMimicOnPolicyRunner,
+  eval_mode,
+)
 
 
 class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
@@ -32,18 +37,22 @@ class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
   )
 
   def _eval_env_cfg(self, purpose: EvalPurpose) -> ManagerBasedRlEnvCfg:
-    """The task's validation mode, or for videos its play mode (twists drawn from
-    the library, the reference ghost) on validation's nominal plant; with the
-    training env's library either way."""
+    """The task's validation mode; for videos its play mode (twists drawn from the
+    library, the reference ghost) on validation's nominal plant; both with the
+    training env's library and its command-line settings (simulation, rewards; see
+    ``_inherit_training_settings``). Stress validation plays the training config
+    itself (random switches and headings, physical draws, pushes, random delays)."""
     # Local import: config imports this runner to register the tasks.
     from mjlab.tasks.osl_gait_library.config.dr import nominal_plant
     from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 
+    if purpose == "stress":
+      # The training config itself: every command-line override included.
+      return deepcopy(self.env.unwrapped.cfg)
     v = self.validation_cfg
     variant = v.get("variant", "walk_fwd")
-    mode = "validation" if purpose == "validation" else "play"
     cfg = osl_gait_library_env_cfg(
-      v["model"], v["socket"], v["reward"], mode=mode, variant=variant
+      v["model"], v["socket"], v["reward"], mode=eval_mode(purpose), variant=variant
     )
     if purpose == "video" and variant == "unicycle":
       nominal_plant(cfg)
@@ -52,6 +61,7 @@ class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
     assert isinstance(train_motion, GaitLibraryCommandCfg)
     assert isinstance(motion, GaitLibraryCommandCfg)
     motion.library_dir = train_motion.library_dir
+    self._inherit_training_settings(cfg)
     return cfg
 
   def _validation_num_envs(self) -> int:

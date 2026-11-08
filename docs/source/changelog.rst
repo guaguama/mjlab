@@ -83,6 +83,24 @@ Added
   the checkpoint's iteration). Its draws are seeded, so every checkpoint plays the
   same command sequence, and training's random state is untouched; a failed
   recording never ends the run. ``--agent.video.enabled False`` turns it off.
+- Tuning knobs for the OSL imitation and gait-library PPO, all off by default: an
+  action-std cap that falls geometrically between two update counts and an std
+  floor (``--agent.algorithm.std-cap-start/-end/-begin-update/-end-update``,
+  ``std-floor``), both projections that leave the std learnable below the cap; an
+  initial std per action term (``init-std-terms``, e.g. the OSL motors lower than
+  the muscles); a linear learning-rate decay that can start after a resumed run's
+  update count and end above 0 (``lr-schedule-offset``, ``lr-final-ratio``); and
+  Muon's Newton-Schulz iteration in bfloat16 (``muon-ns-dtype``). Validation can
+  play the raw mean, the noise-averaged action ``E[clip(mu + sigma eps)]`` and the
+  stochastic policy, each under its own prefix (``--agent.validation.inference``;
+  musculoskeletal tasks now validate the mean and the noise-averaged action by
+  default, and their checkpoint videos play the noise-averaged action,
+  ``--agent.video.inference``), and a stress validation
+  (``--agent.validation.stress-interval``) plays the training distribution with
+  deterministic actions and reports each env's first-episode survival. Every
+  iteration logs the std per action term, the cap and the noise gap under
+  ``Policy/``. ``python -m mjlab.tasks.osl_gait_library.evaluate <checkpoint>`` runs
+  the same validations on a saved checkpoint.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and
@@ -98,6 +116,15 @@ Added
 Changed
 ^^^^^^^
 
+- The ``Mjlab-Gait-Library-Unicycle-OSL-Fullbody`` tasks start every training and
+  play episode at a uniformly random heading
+  (``--env.commands.motion.start-yaw-range``, pi; validation keeps each clip's own).
+  Their observation is world-frame, and a policy trained only at the clips' native
+  headings fell once deployment turned it away from them.
+- The OSL imitation and gait-library runners build their validation and video envs
+  with the training run's simulation settings and reward parameters, so command-line
+  overrides of either reach them, and a failed in-training validation no longer ends
+  the run.
 - The OSL robot-model task ids name their model like the musculoskeletal ones:
   ``-ROBOT`` after ``OSL-Fullbody`` (e.g.
   ``Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT-CLF-Compliant``,

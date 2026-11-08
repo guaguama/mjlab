@@ -9,59 +9,25 @@ every muscle far more weakly than training did, and ends every MSK validation
 episode early. ``ValidationExpected/`` plays ``E[clip(mu + sigma eps, lo, hi)]``
 instead: still deterministic, and the action the policy is trained to expect on
 average.
+
+The closed form lives in :mod:`mjlab.tasks.osl_mimic.rl.expected` (stage 1
+validates with it too); this module adds the per-agent bounds.
 """
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import torch
 
-from mjlab.envs.mdp.actions import TendonEffortAction
+from mjlab.tasks.osl_mimic.rl.expected import expected_clipped_gaussian, term_bounds
 
 from .layout import ActionLayout, Agent
 
 if TYPE_CHECKING:
   from mjlab.managers.action_manager import ActionManager
 
-_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
-_MIN_SIGMA = 1e-12
-"""Below this the clipped mean is the clipped value; the floor keeps ``z`` finite."""
-_PSI_FLOOR = -40.0
-"""``psi(z)`` underflows to 0 well before this in float64; clamping there avoids
-``-inf * 0`` for an infinite bound."""
-
-
-def _psi(z: torch.Tensor) -> torch.Tensor:
-  """``psi(z) = z Phi(z) + phi(z)``, so that ``E[(X - c)^+] = sigma psi((mu - c) /
-  sigma)`` for ``X ~ N(mu, sigma^2)``."""
-  z = z.clamp(min=_PSI_FLOOR)
-  return z * torch.special.ndtr(z) + torch.exp(-0.5 * z.square()) * _INV_SQRT_2PI
-
-
-def expected_clipped_gaussian(
-  mu: torch.Tensor,
-  sigma: torch.Tensor | float,
-  lo: torch.Tensor | float,
-  hi: torch.Tensor | float,
-) -> torch.Tensor:
-  """``E[clip(X, lo, hi)]`` for ``X ~ N(mu, sigma^2)``, elementwise (broadcast).
-
-  ``lo + sigma (psi((mu - lo) / sigma) - psi((mu - hi) / sigma))``, evaluated as
-  the equal ``mu + sigma (psi((lo - mu) / sigma) - psi((mu - hi) / sigma))`` (by
-  ``psi(z) - psi(-z) = z``): both arguments are very negative when ``mu`` sits
-  well inside the bounds, so the result is ``mu`` exactly there, and an infinite
-  bound contributes nothing instead of ``inf - inf``. Computed in float64 and
-  returned in ``mu``'s dtype. Requires ``lo <= hi``.
-  """
-  m = mu.to(torch.float64)
-  s = torch.as_tensor(sigma, dtype=torch.float64, device=mu.device)
-  s = s.clamp(min=_MIN_SIGMA)
-  a = torch.as_tensor(lo, dtype=torch.float64, device=mu.device)
-  b = torch.as_tensor(hi, dtype=torch.float64, device=mu.device)
-  out = m + s * (_psi((a - m) / s) - _psi((m - b) / s))
-  return out.to(mu.dtype)
+__all__ = ["action_bounds", "expected_clipped_gaussian"]
 
 
 def action_bounds(
@@ -86,6 +52,6 @@ def action_bounds(
       raise ValueError(
         f"Action term {name!r} has {term.action_dim} dims; the layout has {dim}."
       )
-    lows.extend([0.0 if isinstance(term, TendonEffortAction) else -1.0] * dim)
+    lows.extend([term_bounds(term)[0]] * dim)
   lo = torch.tensor(lows, dtype=torch.float32, device=device)
   return lo, torch.ones_like(lo)

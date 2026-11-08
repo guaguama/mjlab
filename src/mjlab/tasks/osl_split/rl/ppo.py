@@ -104,6 +104,17 @@ IGNORED_KEYS = frozenset(
     "lr_schedule",
     "lr_schedule_updates",
     "actor_bias_init",
+    # Stage-1 tuning knobs (MuscleMimicPPO): the split has its own rates and keeps
+    # the human's std fixed, and runs Newton-Schulz in float32.
+    "lr_schedule_offset",
+    "lr_final_ratio",
+    "std_cap_start",
+    "std_cap_end",
+    "std_cap_begin_update",
+    "std_cap_end_update",
+    "std_floor",
+    "init_std_terms",
+    "muon_ns_dtype",
   }
 )
 """Inherited from stage 1's config and unused (see ``SplitPpoCfg``): the schedules

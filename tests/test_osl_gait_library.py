@@ -1019,3 +1019,59 @@ def test_unicycle_env_rollout(model: Model, reward: Reward) -> None:
     osl = tuple(act.cfg.target_names_expr) == OSL_TORQUE_JOINTS
     assert within(lags.float(), (0, 10) if osl else (10, 20))
   env.close()
+
+
+def test_episodes_start_at_a_random_heading_on_the_env_origin() -> None:
+  """With ``start_yaw_range`` the start frame's root lands on the env origin turned
+  by a random heading (the robot is written there), and at 0 every episode starts
+  on the clip's native heading exactly as before."""
+  writes: dict[str, torch.Tensor] = {}
+  cmd = _fake_command()
+  robot = cast(Any, cmd.robot)
+  robot.write_joint_state_to_sim = lambda pos, vel, env_ids: writes.update(q=pos)
+  robot.write_root_state_to_sim = lambda state, env_ids: writes.update(root=state)
+  robot.reset = lambda env_ids: None
+  robot.set_joint_position_target = lambda target, env_ids: None
+  ids = torch.arange(4)
+  cmd._draw = lambda n: (  # type: ignore[method-assign]
+    torch.tensor([[1.0, 0.0, 0.0]]).repeat(n, 1),
+    torch.zeros(n, dtype=torch.long),
+  )
+  native = planar_pose(cmd.data["root_pos"][0], cmd.data["root_quat"][0])
+
+  torch.manual_seed(0)
+  cmd._start_episode(ids)
+  cmd._cache.clear()  # As _resample_command does after an episode start.
+  frame = cmd.frame.clone()
+  torch.testing.assert_close(cmd.anchor[:, 2], torch.zeros(4))
+  ref = cmd.reference(0)
+  torch.testing.assert_close(
+    ref.root_pos_w[:, :2], torch.zeros(4, 2), atol=1e-6, rtol=0
+  )
+
+  cmd.cfg.start_yaw_range = math.pi
+  torch.manual_seed(0)
+  cmd._start_episode(ids)
+  cmd._cache.clear()  # As _resample_command does after an episode start.
+  yaw = cmd.anchor[:, 2]
+  assert bool((yaw.abs() <= math.pi).all()) and float(yaw.std()) > 0.1
+  assert torch.equal(cmd.frame, frame)  # The yaw draw comes after the phase draw.
+  ref = cmd.reference(0)
+  pose = planar_pose(ref.root_pos_w, ref.root_quat)
+  torch.testing.assert_close(pose[:, :2], torch.zeros(4, 2), atol=1e-6, rtol=0)
+  turned = torch.atan2(
+    torch.sin(pose[:, 2] - native[frame, 2]), torch.cos(pose[:, 2] - native[frame, 2])
+  )
+  torch.testing.assert_close(turned, yaw, atol=1e-5, rtol=0)
+  # The robot starts on the turned reference, velocities turned with it.
+  torch.testing.assert_close(writes["root"][:, :3], ref.root_pos_w)
+  torch.testing.assert_close(writes["root"][:, 3:7], ref.root_quat)
+  torch.testing.assert_close(writes["root"][:, 7:10], ref.root_lin_vel_w)
+  speed = ref.root_lin_vel_w[:, :2].norm(dim=-1)
+  native_speed = cmd.data["root_lin_vel"][0, frame, :2].norm(dim=-1)
+  torch.testing.assert_close(speed, native_speed, atol=1e-5, rtol=0)
+  # Validation's fixed clips keep the native heading.
+  cmd.cfg.fixed_clips = True
+  cmd._start_episode(ids)
+  cmd._cache.clear()  # As _resample_command does after an episode start.
+  torch.testing.assert_close(cmd.anchor[:, 2], torch.zeros(4))

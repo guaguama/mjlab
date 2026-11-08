@@ -272,6 +272,13 @@ class GaitLibraryCommandCfg(CommandTermCfg):
   fixed_clips: bool = False
   """Validation: env ``i`` plays clip ``i % num_clips`` from phase 0 at its label,
   forever (set ``resampling_time_range`` past the episode)."""
+  start_yaw_range: float = 0.0
+  """Half-width (rad) of the uniform heading each episode starts at, about the
+  clip's own. musclemimic's observation is world-frame (root quaternion, linear
+  velocity, relative site positions, the goal), so a policy only generalizes to the
+  headings it trained at; at 0, every episode starts on the clip's native heading
+  and straight walking never leaves it. ``pi`` covers every heading. Ignored with
+  ``fixed_clips``."""
   fixed_twist: tuple[float, float, float] | None = None
   """Pin every env to this twist ``(vx, vy, wz)``: each draw takes the clip nearest
   to it (the twist cap ignored) in place of the sampler. Library sampling commands
@@ -1066,8 +1073,15 @@ class GaitLibraryCommand(CommandTerm):
 
     origins = self._env.scene.env_origins[env_ids]
     start = self.data["root_pos"][clip, frame]
+    # The anchor (x, y, yaw) puts the start frame's root on the env origin, turned
+    # by the start heading.
     anchor = torch.zeros(n, 3, device=self.device)
-    anchor[:, :2] = origins[:, :2] - start[:, :2]
+    if self.cfg.start_yaw_range > 0.0 and not self.cfg.fixed_clips:
+      anchor[:, 2] = (2.0 * torch.rand(n, device=self.device) - 1.0) * (
+        self.cfg.start_yaw_range
+      )
+    turned = _rotate_xy(start, torch.cos(anchor[:, 2]), torch.sin(anchor[:, 2]))
+    anchor[:, :2] = origins[:, :2] - turned[:, :2]
     self.clip[env_ids] = clip
     self.frame[env_ids] = frame
     self.twist_command[env_ids] = twist

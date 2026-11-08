@@ -61,11 +61,34 @@ class MuscleMimicPpoCfg(RslRlPpoAlgorithmCfg):
   lr_schedule: Literal["linear", "constant"] = "linear"
   lr_schedule_updates: int = NUM_UPDATES
   """Updates over which the rate decays linearly to 0 (keep = max_iterations)."""
+  lr_schedule_offset: int = 0
+  """Updates before the linear decay starts counting. A resumed run keeps its update
+  count, so set this to the checkpoint's count for a fresh schedule."""
+  lr_final_ratio: float = 0.0
+  """The linear decay ends at this fraction of ``learning_rate`` (musclemimic: 0)."""
   reward_normalization: bool = True
   actor_bias_init: Literal["qpos0", "none"] = "none"
   bootstrap_time_outs: bool = False
   """musclemimic never bootstraps: its episodes end where the clip ends. Tasks whose
   episodes are cut off by a time limit (looping libraries) turn this on."""
+  std_cap_start: float = 0.0
+  """Upper bound on every action std through update ``std_cap_begin_update``; 0
+  disables the cap. The std stays learnable below it."""
+  std_cap_end: float = 0.0
+  """The bound from update ``std_cap_end_update`` on, geometric in between; 0 keeps
+  ``std_cap_start``."""
+  std_cap_begin_update: int = 0
+  std_cap_end_update: int = 0
+  """Update counts (the algorithm's, which a resumed run keeps) bracketing the cap's
+  decay."""
+  std_floor: float = 0.0
+  """Lower bound on every action std; 0 disables it."""
+  init_std_terms: dict[str, float] = field(default_factory=dict)
+  """Initial std of named action terms, overriding the actor's ``init_std`` for their
+  outputs; a resumed run keeps its checkpoint's std. On the command line, a Python
+  dict: ``--agent.algorithm.init-std-terms "{'osl_motors': 0.3}"``."""
+  muon_ns_dtype: Literal["float32", "bfloat16"] = "float32"
+  """Newton-Schulz precision: optax's float32, or the reference Muon's bfloat16."""
 
 
 @dataclass
@@ -80,6 +103,26 @@ class OslMimicValidationCfg:
   model: str = "robot"
   socket: str = "rigid"
   reward: str = "mimic"
+  inference: tuple[str, ...] = ("mean",)
+  """Deterministic actions validated, each under its own prefix: ``"mean"`` (the raw
+  mean, musclemimic's, ``Validation/``), ``"expected"`` (the noise-averaged action
+  ``E[clip(mu + sigma eps)]``, ``ValidationExpected/``) and ``"sampled"`` (the
+  stochastic policy, ``ValidationSampled/``). On the command line, a Python tuple:
+  ``--agent.validation.inference "('mean','expected')"``."""
+  stress_interval: int = 0
+  """Iterations between stress validations; 0 disables them. A stress validation
+  plays the training distribution (random clips and switches, physical draws,
+  pushes, random actuator delays) with deterministic actions, ending episodes only
+  on validation's 0.5 m site check, the deployment harness's failure criterion. It
+  reports each env's first episode (``Stress/``, ``StressExpected/``, ...)."""
+  stress_num_envs: int = 512
+  stress_num_steps: int = 1000
+  """Steps per stress episode (10 s at 100 Hz)."""
+  stress_inference: tuple[str, ...] = ("expected",)
+  """Deterministic actions stress-validated (as ``inference``)."""
+  stress_seed: int = 0
+  """Seeds every stress validation alike (commands, pushes, delays), so checkpoints
+  meet the same disturbances. Training's random state is left untouched."""
 
 
 @dataclass
@@ -92,6 +135,9 @@ class OslMimicVideoCfg:
   """Control steps per video: musclemimic's OSL ``video_length`` (30 s at 100 Hz)."""
   width: int = 640
   height: int = 480
+  inference: str = "auto"
+  """``"mean"``, ``"expected"`` (see ``OslMimicValidationCfg.inference``) or
+  ``"auto"``: ``"expected"`` when the policy drives muscles, else ``"mean"``."""
   seed: int = 0
   """Seeds the video env's draws (commands, resets), so every checkpoint's video
   plays the same command sequence. Training's random state is left untouched."""
@@ -120,7 +166,14 @@ def osl_mimic_runner_cfg(
       # conf_osl_fullbody_robot.yaml opts the servos into it; the muscles never.
       actor_bias_init="qpos0" if model == "robot" else "none",
     ),
-    validation=OslMimicValidationCfg(model=model, socket=socket, reward=reward),
+    validation=OslMimicValidationCfg(
+      model=model,
+      socket=socket,
+      reward=reward,
+      # The MSK policy's raw mean fails while its muscle std is large; the
+      # noise-averaged action shows what it has learned meanwhile.
+      inference=("mean", "expected") if model == "msk" else ("mean",),
+    ),
     experiment_name=experiment_name,
     num_steps_per_env=NUM_STEPS,
     max_iterations=NUM_UPDATES,

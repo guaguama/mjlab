@@ -209,6 +209,22 @@ def _terminations(mode: Mode) -> dict[str, TerminationTermCfg]:
   return terms
 
 
+def stress_env_cfg(
+  cfg: ManagerBasedRlEnvCfg, num_steps: int, num_envs: int
+) -> ManagerBasedRlEnvCfg:
+  """Turn a training-mode config into a stress-validation one, in place, and return
+  it: the training distribution (starts, commands and whatever disturbances the task
+  trains with), but validation's 0.5 m site check as the only failure, and episodes
+  of ``num_steps`` control steps on ``num_envs`` envs."""
+  for name in ("root_deviation", "root_orientation"):
+    cfg.terminations.pop(name, None)
+  site = cfg.terminations["site_deviation"]
+  site.params = {**site.params, "threshold": VALIDATION_SITE_THRESHOLD}
+  cfg.episode_length_s = num_steps * cfg.decimation * cfg.sim.mujoco.timestep
+  cfg.scene.num_envs = num_envs
+  return cfg
+
+
 def osl_mimic_env_cfg(
   model: Model = "robot",
   socket: Socket = "rigid",

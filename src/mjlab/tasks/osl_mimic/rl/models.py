@@ -19,6 +19,10 @@ from typing import Literal
 
 import torch
 from rsl_rl.models import MLPModel
+from rsl_rl.modules.distribution import (
+  GaussianDistribution,
+  HeteroscedasticGaussianDistribution,
+)
 from rsl_rl.utils import resolve_nn_activation
 from tensordict import TensorDict
 from torch import nn
@@ -96,6 +100,38 @@ def build_mlp(
   nn.init.zeros_(output.bias)
   layers.append(output)
   return nn.Sequential(*layers)
+
+
+def _gaussian(model: MLPModel) -> GaussianDistribution:
+  dist = getattr(model, "distribution", None)
+  if not isinstance(dist, GaussianDistribution) or isinstance(
+    dist, HeteroscedasticGaussianDistribution
+  ):
+    raise TypeError(
+      f"Expected a state-independent GaussianDistribution, got {type(dist).__name__}."
+    )
+  return dist
+
+
+def gaussian_std_parameter(model: MLPModel) -> tuple[nn.Parameter, bool]:
+  """The learnable std parameter of ``model``'s state-independent Gaussian, and
+  whether it is in log space (``std_type="log"``)."""
+  dist = _gaussian(model)
+  if dist.std_type == "log":
+    return dist.log_std_param, True
+  return dist.std_param, False
+
+
+def gaussian_std(model: MLPModel) -> torch.Tensor:
+  """(action_dim,) the std the distribution samples with: the parameter clamped to
+  its ``std_range`` (``exp`` of the clamped log std for ``std_type="log"``). Unlike
+  ``output_std``, it does not depend on the last stochastic forward pass."""
+  dist = _gaussian(model)
+  if dist.std_type == "log":
+    low, high = dist.log_std_range
+    return torch.exp(dist.log_std_param.clamp(low, high))
+  low, high = dist.std_range
+  return dist.std_param.clamp(low, high)
 
 
 def _freeze(module: nn.Module) -> None:

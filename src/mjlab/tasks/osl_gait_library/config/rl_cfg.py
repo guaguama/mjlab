@@ -51,6 +51,7 @@ def osl_gait_library_runner_cfg(
     model=model,
     socket=socket,
     reward=reward,
+    inference=base.validation.inference,
     variant=variant,
   )
   library_tag = "unicycle" if variant == "unicycle" else "gait_library"

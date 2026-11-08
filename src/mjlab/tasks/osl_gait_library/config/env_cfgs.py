@@ -17,11 +17,13 @@ Two variants:
   sampler over its speed span, no randomization (round 1, unchanged);
 * ``"unicycle"``: the full unicycle library (forward and backward arcs, pivots,
   idle), with commands drawn at random from the library's clips in sesteban's G1
-  unicycle mode split, and stage-1 domain randomization (``config/dr.py``).
+  unicycle mode split, episodes starting at a random heading, and stage-1 domain
+  randomization (``config/dr.py``).
 """
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Literal
 
@@ -89,6 +91,11 @@ UNICYCLE_WZ_RANGE = (0.5, 1.7)
 """Pivot yaw-rate magnitudes."""
 UNICYCLE_TWIST_METRIC_WEIGHTS = mdp.span_normalized_weights((-0.8, 1.5), (-1.7, 1.7))
 """The nearest-clip metric over the library's whole (vx, wz) span."""
+UNICYCLE_START_YAW_RANGE = math.pi
+"""Episodes start at a uniformly random heading. The observation is world-frame, and
+a policy trained only on the clips' native headings walked straight and on arcs only
+there: deployed, it fell once an arc or a re-base turned it 130-220 deg away (the
+pivots, which sweep every heading in training, held)."""
 
 
 def osl_gait_library_env_cfg(
@@ -133,6 +140,7 @@ def osl_gait_library_env_cfg(
     motion_cfg.bck_arc_regions = UNICYCLE_BCK_ARC_REGIONS
     motion_cfg.wz_range = UNICYCLE_WZ_RANGE
     motion_cfg.twist_metric_weights = UNICYCLE_TWIST_METRIC_WEIGHTS
+    motion_cfg.start_yaw_range = 0.0 if validation else UNICYCLE_START_YAW_RANGE
   cfg.commands = {"motion": motion_cfg}
 
   motion = {"command_name": "motion"}

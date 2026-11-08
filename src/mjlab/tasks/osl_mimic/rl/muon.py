@@ -35,12 +35,26 @@ from collections.abc import Iterable
 import torch
 
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
+NS_DTYPES: dict[str, torch.dtype | None] = {"float32": None, "bfloat16": torch.bfloat16}
+"""Newton-Schulz precisions; ``None`` keeps the parameter's own (float32)."""
 
 
-def orthogonalize(g: torch.Tensor, steps: int = 5, eps: float = 1e-8) -> torch.Tensor:
-  """``orthogonalize_via_newton_schulz`` with Frobenius preconditioning."""
+def orthogonalize(
+  g: torch.Tensor,
+  steps: int = 5,
+  eps: float = 1e-8,
+  dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+  """``orthogonalize_via_newton_schulz`` with Frobenius preconditioning.
+
+  ``dtype`` runs the iteration in another precision (``torch.bfloat16`` as in the
+  reference Muon implementation, which is several times faster on tensor cores);
+  the result is returned in ``g``'s dtype. The quintic iteration is built to be
+  stable in bfloat16: it only needs the singular values to land in roughly
+  [0.7, 1.2], not exactly on 1.
+  """
   a, b, c = NS_COEFFS
-  x = g
+  x = g if dtype is None else g.to(dtype)
   transposed = x.shape[0] > x.shape[1]
   if transposed:
     x = x.T
@@ -48,7 +62,8 @@ def orthogonalize(g: torch.Tensor, steps: int = 5, eps: float = 1e-8) -> torch.T
   for _ in range(steps):
     gram = x @ x.T
     x = a * x + (b * gram + c * gram @ gram) @ x
-  return x.T if transposed else x
+  x = x.T if transposed else x
+  return x.to(g.dtype)
 
 
 class MuonAdam(torch.optim.Optimizer):
@@ -63,6 +78,8 @@ class MuonAdam(torch.optim.Optimizer):
     ns_steps: Newton-Schulz iterations.
     eps: Muon's normalization epsilon and AdamW's denominator epsilon.
     adam_b1, adam_b2: AdamW moments.
+    ns_dtype: Precision of the Newton-Schulz iteration: ``"float32"`` (optax's)
+      or ``"bfloat16"`` (the reference Muon implementation's; faster).
   """
 
   def __init__(
@@ -76,7 +93,10 @@ class MuonAdam(torch.optim.Optimizer):
     eps: float = 1e-8,
     adam_b1: float = 0.9,
     adam_b2: float = 0.999,
+    ns_dtype: str = "float32",
   ) -> None:
+    if ns_dtype not in NS_DTYPES:
+      raise ValueError(f"Unknown ns_dtype {ns_dtype!r}; valid: {sorted(NS_DTYPES)}")
     defaults = dict(
       lr=lr,
       beta=beta,
@@ -86,6 +106,7 @@ class MuonAdam(torch.optim.Optimizer):
       adam_b1=adam_b1,
       adam_b2=adam_b2,
     )
+    self.ns_dtype = NS_DTYPES[ns_dtype]
     super().__init__(params, defaults)
     self.max_grad_norm = max_grad_norm
     self.skipped_steps = 0
@@ -140,7 +161,7 @@ class MuonAdam(torch.optim.Optimizer):
       mu_hat = beta * mu / (1.0 - beta ** (t + 1)) + (1.0 - beta) * g / (1.0 - beta**t)
     else:
       mu_hat = mu / (1.0 - beta**t)
-    update = orthogonalize(mu_hat, group["ns_steps"], group["eps"])
+    update = orthogonalize(mu_hat, group["ns_steps"], group["eps"], self.ns_dtype)
     rows, cols = p.shape
     update = update * max(1.0, rows / cols) ** 0.5
     p.add_(update, alpha=-lr)
