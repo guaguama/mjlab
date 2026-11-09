@@ -113,6 +113,26 @@ def drives_muscles(env: ManagerBasedRlEnv) -> bool:
   )
 
 
+def stage_accessors(
+  env: ManagerBasedRlEnv, path: str
+) -> tuple[Callable[[], float], Callable[[float], None]]:
+  """Getter and setter of a staged env setting: ``rewards.<term>.weight`` or
+  ``terminations.<term>.<param>``. The managers read both every step."""
+  section, term, key = (path.split(".", 2) + ["", ""])[:3]
+  if section == "rewards" and key == "weight":
+    reward = env.reward_manager.get_term_cfg(term)
+    return (lambda: reward.weight), (lambda v: setattr(reward, "weight", v))
+  if section == "terminations" and key:
+    params = env.termination_manager.get_term_cfg(term).params
+    if key not in params:
+      raise KeyError(f"Termination {term!r} has no param {key!r} (env stage {path!r}).")
+    return (lambda: params[key]), (lambda v: params.__setitem__(key, v))
+  raise ValueError(
+    f"Unsupported env stage path {path!r}: use 'rewards.<term>.weight' or "
+    "'terminations.<term>.<param>'."
+  )
+
+
 class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
   alg: MuscleMimicPPO
 
@@ -132,6 +152,10 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     self.validation_cfg: dict = dict(train_cfg.get("validation") or {})
     self.video_cfg: dict = dict(train_cfg.get("video") or {})
     super().__init__(env, train_cfg, log_dir, device)
+    self.env_stages: tuple[tuple[int, str, float], ...] = tuple(
+      (int(u), str(path), float(v)) for u, path, v in train_cfg.get("env_stages") or ()
+    )
+    self._stage_defaults: dict[str, float] = {}
     self._validation_env: RslRlVecEnvWrapper | None = None
     self._stress_env: RslRlVecEnvWrapper | None = None
     self._video_env: RslRlVecEnvWrapper | None = None
@@ -155,6 +179,7 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     interval = int(self.validation_cfg.get("interval", 0))
     stress_interval = int(self.validation_cfg.get("stress_interval", 0))
     for it in range(start_it, total_it):
+      stages = self.apply_env_stages()
       start = time.time()
       with torch.inference_mode():
         for _ in range(self.cfg["num_steps_per_env"]):
@@ -189,6 +214,9 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
         rnd_weight=None,
       )
       self._log_policy_stats(it)
+      if self.logger.writer is not None:
+        for path, value in stages.items():
+          self.logger.writer.add_scalar(f"Stages/{path}", value, it)
 
       # musclemimic validates after every interval-th update.
       if interval > 0 and (it + 1) % interval == 0 and self.logger.writer is not None:
@@ -210,6 +238,22 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
       self.record_video(it)
       self.close_video_env()
       self.logger.stop_logging_writer()
+
+  def apply_env_stages(self) -> dict[str, float]:
+    """Set every staged training-env value (``OslMimicRunnerCfg.env_stages``) for the
+    algorithm's update count; returns each staged path's value now in force."""
+    if not self.env_stages:
+      return {}
+    env = self.env.unwrapped
+    update = self.alg.num_updates_done
+    current: dict[str, float] = {}
+    for path in dict.fromkeys(path for _, path, _ in self.env_stages):
+      get, put = stage_accessors(env, path)
+      default = self._stage_defaults.setdefault(path, float(get()))
+      active = sorted((u, v) for u, p, v in self.env_stages if p == path and update < u)
+      current[path] = active[0][1] if active else default
+      put(current[path])
+    return current
 
   ##
   # Validation.

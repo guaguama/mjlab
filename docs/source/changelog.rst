@@ -129,6 +129,21 @@ Changed
   (``--env.commands.motion.start-yaw-range``, pi; validation keeps each clip's own).
   Their observation is world-frame, and a policy trained only at the clips' native
   headings fell once deployment turned it away from them.
+- The ``Mjlab-Gait-Library-Unicycle-OSL-Fullbody-MSK`` tasks train with a stage-1
+  recipe tuned on ``-MSK-CLF-Compliant`` so that the raw policy mean deploys, where
+  musclemimic's settings left a muscle std of about 2 and a gait that depended on the
+  action noise. The muscles start at std 1.0 (the OSL motors at 0.3) under a cap
+  that falls geometrically to 0.07 over updates 300-4000, the 4e-4 learning rate
+  decays linearly to 10% over 4000 updates, runs last 4500 iterations with bfloat16
+  Newton-Schulz, the root may drift 1 m before a reset until update 1500 and 2 m
+  after, the twist reward weighs 0.06 until update 3000 and 0.2 after, the CLF
+  decrease-condition penalty is off, and the runner validates every 60 iterations
+  and stress-validates (raw mean and noise-averaged action) every 120. The stage-2
+  split tasks inherit the final reward and termination settings.
+- The OSL imitation runner stages training-env settings by PPO update
+  (``--agent.env-stages``): a reward weight or termination parameter holds a value
+  until a given update and then returns to the config's own. Stages follow the
+  algorithm's update count, so a resumed run continues in the right stage.
 - The OSL imitation and gait-library runners build their validation and video envs
   with the training run's simulation settings and reward parameters, so command-line
   overrides of either reach them, and a failed in-training validation no longer ends

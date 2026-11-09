@@ -18,7 +18,9 @@ Two variants:
 * ``"unicycle"``: the full unicycle library (forward and backward arcs, pivots,
   idle), with commands drawn at random from the library's clips in sesteban's G1
   unicycle mode split, episodes starting at a random heading, and stage-1 domain
-  randomization (``config/dr.py``).
+  randomization (``config/dr.py``). Its MSK tasks train with the stage-1 recipe: the
+  ``UNICYCLE_MSK_*`` reward and termination settings below and the PPO schedule in
+  ``config/rl_cfg.py``.
 """
 
 from __future__ import annotations
@@ -97,6 +99,20 @@ a policy trained only on the clips' native headings walked straight and on arcs 
 there: deployed, it fell once an arc or a re-base turned it 130-220 deg away (the
 pivots, which sweep every heading in training, held)."""
 
+# ===== The unicycle MSK recipe (tuned on -MSK-CLF-Compliant, 2026-11) =============
+UNICYCLE_MSK_ROOT_DEVIATION = 2.0
+"""The root's drift limit in m (osl_mimic's 1.0). The room lets a drifting policy
+recover instead of being reset; it raised the raw mean's stress survival from ~44%
+to ~55% within 400 iterations, with validation unchanged."""
+UNICYCLE_MSK_TWIST_WEIGHT = 0.2
+"""The twist term's weight (``TWIST_WEIGHT`` elsewhere). Curved walks that fail turn
+too slowly and fall inward; 0.2 cut forward and tight-arc failures and the yaw-rate
+error, with stress survival unchanged."""
+UNICYCLE_MSK_CLF_PEN_W = 0.0
+"""The CLF decrease-condition penalty (0.25 elsewhere). It saturated at a constant
+-0.22 that, with the reward clipped at 0, zeroed the reward of every state far from
+the reference; without it training led on every metric from iteration 50."""
+
 
 def osl_gait_library_env_cfg(
   model: Model = "robot",
@@ -157,6 +173,15 @@ def osl_gait_library_env_cfg(
     cfg.metrics[name] = MetricsTermCfg(
       func=mimic_component, params={"name": name, "reward_name": "twist"}
     )
+
+  if variant == "unicycle" and model == "msk":
+    cfg.rewards["twist"].weight = UNICYCLE_MSK_TWIST_WEIGHT
+    clf = cfg.rewards["mimic"].params["clf"]
+    if clf is not None:
+      clf.pen_w = UNICYCLE_MSK_CLF_PEN_W
+    if "root_deviation" in cfg.terminations:  # Training mode only.
+      root = cfg.terminations["root_deviation"]
+      root.params = {**root.params, "threshold": UNICYCLE_MSK_ROOT_DEVIATION}
 
   if variant == "unicycle":
     apply_osl_dr(cfg, model, socket, mode, dr_cfg)

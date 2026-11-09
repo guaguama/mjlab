@@ -147,6 +147,14 @@ class OslMimicVideoCfg:
 class OslMimicRunnerCfg(RslRlOnPolicyRunnerCfg):
   validation: OslMimicValidationCfg = field(default_factory=OslMimicValidationCfg)
   video: OslMimicVideoCfg = field(default_factory=OslMimicVideoCfg)
+  env_stages: tuple[tuple[int, str, float], ...] = ()
+  """Training-env settings staged by PPO update. Each ``(until_update, path, value)``
+  runs ``value`` before update ``until_update`` and the env config's own value from
+  then on; where two stages of one path overlap, the earlier-ending one holds.
+  ``path`` is ``rewards.<term>.weight`` or ``terminations.<term>.<param>``. The
+  update count is the algorithm's, which checkpoints carry, so a resumed run starts
+  in the right stage. On the command line, e.g.
+  ``--agent.env-stages "((1500,'terminations.root_deviation.threshold',1.0),)"``."""
 
 
 def osl_mimic_runner_cfg(

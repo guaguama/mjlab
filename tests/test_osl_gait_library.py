@@ -39,11 +39,24 @@ from mjlab.tasks.osl_gait_library.config.env_cfgs import (
   TWIST_WEIGHT,
   UNICYCLE_BCK_ARC_REGIONS,
   UNICYCLE_FWD_ARC_REGIONS,
+  UNICYCLE_MSK_CLF_PEN_W,
+  UNICYCLE_MSK_ROOT_DEVIATION,
+  UNICYCLE_MSK_TWIST_WEIGHT,
   UNICYCLE_TWIST_METRIC_WEIGHTS,
   UNICYCLE_WZ_RANGE,
   osl_gait_library_env_cfg,
 )
-from mjlab.tasks.osl_gait_library.config.rl_cfg import GaitLibraryRunnerCfg
+from mjlab.tasks.osl_gait_library.config.rl_cfg import (
+  UNICYCLE_MSK_ENV_STAGES,
+  UNICYCLE_MSK_INIT_STD,
+  UNICYCLE_MSK_INIT_STD_TERMS,
+  UNICYCLE_MSK_ITERATIONS,
+  UNICYCLE_MSK_LR_UPDATES,
+  UNICYCLE_MSK_STD_CAP,
+  UNICYCLE_MSK_STD_CAP_UPDATES,
+  UNICYCLE_MSK_STRESS_INTERVAL,
+  GaitLibraryRunnerCfg,
+)
 from mjlab.tasks.osl_gait_library.mdp import (
   GaitLibraryCommand,
   GaitLibraryCommandCfg,
@@ -59,6 +72,7 @@ from mjlab.tasks.osl_gait_library.mdp.commands import (
 from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.config.rl_cfg import MuscleMimicPpoCfg, OslMimicRunnerCfg
+from mjlab.tasks.osl_mimic.rl.runner import stage_accessors
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.viewer.native.visualizer import MujocoNativeDebugVisualizer
 
@@ -200,6 +214,48 @@ def test_unicycle_task_contract(task: str) -> None:
   assert (v.model, v.socket, v.reward, v.variant) == (model, socket, reward, "unicycle")
   assert rl.experiment_name.startswith("osl_fullbody_unicycle")
   assert "unicycle" in rl.wandb_tags
+
+  # The MSK tasks' stage-1 recipe; the robot tasks keep osl_mimic's settings.
+  msk = model == "msk"
+  clf = cfg.rewards["mimic"].params["clf"]
+  assert clf is None or clf.pen_w == (UNICYCLE_MSK_CLF_PEN_W if msk else 0.25)
+  assert (
+    validation.rewards["twist"].weight
+    == cfg.rewards["twist"].weight
+    == (UNICYCLE_MSK_TWIST_WEIGHT if msk else TWIST_WEIGHT)
+  )
+  root = cfg.terminations["root_deviation"].params["threshold"]
+  assert root == (UNICYCLE_MSK_ROOT_DEVIATION if msk else 1.0)
+  alg = rl.algorithm
+  assert isinstance(alg, MuscleMimicPpoCfg) and rl.actor.distribution_cfg is not None
+  if msk:
+    assert rl.actor.distribution_cfg["init_std"] == UNICYCLE_MSK_INIT_STD
+    assert alg.init_std_terms == UNICYCLE_MSK_INIT_STD_TERMS
+    assert (alg.std_cap_start, alg.std_cap_end) == UNICYCLE_MSK_STD_CAP
+    updates = (alg.std_cap_begin_update, alg.std_cap_end_update)
+    assert updates == UNICYCLE_MSK_STD_CAP_UPDATES
+    assert alg.lr_schedule_updates == UNICYCLE_MSK_LR_UPDATES
+    assert alg.lr_final_ratio == 0.1 and alg.muon_ns_dtype == "bfloat16"
+    assert rl.max_iterations == UNICYCLE_MSK_ITERATIONS
+    assert v.stress_interval == UNICYCLE_MSK_STRESS_INTERVAL
+    assert v.stress_inference == ("mean", "expected")
+    # Every staged path names a setting of the training config.
+    assert rl.env_stages == UNICYCLE_MSK_ENV_STAGES
+    env = SimpleNamespace(
+      reward_manager=SimpleNamespace(get_term_cfg=lambda n: cfg.rewards[n]),
+      termination_manager=SimpleNamespace(get_term_cfg=lambda n: cfg.terminations[n]),
+    )
+    finals = {
+      path: stage_accessors(cast(Any, env), path)[0]() for _, path, _ in rl.env_stages
+    }
+    assert finals == {
+      "terminations.root_deviation.threshold": UNICYCLE_MSK_ROOT_DEVIATION,
+      "rewards.twist.weight": UNICYCLE_MSK_TWIST_WEIGHT,
+    }
+  else:
+    assert rl.actor.distribution_cfg["init_std"] == 0.2
+    assert alg.std_cap_start == 0.0 and not alg.init_std_terms
+    assert v.stress_interval == 0 and rl.env_stages == ()
 
 
 def test_perception_switches() -> None:

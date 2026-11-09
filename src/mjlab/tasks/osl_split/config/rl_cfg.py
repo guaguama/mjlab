@@ -253,7 +253,9 @@ def osl_split_runner_cfg(
   shared = {
     f.name: getattr(base, f.name)
     for f in fields(base)
-    if f.name not in {"algorithm", "validation"}
+    # Stage 2 starts where stage 1 ended, on the env config's final values, so it
+    # takes none of stage 1's env stages.
+    if f.name not in {"algorithm", "validation", "env_stages"}
   }
   cfg = SplitRunnerCfg(**shared)
   assert isinstance(base.algorithm, MuscleMimicPpoCfg)

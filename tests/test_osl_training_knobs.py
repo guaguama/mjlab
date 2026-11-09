@@ -21,6 +21,7 @@ from mjlab.envs.mdp.actions import TendonEffortAction
 from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_cfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import stress_env_cfg
+from mjlab.tasks.osl_mimic.config.rl_cfg import INIT_STD, MuscleMimicPpoCfg
 from mjlab.tasks.osl_mimic.rl.expected import (
   action_bounds,
   action_term_slices,
@@ -71,11 +72,29 @@ def _obs(n: int = NUM_ENVS) -> TensorDict:
   )
 
 
+# The stage-1 recipe's PPO knobs, which _algorithm resets to their neutral defaults.
+RECIPE_KNOBS = (
+  "init_std_terms",
+  "std_cap_start",
+  "std_cap_end",
+  "std_cap_begin_update",
+  "std_cap_end_update",
+  "lr_schedule_updates",
+  "lr_final_ratio",
+  "muon_ns_dtype",
+)
+
+
 def _algorithm(**knobs: Any) -> MuscleMimicPPO:
-  """A real MuscleMimicPPO from the unicycle MSK runner config, shrunk."""
+  """A real MuscleMimicPPO from the unicycle MSK runner config, shrunk, with the
+  recipe's knobs at MuscleMimicPpoCfg's defaults (and musclemimic's muscle init std
+  3.0), so each test sets the ones it checks."""
   cfg = asdict(
     osl_gait_library_runner_cfg("msk", "compliant", "clf", "test", "unicycle")
   )
+  neutral = asdict(MuscleMimicPpoCfg())
+  cfg["algorithm"].update({key: neutral[key] for key in RECIPE_KNOBS})
+  cfg["actor"]["distribution_cfg"]["init_std"] = INIT_STD["msk"]
   for key in ("actor", "critic"):
     cfg[key]["hidden_dims"] = (16, 16)
     # As MjlabOnPolicyRunner strips them before building the models.
@@ -425,3 +444,53 @@ def test_eval_envs_inherit_the_runs_overrides(capsys) -> None:
 
   runner._guarded(broken, 7)  # Reported, never fatal.
   assert "[WARN] broken at it=7 failed" in capsys.readouterr().out
+
+
+##
+# Env stages.
+##
+
+
+def test_env_stages_hold_until_their_update_and_survive_a_resume() -> None:
+  twist = SimpleNamespace(weight=0.2)
+  root = SimpleNamespace(params={"command_name": "motion", "threshold": 2.0})
+  env = SimpleNamespace(
+    reward_manager=SimpleNamespace(get_term_cfg=lambda n: {"twist": twist}[n]),
+    termination_manager=SimpleNamespace(get_term_cfg=lambda n: {"root": root}[n]),
+  )
+  stages = (
+    (1500, "terminations.root.threshold", 1.0),
+    (3000, "rewards.twist.weight", 0.06),
+    (500, "terminations.root.threshold", 0.5),  # Overlaps; ends first, so holds.
+  )
+
+  def runner(update: int) -> Any:
+    return SimpleNamespace(
+      env=SimpleNamespace(unwrapped=env),
+      alg=SimpleNamespace(num_updates_done=update),
+      env_stages=stages,
+      _stage_defaults={},
+    )
+
+  apply = OslMimicOnPolicyRunner.apply_env_stages
+  r = runner(0)
+  assert apply(r) == {"terminations.root.threshold": 0.5, "rewards.twist.weight": 0.06}
+  assert root.params["threshold"] == 0.5 and twist.weight == 0.06
+  r.alg.num_updates_done = 500
+  apply(r)
+  assert root.params["threshold"] == 1.0 and twist.weight == 0.06
+  r.alg.num_updates_done = 3000
+  apply(r)  # Every stage over: the config's own values return.
+  assert root.params["threshold"] == 2.0 and twist.weight == 0.2
+  # A run resumed at update 2000 starts from the config's values, in the right stage.
+  assert apply(runner(2000)) == {
+    "terminations.root.threshold": 2.0,
+    "rewards.twist.weight": 0.06,
+  }
+  bad = runner(0)
+  bad.env_stages = ((9, "rewards.twist", 1.0),)
+  with pytest.raises(ValueError, match="Unsupported env stage path"):
+    apply(bad)
+  bad.env_stages = ((9, "terminations.root.x", 1.0),)
+  with pytest.raises(KeyError, match="no param"):
+    apply(bad)

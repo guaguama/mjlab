@@ -24,7 +24,10 @@ from tensordict import TensorDict
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import get_spec
 from mjlab.tasks.osl_gait_library import export as gl_export
 from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
-from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_cfg
+from mjlab.tasks.osl_gait_library.config.rl_cfg import (
+  UNICYCLE_MSK_INIT_STD,
+  osl_gait_library_runner_cfg,
+)
 from mjlab.tasks.osl_mimic.rl import export as policy_export
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.utils.os import dump_yaml
@@ -154,7 +157,10 @@ def test_bundle_contract(exported) -> None:
     low = 0.0 if b["name"] == "muscles" else -1.0
     assert set(action["expected_low"][span]) == {low}
     assert set(action["expected_high"][span]) == {1.0}
-  np.testing.assert_allclose(action["std"], 3.0 if model == "msk" else 0.2, rtol=1e-6)
+  # The fake checkpoint keeps the runner config's initial std (the unicycle MSK
+  # recipe's; its per-term OSL value is set by the PPO, not by the model).
+  init_std = UNICYCLE_MSK_INIT_STD if model == "msk" else 0.2
+  np.testing.assert_allclose(action["std"], init_std, rtol=1e-6)
   # Unicycle DR: OSL motors 0-20 ms, the human 20-40 ms, at 2 ms physics steps.
   delays = m["training"]["actuator_delay"]
   human = "muscles" if model == "msk" else "servos"
