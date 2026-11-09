@@ -37,7 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -125,6 +125,18 @@ def read_config(path: str | Path) -> dict[str, Any]:
 def plain(value: Any) -> Any:
   """JSON types: tuples become lists, enums their values."""
   return json.loads(json.dumps(value, default=lambda x: x.value))
+
+
+DEPLOY_SOLVER_ITERATIONS = 10
+DEPLOY_LS_ITERATIONS = 20
+"""The smallest solver caps a bundle gets (the run's own when higher). The OSL tasks
+train at mujoco_warp's 4 Newton / 8 line-search iterations, where a policy behaves the
+same as at 10 (the solves converge). CPU MuJoCo's Newton solver needs up to ~7
+iterations at impratio 3 under the elliptic cone: capped at 4 it truncates the contact
+solve, and a policy that validates in warp falls within a second in osl_deploy (the
+first converged MSK run: 0 of 12 test clips survived 20 s at 4, 9 of 12 at 10, and 10
+and 50 iterations were identical). Solves stop at convergence, so the higher cap only
+costs time where it is needed."""
 
 
 @dataclass(frozen=True)
@@ -240,16 +252,24 @@ class Components:
   env: SimpleNamespace
   command: GaitLibraryCommand
   parts: PolicyParts
+  solver: dict[str, Any] = field(default_factory=dict)
+  """The compiled model's solver caps and the run's (``deployment``/``training``)."""
 
 
 def build_components(
-  checkpoint: str | Path, library: str | Path | None = None
+  checkpoint: str | Path,
+  library: str | Path | None = None,
+  solver_iterations: int | None = None,
+  ls_solver_iterations: int | None = None,
 ) -> Components:
   """Rebuild the run's task on CPU, without a Warp simulation.
 
   Args:
     checkpoint: ``model_<N>.pt`` inside a run directory with ``params/``.
     library: The clip folder, when the run's ``library_dir`` is not on this machine.
+    solver_iterations, ls_solver_iterations: The compiled model's solver caps;
+      default the run's own, raised to ``DEPLOY_SOLVER_ITERATIONS`` and
+      ``DEPLOY_LS_ITERATIONS`` (see there).
 
   Raises:
     ValueError: If the run is not a gait-library run, the config rebuilt from this
@@ -293,6 +313,27 @@ def build_components(
     )
   command_cfg.library_dir = str(folder.resolve())
 
+  mj = cfg.sim.mujoco
+  solver = {
+    "training": {"iterations": mj.iterations, "ls_iterations": mj.ls_iterations},
+  }
+  mj.iterations = (
+    max(mj.iterations, DEPLOY_SOLVER_ITERATIONS)
+    if solver_iterations is None
+    else int(solver_iterations)
+  )
+  mj.ls_iterations = (
+    max(mj.ls_iterations, DEPLOY_LS_ITERATIONS)
+    if ls_solver_iterations is None
+    else int(ls_solver_iterations)
+  )
+  if mj.iterations < 1 or mj.ls_iterations < 1:
+    raise ValueError("Solver iteration caps must be positive.")
+  solver["deployment"] = {
+    "iterations": mj.iterations,
+    "ls_iterations": mj.ls_iterations,
+  }
+
   cfg.scene.num_envs = 1
   scene = Scene(cfg.scene, "cpu")
   model = scene.compile()
@@ -326,7 +367,7 @@ def build_components(
     entity_cfg=cfg.scene.entities["robot"],
     obs_group_history=actor.history_length,
   )
-  return Components(spec, cfg, env, command, parts)
+  return Components(spec, cfg, env, command, parts, solver)
 
 
 def load_actor(checkpoint: str | Path, action_dim: int) -> torch.nn.Module:
@@ -425,6 +466,12 @@ def _readme(manifest: dict[str, Any]) -> str:
     for name, d in delays.items()
   )
   validation = manifest["validation"]
+  deployment = manifest.get("deployment") or {}
+  solver = deployment.get("solver") or {"iterations": "?", "ls_iterations": "?"}
+  trained = deployment.get("training_solver") or {
+    "iterations": "?",
+    "ls_iterations": "?",
+  }
   return f"""# {run["task"] or "OSL gait-library policy"}: {run["run"]} / {run["checkpoint"]}
 
 Deployment bundle exported by mjlab (`mjlab.tasks.osl_gait_library.export`) for
@@ -441,11 +488,15 @@ osl_deploy (plain CPU MuJoCo {manifest["mujoco_version"]}).
   {", ".join(f"{b['name']} ({b['size']})" for b in action["blocks"])}
 - Default inference: **{action["default_inference"]}**
 - ONNX vs PyTorch max abs error: {validation["onnx_max_abs_error"]:.3g}
+- Solver caps of `model.mjb`: {solver["iterations"]} Newton, {solver["ls_iterations"]}
+  line search (training: {trained["iterations"]}/{trained["ls_iterations"]} in mujoco_warp,
+  where its solves converge; CPU MuJoCo needs the higher cap)
 
 Inference: `mean` applies the raw policy mean; `expected` applies
-E[clip(N(mean, std^2), lo, hi)] with the learned std. MSK policies need `expected`
-(their large muscle std makes the raw mean far weaker than what they trained on);
-robot policies run on the raw mean.
+E[clip(N(mean, std^2), lo, hi)] with the learned std. A muscle policy trained with
+a large std (around 1 or more) needs `expected`, because clipping makes the noise
+itself drive its muscles; one annealed to a small std runs on the raw mean, as robot
+policies do.
 
 Actuator command delays in training (deployment must add them itself):
 {delay_lines}
@@ -466,6 +517,8 @@ def export_bundle(
   library: str | Path | None = None,
   inference: Inference | None = None,
   overwrite: bool = False,
+  solver_iterations: int | None = None,
+  ls_solver_iterations: int | None = None,
 ) -> Path:
   """Export ``checkpoint`` as a bundle (see the module docstring); returns it.
 
@@ -476,12 +529,14 @@ def export_bundle(
     inference: The manifest's default inference; None picks ``expected`` for MSK
       policies and ``mean`` for robot ones.
     overwrite: Replace an existing bundle (once the new one is complete).
+    solver_iterations, ls_solver_iterations: The bundle model's solver caps (see
+      :func:`build_components`); recorded in the manifest's ``deployment``.
   """
   checkpoint = Path(checkpoint).resolve()
   output = Path(output or checkpoint.parent / "deploy" / checkpoint.stem).resolve()
   if output.exists() and not overwrite:
     raise FileExistsError(f"{output} exists; pass --overwrite to replace it.")
-  c = build_components(checkpoint, library)
+  c = build_components(checkpoint, library, solver_iterations, ls_solver_iterations)
   parts, command = c.parts, c.command
   action_dim = sum(term.action_dim for term in parts.actions.values())
   actor = load_actor(checkpoint, action_dim)
@@ -516,6 +571,16 @@ def export_bundle(
       "lookahead_stride": command.cfg.lookahead_stride,
       "blend_time_s": command.cfg.blend_time_s,
       "twist_metric_weights": list(command.cfg.twist_metric_weights),
+    }
+    manifest["deployment"] = {
+      "solver": c.solver["deployment"],
+      "training_solver": c.solver["training"],
+      "note": (
+        "Solver caps of model.mjb. Training ran mujoco_warp at training_solver, "
+        "where its solves converge; CPU MuJoCo needs a higher cap to converge "
+        "(it truncates the contact solve at 4 iterations under the elliptic cone at "
+        "impratio 3)."
+      ),
     }
     library_dir = Path(command.cfg.library_dir)
     manifest["provenance"] = _provenance(
@@ -664,6 +729,11 @@ class ExportConfig:
   """Create a missing repo public (default private)."""
   threads: int = 2
   """CPU threads for PyTorch."""
+  solver_iterations: int | None = None
+  """The bundle model's Newton iteration cap; default the run's, at least
+  ``DEPLOY_SOLVER_ITERATIONS`` (10)."""
+  ls_solver_iterations: int | None = None
+  """Its line-search cap; default the run's, at least ``DEPLOY_LS_ITERATIONS`` (20)."""
 
 
 def main() -> None:
@@ -673,7 +743,13 @@ def main() -> None:
   torch.set_num_threads(cfg.threads)
   inference = None if cfg.inference == "auto" else cfg.inference
   bundle = export_bundle(
-    cfg.checkpoint, cfg.output, cfg.library, inference, cfg.overwrite
+    cfg.checkpoint,
+    cfg.output,
+    cfg.library,
+    inference,
+    cfg.overwrite,
+    cfg.solver_iterations,
+    cfg.ls_solver_iterations,
   )
   manifest = json.loads((bundle / "manifest.json").read_text())
   print(

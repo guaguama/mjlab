@@ -101,6 +101,14 @@ Added
   iteration logs the std per action term, the cap and the noise gap under
   ``Policy/``. ``python -m mjlab.tasks.osl_gait_library.evaluate <checkpoint>`` runs
   the same validations on a saved checkpoint.
+- ``Mjlab-Stairs-OSL-Fullbody`` tasks (``-ROBOT``/``-MSK``, ``-CLF``,
+  ``-Compliant``): the matching ``Mjlab-Mimic-OSL-Fullbody`` task on one stairs clip
+  and its TERRA box terrain, with the unicycle tasks' stage-1 domain randomization.
+  The terrain is read from the TerrainSpec JSON beside the clip
+  (``<clip>_terrain.json``, or ``--env.commands.motion.terrain-file``) and added to
+  the scene as static boxes; it follows the motion file given on the command line.
+  Episodes start at the clip's own world pose, without re-centring. Each run keeps
+  a copy of its terrain in ``params/terrain.json``.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and
@@ -155,6 +163,12 @@ Changed
 Fixed
 ^^^^^
 
+- OSL gait-library deployment bundles get at least 10 Newton and 20 line-search
+  solver iterations (``--solver-iterations``, ``--ls-solver-iterations`` to set
+  them), recorded in the manifest's ``deployment``. The tasks train at mujoco_warp's
+  4/8, where the solves converge, but CPU MuJoCo truncates its contact solve at 4
+  iterations under the elliptic cone at impratio 3: a policy that validated in
+  training fell within a second in osl_deploy, and survived with the higher cap.
 - OSL imitation and gait-library envs on the compliant socket no longer re-read the
   robot model for every clip they pad; a 779-clip library took about four minutes per
   env to load.

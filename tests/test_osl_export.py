@@ -273,3 +273,20 @@ def test_upload_falls_back_to_the_hf_tool(tmp_path, monkeypatch) -> None:
   monkeypatch.setattr(gl_export.shutil, "which", lambda name: None)
   with pytest.raises(RuntimeError, match="hf upload me/policies"):
     gl_export.upload_bundle(bundle, "me/policies", "custom/path", private=False)
+
+
+def test_bundle_solver_caps_converge_on_cpu(exported, tmp_path) -> None:
+  """Bundles get at least 10/20 solver iterations (the OSL tasks train at 4/8, where
+  CPU MuJoCo truncates its contact solve), recorded in the manifest; flags override."""
+  _, checkpoint, bundle = exported
+  m = json.loads((bundle / "manifest.json").read_text())
+  model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
+  assert (model.opt.iterations, model.opt.ls_iterations) == (10, 20)
+  assert m["deployment"]["solver"] == {"iterations": 10, "ls_iterations": 20}
+  assert m["deployment"]["training_solver"] == {"iterations": 4, "ls_iterations": 8}
+  assert "10 Newton, 20" in (bundle / "README.md").read_text()
+  custom = gl_export.export_bundle(
+    checkpoint, tmp_path / "b", solver_iterations=50, ls_solver_iterations=50
+  )
+  model = mujoco.MjModel.from_binary_path(str(custom / "model.mjb"))
+  assert (model.opt.iterations, model.opt.ls_iterations) == (50, 50)
