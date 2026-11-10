@@ -87,6 +87,17 @@ class ActionLayout:
   def human_terms(self) -> list[str]:
     return [name for name, _ in self.terms if name != self.osl_term]
 
+  def agent_terms(self, agent: Agent) -> list[tuple[str, slice]]:
+    """``agent``'s action terms, each with its columns in ``agent``'s own action
+    (not the env's), in order."""
+    out: list[tuple[str, slice]] = []
+    start = 0
+    for name, dim in self.terms:
+      if (name == self.osl_term) == (agent == "osl"):
+        out.append((name, slice(start, start + dim)))
+        start += dim
+    return out
+
   def to_list(self) -> list[list[str | int]]:
     """Plain-type form for checkpoints and YAML."""
     return [[name, dim] for name, dim in self.terms]

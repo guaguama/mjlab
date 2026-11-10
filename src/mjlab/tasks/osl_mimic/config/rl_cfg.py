@@ -137,7 +137,8 @@ class OslMimicVideoCfg:
   height: int = 480
   inference: str = "auto"
   """``"mean"``, ``"expected"`` (see ``OslMimicValidationCfg.inference``) or
-  ``"auto"``: ``"expected"`` when the policy drives muscles, else ``"mean"``."""
+  ``"auto"``: ``"expected"`` when the policy drives muscles whose median std exceeds
+  0.3, else ``"mean"``."""
   seed: int = 0
   """Seeds the video env's draws (commands, resets), so every checkpoint's video
   plays the same command sequence. Training's random state is left untouched."""

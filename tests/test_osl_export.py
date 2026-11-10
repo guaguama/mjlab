@@ -150,7 +150,8 @@ def test_bundle_contract(exported) -> None:
   action = m["action"]
   assert [(b["name"], b["size"]) for b in action["blocks"]] == blocks
   assert action["size"] == action_dim == len(action["std"])
-  # Robot policies run on the raw mean, MSK ones on the noise-averaged action.
+  # Robot policies run on the raw mean; MSK ones, at the fixture's muscle std of
+  # 1.0 (above 0.3), on the noise-averaged action.
   assert action["default_inference"] == ("expected" if model == "msk" else "mean")
   for b in action["blocks"]:
     span = slice(b["start"], b["start"] + b["size"])
@@ -296,3 +297,25 @@ def test_bundle_solver_caps_converge_on_cpu(exported, tmp_path) -> None:
   )
   model = mujoco.MjModel.from_binary_path(str(custom / "model.mjb"))
   assert (model.opt.iterations, model.opt.ls_iterations) == (50, 50)
+
+
+def test_default_inference_follows_the_muscle_std(exported) -> None:
+  """The manifest's default is the noise-averaged action only for a muscle policy
+  whose median muscle std exceeds 0.3; a low-std MSK policy (the stage-1 recipe
+  ends at 0.07) and every robot policy run on the raw mean. The OSL motors' std
+  does not count."""
+  case, checkpoint, _ = exported
+  model = case[0]
+  obs_dim, action_dim, _ = CASES[case]
+  parts = gl_export.build_components(checkpoint).parts
+  low, high = np.full(action_dim, 0.07), np.full(action_dim, 1.0)
+  assert policy_export.default_inference(parts, low) == "mean"
+  assert policy_export.default_inference(parts, high) == (
+    "expected" if model == "msk" else "mean"
+  )
+  manifest = policy_export.policy_metadata(parts, low, obs_dim, None)
+  assert manifest["action"]["default_inference"] == "mean"
+  if model == "msk":
+    osl_noisy = low.copy()
+    osl_noisy[:2] = 3.0  # The OSL motors come first on the MSK model.
+    assert policy_export.default_inference(parts, osl_noisy) == "mean"

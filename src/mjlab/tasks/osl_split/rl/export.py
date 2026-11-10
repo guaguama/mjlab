@@ -18,6 +18,14 @@ to rebuild its input exactly, so every export carries, next to the network:
   under. They describe the robustness it was trained for; nothing in them is
   applied at inference;
 * ``std``: the actor's sampling std (normalized action units) at export;
+* ``default_inference``: ``"mean"``: the controller runs the actor's mean (the OSL
+  motors clip symmetrically, so the noise-averaged action is the mean);
+* ``reset``: what the observation holds when the controller starts or an episode
+  restarts: every term's history (and bus lag buffer) filled with the first frame
+  read, and the previous command 0;
+* ``deployment``: the solver caps a CPU MuJoCo consumer needs (at least 10 Newton
+  and 20 line-search iterations, as the stage-1 bundles get) next to the training
+  ones;
 * ``lineage``: the stage-1 run stage 2 started from.
 
 The ONNX graph (input ``obs`` (1, D), output ``actions`` (1, 2)) is exported the
@@ -40,6 +48,10 @@ import numpy as np
 import torch
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import OSL_TORQUE_JOINTS
+from mjlab.tasks.osl_gait_library.export import (
+  DEPLOY_LS_ITERATIONS,
+  DEPLOY_SOLVER_ITERATIONS,
+)
 from mjlab.tasks.osl_split.config.sensors import (
   ACC_RANGE,
   ANKLE_FORCE,
@@ -77,6 +89,20 @@ if TYPE_CHECKING:
 
 OSL_POLICY_FORMAT = "mjlab.osl_split.osl_policy/1"
 """Stored under ``"format"`` in every metadata JSON; bump it on layout changes."""
+DEFAULT_INFERENCE = "mean"
+"""The OSL actor runs on its mean: its commands clip symmetrically at +-1 with the
+mean inside, so its noise-averaged action is the mean (stage 1 logged a zero noise
+gap on the OSL rows)."""
+RESET = {
+  "history": (
+    "After a reset (the controller's start, an episode's), every observation "
+    "term's history and every bus's lag buffer hold the first frame read after it, "
+    "repeated: the oldest frames equal the newest until the history fills."
+  ),
+  "last_action": "0 for both joints after a reset (the action term's raw action).",
+}
+"""The observation's state at a reset, as mjlab's history and delay buffers keep it
+(backfilled with the first frame) and as the action term resets (0)."""
 EXPORT_DIR = "exported"
 """The run directory's subdirectory the runner exports into."""
 OBS_LAYOUT = "term-major, oldest to newest"
@@ -140,6 +166,9 @@ def osl_policy_metadata(
     "action": _action_metadata(env, alg),
     "randomization": _randomization_metadata(env),
     "std": std,
+    "default_inference": DEFAULT_INFERENCE,
+    "reset": dict(RESET),
+    "deployment": _deployment_metadata(env),
     "lineage": dict(lineage) if lineage is not None else None,
   }
 
@@ -379,6 +408,36 @@ def _motor_gains(
     gains.append(float(model.actuator_gear[a, 0] * model.actuator_gainprm[a, 0]))
     ranges.append([float(x) for x in model.actuator_ctrlrange[a]])
   return gains, ranges
+
+
+def _deployment_metadata(env: ManagerBasedRlEnv) -> dict[str, Any]:
+  """The solver caps a CPU MuJoCo consumer should run (the training ones, raised
+  to ``DEPLOY_SOLVER_ITERATIONS`` / ``DEPLOY_LS_ITERATIONS``) and the training
+  ones (None when the env does not say)."""
+  mj = getattr(getattr(getattr(env, "cfg", None), "sim", None), "mujoco", None)
+  training = None
+  if mj is not None:
+    training = {
+      "iterations": int(mj.iterations),
+      "ls_iterations": int(mj.ls_iterations),
+    }
+  return {
+    "solver": {
+      "iterations": max(
+        (training or {}).get("iterations", 0), DEPLOY_SOLVER_ITERATIONS
+      ),
+      "ls_iterations": max(
+        (training or {}).get("ls_iterations", 0), DEPLOY_LS_ITERATIONS
+      ),
+    },
+    "training_solver": training,
+    "note": (
+      "Training ran mujoco_warp at training_solver, where its solves converge. CPU "
+      "MuJoCo needs at least 10 Newton and 20 line-search iterations under the "
+      "elliptic cone at impratio 3: at 4 it truncates the contact solve, and a "
+      "policy that validates in warp falls in osl_deploy."
+    ),
+  }
 
 
 def _randomization_metadata(env: ManagerBasedRlEnv) -> dict[str, Any]:

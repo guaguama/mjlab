@@ -23,11 +23,13 @@ from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_c
 from mjlab.tasks.osl_mimic.config.env_cfgs import stress_env_cfg
 from mjlab.tasks.osl_mimic.config.rl_cfg import INIT_STD, MuscleMimicPpoCfg
 from mjlab.tasks.osl_mimic.rl.expected import (
+  EXPECTED_INFERENCE_MIN_STD,
   action_bounds,
   action_term_slices,
+  auto_inference,
   expected_clipped_gaussian,
 )
-from mjlab.tasks.osl_mimic.rl.models import gaussian_std
+from mjlab.tasks.osl_mimic.rl.models import gaussian_std, gaussian_std_parameter
 from mjlab.tasks.osl_mimic.rl.muon import MuonAdam, orthogonalize
 from mjlab.tasks.osl_mimic.rl.ppo import MuscleMimicPPO, geometric_schedule
 from mjlab.tasks.osl_mimic.rl.runner import OslMimicOnPolicyRunner, inference_modes
@@ -369,17 +371,40 @@ def test_stress_env_cfg_is_the_training_distribution_with_the_site_check() -> No
   assert train.terminations["site_deviation"].params["threshold"] == 1.0
 
 
-def test_video_inference_auto_picks_expected_for_muscles() -> None:
+def test_video_inference_auto_follows_the_muscle_std() -> None:
+  """``auto`` plays the noise-averaged action only while the median muscle std is
+  above 0.3 (where the clipped noise drives the muscles); the OSL motors' std does
+  not count."""
   runner = OslMimicOnPolicyRunner.__new__(OslMimicOnPolicyRunner)
   runner.video_cfg = {"inference": "auto"}
+  runner.alg = _algorithm()  # Muscles at musclemimic's 3.0.
   muscles = SimpleNamespace(action_manager=_action_manager())
   servos = SimpleNamespace(
     action_manager=_FakeActionManager({"servos": SimpleNamespace(action_dim=3)})
   )
   assert runner._video_inference(cast(Any, muscles)) == "expected"
   assert runner._video_inference(cast(Any, servos)) == "mean"
+  param, _ = gaussian_std_parameter(runner.alg.actor)
+  with torch.no_grad():
+    param[:OSL] = math.log(3.0)  # The OSL rows: ignored.
+    param[OSL:] = math.log(0.07)  # The recipe's final muscle std.
+  assert runner._video_inference(cast(Any, muscles)) == "mean"
+  with torch.no_grad():
+    param[OSL : OSL + 3] = math.log(0.5)  # 3 of 5 muscles above 0.3.
+  assert runner._video_inference(cast(Any, muscles)) == "expected"
   runner.video_cfg = {"inference": "mean"}
   assert runner._video_inference(cast(Any, muscles)) == "mean"
+
+
+def test_auto_inference_threshold() -> None:
+  assert EXPECTED_INFERENCE_MIN_STD == 0.3
+  assert auto_inference([]) == "mean"  # No muscles.
+  assert auto_inference(torch.tensor([0.07, 0.07])) == "mean"
+  assert auto_inference([0.3, 0.3, 0.3]) == "mean"  # At the threshold.
+  assert auto_inference([0.2, 0.31, 2.0]) == "expected"
+  # An even count averages the middle pair: 0.35 and 0.25.
+  assert auto_inference([0.1, 0.2, 0.5, 2.0]) == "expected"
+  assert auto_inference([0.1, 0.2, 0.3, 2.0]) == "mean"
 
 
 def test_init_std_per_action_term() -> None:

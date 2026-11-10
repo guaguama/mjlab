@@ -10,26 +10,29 @@ nothing else needs surgery. A :class:`WarmStart` holds:
 * ``human_actor``: the unified actor's state dict with its output layer and log-std
   restricted to the human's rows. Those are ``ActionLayout.rows("human")``, *not* a
   prefix or suffix in general: the musculoskeletal layout puts the OSL first. The std
-  is copied verbatim, and stage 2 holds it fixed by default: the musculoskeletal
-  actor's mean muscle commands were learned against that noise (noise clipped by the
-  [0, 1] excitation range is co-contraction), so lowering it changes the gait;
+  is copied verbatim, and stage 2 holds it fixed by default: the human's mean
+  commands were learned at that std (0.07 at the end of a stage-1 recipe run, where
+  the raw mean is the gait), so another std changes what they do;
 * ``human_critic``: the stage-1 critic, verbatim. Stage 2 copies it into both
   critics, unless the reward type switches;
 * ``teacher_head``: the two OSL rows of the output layer and their log-stds: the
   unified policy's OSL controller, on the human trunk's penultimate features (stage
-  2's optional teacher blend);
+  2's teacher blend and zero-shot teacher check);
 * ``return_stats``: the reward normalizer's running return mean, variance and count.
   The stage-1 critic learned returns divided by that standard deviation, so a copied
-  critic needs it to keep its scale; stage 2 resets the count (2e8 at stage 1's
-  iteration 610, about 1e9 at its end) so the statistics can follow the new reward
-  channels;
+  critic needs it to keep its scale; stage 2 resets the count (about 2e9 at the end
+  of a recipe run) so the statistics can follow the new reward channels;
 * ``lineage``: where it came from, as plain types (also written as YAML): the run,
   checkpoint, iteration and step counters, the task, the action layout, both
-  architectures, the stds and the W&B run.
+  architectures, the stds and the W&B run, and stage 1's state at its end: its last
+  learning rate and std cap, the env settings it trained with (CLF penalty weight,
+  twist weight, root-deviation limit, with the env stages then in force), the
+  library release and whether the run had finished. Stage 2 compares them with its
+  own settings when it starts (warnings, and a refusal for another ``pen_w``).
 
 What is *not* carried: the optimizer state and its update counter. Stage 1 runs one
-MuonAdam over actor and critic on a linear decay that reaches 0 at its last
-iteration; stage 2 gives every module its own optimizer and schedule.
+MuonAdam over actor and critic on its own schedule (the recipe decays to 10% of the
+rate and holds); stage 2 gives every module its own optimizer and schedule.
 
 Between the stages the reward type may switch (CLF to MimicReward or back; stage 2
 then retrains its critics from scratch), but the model and the socket may not:
@@ -45,6 +48,9 @@ rebuilds both networks from the run's ``params/agent.yaml``.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import os
 import re
 import statistics
@@ -60,8 +66,11 @@ import yaml
 from tensordict import TensorDict
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.tasks.osl_gait_library.export import read_config
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward, _actions
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
+from mjlab.tasks.osl_mimic.rl.ppo import geometric_schedule
+from mjlab.tasks.osl_split.scripts.two_stage import planned_last_iteration
 
 from .layout import ActionLayout
 
@@ -92,8 +101,35 @@ LINEAGE_KEYS: tuple[str, ...] = (
   "created",
   "verified_max_abs_diff",
 )
-"""Keys every lineage carries. Converted files also record ``library_dir``, the
-stage-1 motion library (``None`` when the run's ``params/env.yaml`` lacks it)."""
+"""Keys every lineage carries."""
+OPTIONAL_LINEAGE_KEYS: tuple[str, ...] = (
+  "library_dir",
+  "library_release",
+  "stage1_lr",
+  "stage1_std_cap",
+  "stage1_env",
+  "stage1_planned_last_iteration",
+)
+"""Keys converted files record beyond :data:`LINEAGE_KEYS` (older files lack some,
+and they load all the same):
+
+* ``library_dir``: the stage-1 motion library (``None`` when the run's
+  ``params/env.yaml`` lacks it); ``library_release``: its ``{"release",
+  "sha256"}`` (:func:`library_release`), when readable where it was converted;
+* ``stage1_lr``: the rate of stage 1's last update; ``stage1_std_cap``: the std cap
+  its final std was projected under (None without a cap);
+* ``stage1_env``: the env settings of stage 1's last update
+  (:func:`stage1_env_settings`), None without ``params/env.yaml``;
+* ``stage1_planned_last_iteration``: the iteration the run was set to end at (None
+  when its settings do not say)."""
+HUMAN_STD_WARNING = 0.15
+"""A median human std above this draws a warning: stage 2 holds it fixed, and a
+policy trained at a large std leans on its noise (the recipe ends at 0.07)."""
+ENV_STAGE_SETTINGS = {
+  "rewards.twist.weight": "twist_weight",
+  "terminations.root_deviation.threshold": "root_deviation",
+}
+"""Stage-1 env-stage paths and the ``stage1_env`` setting each overrides."""
 VERIFY_ATOL = 1e-5
 """Bound on the split's deviation from the unified actor. The split is exact up to
 float32 summation order in the output layer (1.2e-6 on the MSK-CLF-compliant run's
@@ -243,6 +279,8 @@ class WarmStart:
         f"count {stats['count']:.4g}",
         "  verification: "
         + ("skipped" if diff is None else f"max |split - unified| {diff:.2g}"),
+        *provenance_lines(lin),
+        *(f"[WARN] {warning}" for warning in lineage_warnings(lin)),
       )
     )
 
@@ -308,8 +346,9 @@ def build_warm_start(
 
   The model, socket, reward and variant come from the run's ``params/agent.yaml``
   (its ``validation`` block), the architectures from its ``actor`` and ``critic``
-  blocks. ``params/env.yaml`` cannot be loaded back (its spec_fn is a closure) and
-  is only scanned for the motion library. ``verify`` rebuilds the unified and the
+  blocks. ``params/env.yaml`` cannot be loaded back as a config (its spec_fn is a
+  closure); it is read as plain data for the motion library and stage 1's env
+  settings (:func:`stage1_env_settings`). ``verify`` rebuilds the unified and the
   human actor on CPU and checks the split on random observations
   (:func:`verify_warm_start`); it costs a few seconds.
   """
@@ -392,6 +431,16 @@ def build_warm_start(
     "verified_max_abs_diff": None,
     "library_dir": _library_dir(run_dir),
   }
+  algorithm = agent.get("algorithm") or {}
+  updates = int(state["num_updates_done"])
+  lineage["library_release"] = library_release(lineage["library_dir"])
+  lineage["stage1_lr"] = stage1_learning_rate(algorithm, max(updates - 1, 0))
+  lineage["stage1_std_cap"] = stage1_std_cap(algorithm, updates)
+  lineage["stage1_env"] = stage1_env_settings(run_dir, agent, updates)
+  try:
+    lineage["stage1_planned_last_iteration"] = planned_last_iteration(run_dir)
+  except Exception:  # noqa: BLE001 - provenance only, never a reason to fail.
+    lineage["stage1_planned_last_iteration"] = None
   ws = WarmStart(
     human_actor=human_actor,
     human_critic={key: value.detach().clone() for key, value in critic.items()},
@@ -612,8 +661,239 @@ def find_wandb_run_id(
 
 
 ##
+# Provenance: stage 1's state at its end.
+##
+
+
+def stage1_learning_rate(algorithm: Mapping[str, Any], update: int) -> float | None:
+  """The rate ``MuscleMimicPPO`` trained ``update`` with, from an agent.yaml
+  ``algorithm`` block (its ``scheduled_learning_rate``); None without a rate."""
+  try:
+    base = float(algorithm["learning_rate"])
+  except (KeyError, TypeError, ValueError):
+    return None
+  updates = int(algorithm.get("lr_schedule_updates") or 0)
+  if algorithm.get("lr_schedule", "linear") == "constant" or updates <= 0:
+    return base
+  done = max(update - int(algorithm.get("lr_schedule_offset") or 0), 0)
+  fraction = max(1.0 - done / updates, 0.0)
+  final = float(algorithm.get("lr_final_ratio") or 0.0)
+  return base * (final + (1.0 - final) * fraction)
+
+
+def stage1_std_cap(algorithm: Mapping[str, Any], update: int) -> float | None:
+  """``MuscleMimicPPO.std_cap(update)`` from an agent.yaml ``algorithm`` block; None
+  without a cap."""
+  start = float(algorithm.get("std_cap_start") or 0.0)
+  if start <= 0.0:
+    return None
+  end = float(algorithm.get("std_cap_end") or 0.0) or start
+  return geometric_schedule(
+    update,
+    start,
+    end,
+    int(algorithm.get("std_cap_begin_update") or 0),
+    int(algorithm.get("std_cap_end_update") or 0),
+  )
+
+
+def env_stages_in_force(
+  stages: Iterable[Sequence[Any]], update: int
+) -> dict[str, float]:
+  """The staged values ``OslMimicOnPolicyRunner.apply_env_stages`` sets for
+  ``update``, by path; a path whose stages have all ended is absent (the env config's
+  own value holds)."""
+  stages = [(int(u), str(path), float(v)) for u, path, v in stages]
+  out: dict[str, float] = {}
+  for path in dict.fromkeys(path for _, path, _ in stages):
+    active = sorted((u, v) for u, p, v in stages if p == path and update < u)
+    if active:
+      out[path] = active[0][1]
+  return out
+
+
+def stage1_env_settings(
+  run_dir: Path, agent: Mapping[str, Any], num_updates_done: int
+) -> dict[str, Any] | None:
+  """The env settings stage 1's last update trained with: ``clf_pen_w`` (None
+  under MimicReward), ``twist_weight`` and ``root_deviation`` (the training
+  limit), from ``params/env.yaml`` with the env stages then in force on top
+  (recorded as ``env_stages_in_force``). None without a readable env.yaml."""
+  try:
+    env = read_config(run_dir / "params" / "env.yaml")
+  except (OSError, yaml.YAMLError, ValueError):
+    return None
+  if not isinstance(env, Mapping):
+    return None
+  settings: dict[str, Any] = {
+    "clf_pen_w": _number(_dig(env, "rewards", "mimic", "params", "clf", "pen_w")),
+    "twist_weight": _number(_dig(env, "rewards", "twist", "weight")),
+    "root_deviation": _number(
+      _dig(env, "terminations", "root_deviation", "params", "threshold")
+    ),
+  }
+  stages = env_stages_in_force(agent.get("env_stages") or (), num_updates_done - 1)
+  for path, value in stages.items():
+    if path in ENV_STAGE_SETTINGS:
+      settings[ENV_STAGE_SETTINGS[path]] = value
+  settings["env_stages_in_force"] = stages
+  return settings
+
+
+def env_cfg_settings(cfg: Any) -> dict[str, float | None]:
+  """:func:`stage1_env_settings`' settings of a live env config (None where it
+  has none: a MimicReward ``clf_pen_w``, a mode without the root-deviation
+  limit)."""
+
+  def term(section: str, name: str) -> Any:
+    terms = getattr(cfg, section, None)
+    return terms.get(name) if isinstance(terms, Mapping) else None
+
+  mimic, twist, root = (
+    term("rewards", "mimic"),
+    term("rewards", "twist"),
+    term("terminations", "root_deviation"),
+  )
+  clf = (getattr(mimic, "params", None) or {}).get("clf")
+  pen_w = clf.get("pen_w") if isinstance(clf, Mapping) else getattr(clf, "pen_w", None)
+  threshold = (getattr(root, "params", None) or {}).get("threshold")
+  return {
+    "clf_pen_w": _number(pen_w),
+    "twist_weight": _number(getattr(twist, "weight", None)),
+    "root_deviation": _number(threshold),
+  }
+
+
+def library_release(library_dir: str | Path | None) -> dict[str, str | None] | None:
+  """A gait library's identity: ``release`` (``library.json``'s, else the folder
+  name) and ``sha256`` (of ``library.json``; None where it cannot be read). None
+  without a library."""
+  if not library_dir:
+    return None
+  folder = Path(library_dir).expanduser()
+  try:
+    data = (folder / "library.json").read_bytes()
+  except OSError:
+    return {"release": folder.name or None, "sha256": None}
+  name = None
+  try:
+    loaded = json.loads(data)
+    name = loaded.get("release") if isinstance(loaded, Mapping) else None
+  except ValueError:
+    pass
+  return {
+    "release": str(name) if name else folder.name or None,
+    "sha256": hashlib.sha256(data).hexdigest(),
+  }
+
+
+def compare_library_releases(
+  stage1: Mapping[str, Any] | None, stage2: Mapping[str, Any] | None
+) -> tuple[str, str] | None:
+  """``("INFO" | "WARN", message)`` comparing two :func:`library_release` values, or
+  None when either is unknown. The content hash decides where both have one (a
+  cluster run's library sits at another path than this machine's copy); the release
+  names otherwise."""
+  if not stage1 or not stage2:
+    return None
+  names = (stage1.get("release"), stage2.get("release"))
+  hashes = (stage1.get("sha256"), stage2.get("sha256"))
+  if hashes[0] and hashes[1]:
+    if hashes[0] == hashes[1]:
+      return "INFO", f"Stage 1 and stage 2 use the same library release {names[1]}."
+    if names[0] == names[1]:
+      # library.json records its conversion's time and input path, so a release
+      # converted again differs in bytes even when its clips do not.
+      return (
+        "WARN",
+        f"Stage 1 and stage 2 use library {names[1]}, but their library.json "
+        f"differ ({hashes[0][:12]} vs {hashes[1][:12]}): the same release name, "
+        "converted again or edited. Check that its clips are the same.",
+      )
+    return (
+      "WARN",
+      f"Stage 1 trained on library {names[0]} (library.json {hashes[0][:12]}), "
+      f"stage 2 uses {names[1]} ({hashes[1][:12]}): another library.",
+    )
+  if names[0] == names[1]:
+    return (
+      "INFO",
+      f"Stage 1 and stage 2 use library {names[1]} (by name: stage 1's "
+      "library.json was not readable when converted).",
+    )
+  return "WARN", f"Stage 1 trained on library {names[0]}, stage 2 uses {names[1]}."
+
+
+def lineage_warnings(lineage: Mapping[str, Any]) -> list[str]:
+  """What a warm start's lineage alone shows to be risky: a large human std (stage
+  2 holds it fixed) and an unfinished stage-1 run."""
+  warnings: list[str] = []
+  median = (lineage.get("human_std") or {}).get("median")
+  if median is not None and float(median) > HUMAN_STD_WARNING:
+    warnings.append(
+      f"The human's median std is {float(median):.3g}, above {HUMAN_STD_WARNING}: "
+      "stage 2 holds it fixed, and a policy trained at a large std leans on its "
+      "noise, so its raw mean may not walk (the stage-1 recipe ends at 0.07)."
+    )
+  planned = lineage.get("stage1_planned_last_iteration")
+  if planned is not None and int(lineage["iter"]) < int(planned):
+    warnings.append(
+      f"The warm start is iteration {lineage['iter']} of a stage-1 run set to end at "
+      f"{planned}: the run is unfinished (still training, stopped or crashed), or "
+      "an earlier checkpoint was chosen."
+    )
+  return warnings
+
+
+def provenance_lines(lineage: Mapping[str, Any]) -> list[str]:
+  """Stage 1's recorded end state, for summaries."""
+  lines: list[str] = []
+  if "stage1_lr" in lineage or "stage1_std_cap" in lineage:
+    lr, cap = lineage.get("stage1_lr"), lineage.get("stage1_std_cap")
+    shown_cap = "none" if cap is None and "stage1_std_cap" in lineage else _shown(cap)
+    lines.append(
+      f"  stage 1 at its end: learning rate {_shown(lr)}, std cap {shown_cap}"
+    )
+  env = lineage.get("stage1_env")
+  if env:
+    stages = env.get("env_stages_in_force") or {}
+    lines.append(
+      f"  stage-1 env: CLF pen_w {_shown(env.get('clf_pen_w'))}, twist weight "
+      f"{_shown(env.get('twist_weight'))}, root deviation "
+      f"{_shown(env.get('root_deviation'))}"
+      + (f" (env stages in force: {stages})" if stages else "")
+    )
+  release = lineage.get("library_release")
+  if release:
+    digest = release.get("sha256")
+    lines.append(
+      f"  library: {release.get('release')}"
+      + (f" (library.json sha256 {digest[:12]})" if digest else "")
+    )
+  return lines
+
+
+##
 # Helpers.
 ##
+
+
+def _dig(tree: Any, *keys: str) -> Any:
+  for key in keys:
+    if not isinstance(tree, Mapping) or key not in tree:
+      return None
+    tree = tree[key]
+  return tree
+
+
+def _number(value: Any) -> float | None:
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return None
+  return float(value) if math.isfinite(value) else None
+
+
+def _shown(value: Any) -> str:
+  return "not recorded" if value is None else f"{value:.3g}"
 
 
 def _read_agent_cfg(run_dir: Path) -> dict[str, Any]:

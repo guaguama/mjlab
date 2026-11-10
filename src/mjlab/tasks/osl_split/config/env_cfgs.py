@@ -13,7 +13,10 @@ observation, unchanged. The changes:
   in training (:func:`~..mdp.osl_observation_group`);
 * the imitation reward becomes :class:`~..mdp.split_mimic_reward` under the same name,
   ``mimic``, so the stage-1 diagnostics keep their keys: it returns the same team
-  reward, exposes the two agents' reward channels, and adds their diagnostics.
+  reward, exposes the two agents' reward channels, and adds their diagnostics;
+* the scene gains a contact sensor between the OSL and the biological left leg
+  (:func:`~.sensors.leg_contact_sensor_cfg`), which the split reward reports as
+  leg-crossing diagnostics (no penalty): a sensor changes no physics.
 
 The stage-1 perception switches (``OslDrCfg.encoder_bias`` and ``obs_noise``) edit
 the ``actor`` group, which is now the human's observation, so they are refused.
@@ -32,7 +35,7 @@ from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward
 from mjlab.tasks.osl_mimic.mdp import mimic_component
 from mjlab.tasks.osl_split import mdp
 
-from .sensors import with_osl_sensors
+from .sensors import leg_contact_sensor_cfg, with_osl_sensors
 
 REWARD_NAME = "mimic"
 """The imitation reward's term name, kept from stage 1."""
@@ -76,6 +79,7 @@ def osl_split_env_cfg(
   cfg.scene.entities["robot"] = replace(
     entity, spec_fn=with_osl_sensors(entity.spec_fn)
   )
+  cfg.scene.sensors = (*cfg.scene.sensors, leg_contact_sensor_cfg(cfg.decimation))
 
   del cfg.observations["critic"]
   cfg.observations["osl"] = mdp.osl_observation_group(mode, osl_obs)
@@ -91,4 +95,9 @@ def osl_split_env_cfg(
   for name in dict.fromkeys((*mdp.SPLIT_DIAGNOSTICS, *mdp.SPLIT_CLF_DIAGNOSTICS)):
     if clf or name not in mdp.SPLIT_CLF_DIAGNOSTICS:
       cfg.metrics[name] = MetricsTermCfg(func=mimic_component, params={"name": name})
+  # Per episode: the share of steps with a leg contact, and the hardest strike.
+  for name, reduce in zip(mdp.SPLIT_CONTACT_DIAGNOSTICS, ("mean", "max"), strict=True):
+    cfg.metrics[name] = MetricsTermCfg(
+      func=mimic_component, params={"name": name}, reduce=reduce
+    )
   return cfg

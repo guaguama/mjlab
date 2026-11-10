@@ -20,14 +20,18 @@ Two inference modes turn the mean into the action:
 
 * ``"mean"``: the raw mean. The robot model's policies run on it: their std is
   small (0.2 at init) next to the [-1, 1] action range, so the mean is what they
-  were trained around;
+  were trained around. So do MSK policies trained with the stage-1 recipe, whose
+  muscle std ends at 0.07;
 * ``"expected"``: ``E[clip(mu + sigma eps, lo, hi)]``, per output, with the learned
   sigma: still deterministic, but the action the policy trained against on
-  average. The MSK model needs it. Its muscle std stays around 1.4-2.5, every sampled
-  excitation is clamped to [0, 1], so noise gives each muscle 0.2-0.4 of drive on
-  average that the raw mean lacks, and raw-mean rollouts fall within seconds.
+  average. An MSK policy with a large muscle std needs it (musclemimic's settings
+  left 1.4-2.5): every sampled excitation is clamped to [0, 1], so noise gives each
+  muscle 0.2-0.4 of drive on average that the raw mean lacks, and raw-mean rollouts
+  fall within seconds.
 
-``default_inference`` picks ``expected`` exactly when the policy drives muscles.
+``default_inference`` picks ``expected`` when the policy drives muscles whose
+median std exceeds 0.3 (:data:`~.expected.EXPECTED_INFERENCE_MIN_STD`), ``mean``
+otherwise.
 """
 
 from __future__ import annotations
@@ -46,6 +50,8 @@ import torch
 
 from mjlab.actuator.actuator import TransmissionType
 from mjlab.tasks.osl_mimic.mdp.observations import TOUCH_SENSORS
+
+from .expected import auto_inference
 
 if TYPE_CHECKING:
   from mjlab.entity import EntityCfg
@@ -162,11 +168,15 @@ def unsupported_processing(
   return issues + (["history_length"] if group_history else [])
 
 
-def default_inference(parts: PolicyParts) -> Inference:
-  """``expected`` when the policy drives muscles, ``mean`` otherwise."""
+def default_inference(parts: PolicyParts, std: np.ndarray) -> Inference:
+  """``expected`` when the policy drives muscles whose median std (``std``: the
+  actor's, per output) exceeds 0.3, ``mean`` otherwise (see
+  :func:`~.expected.auto_inference`)."""
   muscles = set(muscle_actuators(parts.model))
-  driven = {a for a, _ in _actuators(parts.model, parts.actions)}
-  return "expected" if muscles & driven else "mean"
+  outputs = [
+    i for i, (a, _) in enumerate(_actuators(parts.model, parts.actions)) if a in muscles
+  ]
+  return auto_inference(np.asarray(std, dtype=np.float64).reshape(-1)[outputs])
 
 
 def action_std(actor: torch.nn.Module, action_dim: int) -> np.ndarray:
@@ -377,7 +387,7 @@ def policy_metadata(
   size = sum(term_sizes(parts).values())
   if size != obs_dim:
     raise ValueError(f"The actor reads {obs_dim} values; the schema gives {size}.")
-  inference = inference or default_inference(parts)
+  inference = inference or default_inference(parts, std)
   return {
     "schema_version": SCHEMA_VERSION,
     "mujoco_version": mujoco.__version__,

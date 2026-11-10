@@ -13,6 +13,8 @@ from .observations import osl_validation_group as osl_validation_group
 from .rewards import CHANNELS as CHANNELS
 from .rewards import GROUPS as GROUPS
 from .rewards import SPLIT_CLF_DIAGNOSTICS as SPLIT_CLF_DIAGNOSTICS
+from .rewards import SPLIT_CONTACT_DIAGNOSTICS as SPLIT_CONTACT_DIAGNOSTICS
 from .rewards import SPLIT_DIAGNOSTICS as SPLIT_DIAGNOSTICS
 from .rewards import SplitRewardCfg as SplitRewardCfg
+from .rewards import leg_contact_diagnostics as leg_contact_diagnostics
 from .rewards import split_mimic_reward as split_mimic_reward

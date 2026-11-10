@@ -93,7 +93,8 @@ WARMUP = 1
 RAMP = 2
 """``algorithm.human_actor_ramp_iterations``."""
 ANNEAL = 2
-"""``channels.anneal_iterations``, starting at the human unfreeze."""
+"""``channels.anneal_iterations``, starting at the human unfreeze (an
+``anneal_start_iteration`` of -1)."""
 SCHEDULE = 6
 """``algorithm.schedule_iterations``: longer than the first run, so a resumed run
 must keep it."""
@@ -129,6 +130,11 @@ EXPECTED_TAGS = (
   "Policy/osl/mean_std",
   "Policy/osl/std_knee",
   "Policy/osl/std_ankle",
+  "Policy/std/osl_motors",
+  "Policy/noise_gap/osl_motors",
+  "Policy/mean_outside/osl_motors",
+  "Critic/human/explained_variance",
+  "Critic/osl/explained_variance",
   "Stage2/iteration",
   "Stage2/human_frozen",
   "Stage2/osl_actor_frozen",
@@ -421,7 +427,9 @@ def _stage2_cfg(
   cfg["logger"] = "tensorboard"
   cfg["upload_model"] = False
   cfg["export_osl_onnx"] = False
-  cfg["validation"]["interval"] = 0  # No validation, so no zero-shot pass either.
+  # No validation or stress validation, so no zero-shot pass either.
+  cfg["validation"].update(interval=0, stress_interval=0)
+  cfg["blend"]["enabled"] = False  # Its default ramp outlasts this freeze.
   cfg["algorithm"].update(
     num_mini_batches=2,
     schedule_iterations=schedule_iterations,
@@ -429,7 +437,7 @@ def _stage2_cfg(
     osl_critic_obs=osl_critic_obs,
   )
   cfg["freeze"].update(human_actor_iterations=FREEZE, critic_warmup_iterations=WARMUP)
-  cfg["channels"]["anneal_iterations"] = ANNEAL
+  cfg["channels"].update(anneal_start_iteration=-1, anneal_iterations=ANNEAL)
   cfg["channels"]["additive_term_weights"] = {"twist": TWIST_SPLIT}
   cfg["warm_start"]["path"] = "" if warm_start is None else str(warm_start)
   return cfg
@@ -614,21 +622,26 @@ def test_stage2_end_to_end(tmp_path: Path, model: Model, osl_critic_obs: str) ->
   for snap in history:
     assert snap.lrs == schedule.lrs(snap.k)
   algorithm = cfg["algorithm"]
-  critic_lr, osl_lr = algorithm["critic_lr"], algorithm["osl_actor_lr"]
-  peak = algorithm["human_actor_peak_lr"]
+  osl_lr, peak = algorithm["osl_actor_lr"], algorithm["human_actor_peak_lr"]
+  floor = algorithm["lr_final_ratio"]
   for snap in history:
-    decay = 1.0 - snap.k / SCHEDULE
-    assert snap.lrs["human_critic"] == pytest.approx(critic_lr * decay)
-    assert snap.lrs["osl_critic"] == pytest.approx(critic_lr * decay)
+    # The critics ramp over the warm-up and decay to their floor at the end.
+    ramp = min((snap.k + 1) / WARMUP, 1.0)
+    decay = floor + (1.0 - floor) * (1.0 - snap.k / SCHEDULE)
+    for module in ("human_critic", "osl_critic"):
+      rate = algorithm[f"{module}_lr"] * ramp * decay
+      assert snap.lrs[module] == pytest.approx(rate), module
     expected = 0.0 if snap.k < WARMUP else osl_lr * decay
     assert snap.lrs["osl_actor"] == pytest.approx(expected)
+  # The human: frozen, then its ramp to the peak, which it holds.
   human_lrs = [snap.lrs["human_actor"] for snap in history]
-  ramped = peak * (1.0 - 1.0 / (SCHEDULE - FREEZE))
-  assert human_lrs == pytest.approx([0.0, 0.0, peak / RAMP, ramped])
+  assert human_lrs == pytest.approx([0.0, 0.0, peak / RAMP, peak])
 
-  # Checkpoints at stage-local k % save_interval == 0, and the last.
+  # Checkpoints at stage-local k % save_interval == 0 but the launch's first
+  # iteration, and the last.
   steps = [snap.it for snap in history]
-  saved = {snap.it for snap in history if snap.k % SAVE_INTERVAL == 0} | {steps[-1]}
+  saved = {s.it for s in history if s.k % SAVE_INTERVAL == 0 and s.k > 0}
+  saved.add(steps[-1])
   assert {int(p.stem.split("_")[1]) for p in log_dir.glob("model_*.pt")} == saved
   final = log_dir / f"model_{steps[-1]}.pt"
   checkpoint = torch.load(final, map_location="cpu", weights_only=False)

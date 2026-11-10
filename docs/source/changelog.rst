@@ -65,8 +65,9 @@ Added
   actor, compiled model, preprocessed reference, manifest) for osl_deploy, after
   checking the run's saved configs against this checkout; ``--hf-repo`` uploads it to
   Hugging Face. The manifest names each policy's default inference: the raw mean for
-  the robot model, the noise-averaged clipped-Gaussian action for the musculoskeletal
-  one, and records the actuator delays it trained with.
+  robot policies and for musculoskeletal ones whose median muscle std is at most
+  0.3, the noise-averaged clipped-Gaussian action above that, and records the
+  actuator delays it trained with.
 - Play controls for the gait-library tasks, after sesteban's G1 unicycle play:
   ``--twist vx,vy,wz`` pins every env to the clip nearest a twist, the native viewer
   drives the pin from the keyboard (arrow keys, Page Up/Down, Delete, Home) and viser
@@ -167,6 +168,33 @@ Changed
   environments.
 - ``DebugVisualizer.add_ghost_mesh`` accepts a model other than the scene's in the
   native and viser viewers: each ghost model gets its own ``MjData``.
+- The ``Mjlab-Split-Unicycle-OSL-Fullbody`` stage-2 tasks carry over stage 1's
+  tuning lessons for a low-std warm start. Learning rates: the human actor at 3e-5,
+  held after its ramp; separate critic rates (human 1e-4, OSL 3e-4) that ramp over
+  the critic warm-up; the critics' and OSL actor's rates decay to 10% and hold
+  (``lr-final-ratio``); the stage-1 recipe's Newton-Schulz precision (bfloat16 for
+  the musculoskeletal tasks); and a resumed run can take the command line's
+  curriculum to retune or extend it (``--agent.resume-curriculum config``), keeping
+  its Muon settings. The teacher blend is on (ramp 100), the OSL actor's std floor
+  is 0.05, and the OSL reward channel anneals over iterations 10-160. Stage-1
+  algorithm settings stage 2 does not use are refused instead of ignored, on the
+  command line before the env is built. Validation inherits the run's settings,
+  plays the raw mean (plus, at zero-shot, the unified stage-1 policy as a teacher,
+  at its raw mean and noise-averaged), reports left and right tight arcs and
+  pivots, and a stress validation plays the training distribution every 120
+  iterations, with the OSL actor's mean and its sampled action; every evaluation is
+  guarded and timed. The runner logs per-term policy statistics, critic explained
+  variance and GPU memory, skips the save at a launch's first iteration, and
+  compares the warm start's recorded end state (rate, std cap, env settings,
+  library release) with stage 2's, refusing another CLF penalty weight. A contact
+  sensor reports OSL strikes on the biological left leg (no penalty), and the OSL
+  export records CPU MuJoCo's solver caps, its default inference and the reset
+  conventions. A smaller, fresh OSL critic is available as a memory fallback
+  (``--agent.algorithm.osl-critic-init fresh``, with the longer critic warm-up).
+- The OSL deployment bundles and the checkpoint videos of the imitation,
+  gait-library and split runners default to the raw mean for musculoskeletal
+  policies whose median muscle std is at most 0.3 (the stage-1 recipe ends at
+  0.07), and keep the noise-averaged action above it.
 
 - Bumped ``rsl-rl-lib`` from 5.5.0 to 5.5.1. This removes the need for capping
   ``wandb`` below 0.29.

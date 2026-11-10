@@ -1,14 +1,17 @@
 """The noise-averaged action of a clipped Gaussian policy, for validation.
 
-Stage 1 validates with the policy's mean action. The MSK human never trains with
-that action: its muscle std is about 2.45, and every sampled command is clipped, to
-[-1, 1] by the action term and to [0, 1] by MuJoCo's muscle activation dynamics. A
-muscle commanded a mean of -1 receives about 0.27 on average in training and 0 from
-the mean action; one commanded 0 receives about 0.42 and 0. The raw mean drives
-every muscle far more weakly than training did, and ends every MSK validation
-episode early. ``ValidationExpected/`` plays ``E[clip(mu + sigma eps, lo, hi)]``
-instead: still deterministic, and the action the policy is trained to expect on
-average.
+Every sampled command of these policies is clipped: to [-1, 1] by the action term,
+and a muscle's excitation again to [0, 1] by MuJoCo's activation dynamics. With a
+large std the clipping makes the noise itself drive the plant: at musclemimic's
+muscle std of about 2.45, a muscle commanded a mean of 0 receives about 0.42 on
+average, and 0 from the raw mean, so a policy trained there leans on its noise and
+its raw mean falls. ``E[clip(mu + sigma eps, lo, hi)]`` is the action such a policy
+is trained to expect on average, and still deterministic. The stage-1 recipe ends
+at a muscle std of 0.07, where it is nearly the raw mean: stage 2 plays it once, at
+zero-shot, on the unified stage-1 policy (``ValidationTeacherExpected/``, every row
+averaged, as stage 1 does), whose gap to the raw-mean teacher is the warm start's
+own noise reliance, and validates the raw mean (``Validation/``), the deployment
+metric.
 
 The closed form lives in :mod:`mjlab.tasks.osl_mimic.rl.expected` (stage 1
 validates with it too); this module adds the per-agent bounds.

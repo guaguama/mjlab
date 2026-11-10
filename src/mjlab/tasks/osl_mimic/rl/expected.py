@@ -9,13 +9,18 @@ more weakly than training did. ``E[clip(mu + sigma eps, lo, hi)]`` is the action
 the policy is trained to expect on average, and still deterministic.
 
 ``expected_clipped_gaussian`` is the closed form; ``action_bounds`` the range each
-output of a stage-1 policy is effectively clipped to, in action-manager order.
+output of a stage-1 policy is effectively clipped to, in action-manager order;
+``auto_inference`` the default deterministic action for a policy's muscle std: the
+noise-averaged action only while that std is large enough for the noise to drive
+the muscles.
 """
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+import statistics
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -30,6 +35,11 @@ _MIN_SIGMA = 1e-12
 _PSI_FLOOR = -40.0
 """``psi(z)`` underflows to 0 well before this in float64; clamping there avoids
 ``-inf * 0`` for an infinite bound."""
+EXPECTED_INFERENCE_MIN_STD = 0.3
+"""The median muscle std above which a muscle policy defaults to the noise-averaged
+action. musclemimic's settings left muscle stds of 1.4-2.5, whose raw mean fell
+within seconds; the stage-1 recipe ends at 0.07, where the raw mean is the gait and
+the noise-averaged action is nearly the same."""
 
 
 def _psi(z: torch.Tensor) -> torch.Tensor:
@@ -98,3 +108,21 @@ def action_term_slices(action_manager: ActionManager) -> dict[str, slice]:
     slices[name] = slice(start, start + dim)
     start += dim
   return slices
+
+
+def auto_inference(
+  muscle_std: torch.Tensor | Iterable[float],
+) -> Literal["mean", "expected"]:
+  """The default deterministic action of a policy whose muscle outputs sample with
+  ``muscle_std``: ``"expected"`` when their median exceeds
+  :data:`EXPECTED_INFERENCE_MIN_STD`, ``"mean"`` otherwise and for a policy without
+  muscles (an empty ``muscle_std``)."""
+  if isinstance(muscle_std, torch.Tensor):
+    values = [float(x) for x in muscle_std.detach().reshape(-1).tolist()]
+  else:
+    values = [float(x) for x in muscle_std]
+  if not values:
+    return "mean"
+  return (
+    "expected" if statistics.median(values) > EXPECTED_INFERENCE_MIN_STD else "mean"
+  )

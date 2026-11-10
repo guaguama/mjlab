@@ -31,8 +31,8 @@ Beyond musclemimic's:
   episode;
 * the algorithm's ``policy_stats`` (std per action term, the std cap, the noise gap)
   are logged under ``Policy/`` every iteration;
-* videos play ``video.inference`` (the noise-averaged action for muscle policies by
-  default).
+* videos play ``video.inference`` (by default the noise-averaged action for muscle
+  policies whose median muscle std exceeds 0.3, the raw mean otherwise).
 """
 
 from __future__ import annotations
@@ -58,7 +58,12 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.osl_mimic.mdp import MimicMotionCommandCfg, mimic_reward
 
-from .expected import action_bounds, expected_clipped_gaussian
+from .expected import (
+  action_bounds,
+  action_term_slices,
+  auto_inference,
+  expected_clipped_gaussian,
+)
 from .models import MuscleMimicMLPModel, gaussian_std
 from .ppo import MuscleMimicPPO
 
@@ -576,10 +581,22 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     return self._build_eval_env(cfg, render=True)
 
   def _video_inference(self, env: ManagerBasedRlEnv) -> str:
+    """``video.inference``; ``"auto"`` follows the actor's muscle std
+    (:func:`~.expected.auto_inference`)."""
     mode = str(self.video_cfg.get("inference", "auto"))
-    if mode == "auto":
-      return "expected" if drives_muscles(env) else "mean"
-    return mode
+    if mode != "auto":
+      return mode
+    if not drives_muscles(env):
+      return "mean"
+    manager = env.action_manager
+    columns = [
+      column
+      for name, cols in action_term_slices(manager).items()
+      if isinstance(manager.get_term(name), TendonEffortAction)
+      for column in range(cols.start, cols.stop)
+    ]
+    std = gaussian_std(cast(MuscleMimicMLPModel, self.alg.get_policy())).detach()
+    return auto_inference(std[columns])
 
   @contextmanager
   def _video_policy(

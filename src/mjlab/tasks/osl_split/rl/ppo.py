@@ -8,14 +8,15 @@ the four networks with four optimizers:
 * **human actor**: the unified actor minus its OSL output rows, warm-started
   exactly (:meth:`TwoAgentPPO.apply_warm_start`), reading the stage-1 ``actor``
   observation group. It keeps sampling at its stage-1 std, held fixed unless
-  ``human_learn_std``: the MSK mean commands rely on that noise (clipped noise is
-  co-contraction), so lowering it would change what the means do.
+  ``human_learn_std`` (the user's decision): stage-1 recipe runs end at a std of
+  0.07, where the raw mean is the gait, and a std the human did not train with
+  would change what its mean commands do.
 * **OSL actor**: a fresh small network on the ``osl`` group (the prosthesis's own
   sensors with history), with a learnable std above a floor that it can always
-  rise from again (:func:`_keep_std_inside_range`).
-* **critics**: both copies of the stage-1 critic on the ``actor`` group (the OSL
-  critic optionally also reads ``osl``), each predicting its own agent's
-  normalized return.
+  rise from again (:func:`_keep_std_inside_range`), and no cap.
+* **critics**: copies of the stage-1 critic on the ``actor`` group (the OSL critic
+  optionally also reads ``osl``, or starts fresh: ``osl_critic_init``), each
+  predicting its own agent's normalized return, each at its own rate.
 
 Within an update both agents use the same minibatch indices. A frozen module takes
 no part: no forward pass in the loss, no optimizer step, no gradient, so its
@@ -24,7 +25,9 @@ The loss is the sum over the modules that train (they share no parameters), with
 one ``backward()``, then one :class:`~mjlab.tasks.osl_mimic.rl.muon.MuonAdam` step
 per module. Each optimizer clips its own module's global norm and skips its own
 step on a non-finite gradient, so a NaN in the OSL's loss leaves the critics and
-the human learning.
+the human learning. All four run Newton-Schulz in ``muon_ns_dtype`` (bfloat16, as
+stage 1's recipe), and a resumed run re-applies this run's Muon settings to the
+optimizer states it loads.
 
 Everything else is stage 1's: reward normalization by the running return std (per
 agent here), time-outs bootstrapped after it, GAE, the clipped value loss, and the
@@ -34,7 +37,12 @@ human's statistics stay ``"frozen"`` while it is frozen, and the OSL actor's kee
 updating while its weights are frozen in the critic-only warm-up, so it starts
 learning on settled statistics.
 
-**The blend** (optional, off by default): while ``beta < 1`` the env receives
+Every update also records :attr:`TwoAgentPPO.policy_stats` (per action term of
+both actors, with stage 1's names: the std, the noise gap and the share of means
+outside the effective range) and :attr:`TwoAgentPPO.critic_stats` (each critic's
+explained variance on the rollout), which the runner logs.
+
+**The blend** (on by default): while ``beta < 1`` the env receives
 ``(1 - beta) * teacher + beta * osl_actor`` for the OSL rows, where the teacher is
 the unified policy's OSL head on the frozen human trunk's features (exactly the
 unified policy's OSL mean). PPO still learns from the OSL actor's own sample.
@@ -54,12 +62,13 @@ from tensordict import TensorDict
 from torch import nn
 
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel, RunningMeanStd
-from mjlab.tasks.osl_mimic.rl.muon import MuonAdam
+from mjlab.tasks.osl_mimic.rl.muon import NS_DTYPES, MuonAdam
 
-from .expected import action_bounds
-from .layout import ActionLayout
+from .expected import action_bounds, expected_clipped_gaussian
+from .layout import AGENTS, ActionLayout
 from .policy import (
   HumanMode,
+  OslMode,
   SplitInferencePolicy,
   distribution_std,
   gaussian_distribution,
@@ -80,45 +89,69 @@ OBS_SETS: dict[Module, str] = {
   "osl_critic": "osl_critic",
 }
 """Each module's rsl_rl observation set, which is also its model-config key."""
+NETWORK_FLAGS: dict[str, str] = {
+  name: key.replace("_", "-") for name, key in OBS_SETS.items()
+}
+"""Each module's model config on the command line (``--agent.<flag>.*``)."""
 OSL_OBS_GROUP = "osl"
 """The OSL actor's observation group, appended to the OSL critic's input under
 ``osl_critic_obs="full+osl"``."""
 SCHEDULE_KEYS = frozenset(
   {
-    "critic_lr",
+    "human_critic_lr",
+    "osl_critic_lr",
     "osl_actor_lr",
     "human_actor_peak_lr",
     "human_actor_ramp_iterations",
+    "human_actor_lr_final_ratio",
+    "lr_final_ratio",
     "schedule_iterations",
   }
 )
 """Algorithm settings for :class:`~.schedules.SplitSchedule` (and the runner)."""
-IGNORED_KEYS = frozenset(
-  {
-    "class_name",
-    "learning_rate",
-    "schedule",
-    "desired_kl",
-    "optimizer",
-    "share_cnn_encoders",
-    "lr_schedule",
-    "lr_schedule_updates",
-    "actor_bias_init",
-    # Stage-1 tuning knobs (MuscleMimicPPO): the split has its own rates and keeps
-    # the human's std fixed, and runs Newton-Schulz in float32.
-    "lr_schedule_offset",
-    "lr_final_ratio",
-    "std_cap_start",
-    "std_cap_end",
-    "std_cap_begin_update",
-    "std_cap_end_update",
-    "std_floor",
-    "init_std_terms",
-    "muon_ns_dtype",
-  }
-)
-"""Inherited from stage 1's config and unused (see ``SplitPpoCfg``): the schedules
-replace the single rate, and the human's output bias comes from the warm start."""
+STAGE1_ONLY_KNOBS: dict[str, tuple[Any, str]] = {
+  "learning_rate": (
+    0.0,
+    "the per-module rates (human_critic_lr, osl_critic_lr, osl_actor_lr, "
+    "human_actor_peak_lr)",
+  ),
+  "lr_schedule": (
+    "linear",
+    "the stage-local schedule (schedule_iterations, lr_final_ratio, "
+    "human_actor_lr_final_ratio)",
+  ),
+  "lr_schedule_updates": (0, "algorithm.schedule_iterations"),
+  "lr_schedule_offset": (
+    0,
+    "--agent.resume-curriculum config, which takes the command line's schedule",
+  ),
+  "std_cap_start": (0.0, "the OSL actor's std range (osl_actor.distribution_cfg)"),
+  "std_cap_end": (0.0, "the OSL actor's std range (osl_actor.distribution_cfg)"),
+  "std_cap_begin_update": (
+    0,
+    "the OSL actor's std range (osl_actor.distribution_cfg)",
+  ),
+  "std_cap_end_update": (0, "the OSL actor's std range (osl_actor.distribution_cfg)"),
+  "std_floor": (
+    0.0,
+    "the OSL actor's std range (osl_actor.distribution_cfg.std_range); the human's "
+    "std stays the warm start's",
+  ),
+  "init_std_terms": (
+    {},
+    "osl_actor.distribution_cfg.init_std; the human's std is the warm start's",
+  ),
+  "actor_bias_init": ("none", "the warm start, which sets the human's output bias"),
+  "schedule": ("fixed", "the stage-local schedule (stage 2 has no KL-adaptive rate)"),
+  "desired_kl": (0.01, "the stage-local schedule (stage 2 has no KL-adaptive rate)"),
+  "optimizer": ("adam", "one MuonAdam per module (the muon_* settings)"),
+  "share_cnn_encoders": (False, "nothing: stage 2's networks are MLPs"),
+}
+"""Stage-1 algorithm settings that mean nothing in stage 2, with their neutral value
+(``SplitPpoCfg``'s) and what replaces them. :meth:`TwoAgentPPO.construct_algorithm`
+refuses any other value, so an override cannot silently do nothing."""
+IGNORED_KEYS = frozenset({"class_name", *STAGE1_ONLY_KNOBS})
+"""Algorithm settings ``TwoAgentPPO`` does not take."""
 RETURN_COUNT_FRESH = 1e-4
 """A fresh return normalizer's count, as in stage 1 (``NormalizeVecReward``)."""
 STD_MARGIN = 1e-6
@@ -211,14 +244,22 @@ class TwoAgentPPO:
     muon_beta: float = 0.95,
     muon_nesterov: bool = True,
     muon_ns_steps: int = 5,
+    muon_ns_dtype: str = "bfloat16",
     reward_normalization: bool = True,
     bootstrap_time_outs: bool = True,
     human_learn_std: bool = False,
     return_count_iterations: float = 3.0,
     osl_critic_obs: Literal["full", "full+osl"] = "full",
+    osl_critic_init: Literal["stage1", "fresh"] = "stage1",
   ) -> None:
     if osl_critic_obs not in ("full", "full+osl"):
       raise ValueError(f"Unknown osl_critic_obs {osl_critic_obs!r}.")
+    if osl_critic_init not in ("stage1", "fresh"):
+      raise ValueError(f"Unknown osl_critic_init {osl_critic_init!r}.")
+    if muon_ns_dtype not in NS_DTYPES:
+      raise ValueError(
+        f"Unknown muon_ns_dtype {muon_ns_dtype!r}; valid: {sorted(NS_DTYPES)}"
+      )
     self.device = device
     self.layout = layout
     self.storage = storage
@@ -266,6 +307,7 @@ class TwoAgentPPO:
     self.human_learn_std = human_learn_std
     self.return_count_iterations = return_count_iterations
     self.osl_critic_obs = osl_critic_obs
+    self.osl_critic_init = osl_critic_init
 
     # Every module's parameters (the human's std included, whatever
     # human_learn_std says), so checkpoints keep one structure; a parameter
@@ -278,9 +320,34 @@ class TwoAgentPPO:
         beta=muon_beta,
         nesterov=muon_nesterov,
         ns_steps=muon_ns_steps,
+        ns_dtype=muon_ns_dtype,
       )
       for name, model in self.models.items()
     }
+    # Loading an optimizer state restores its groups' settings too; a resumed run
+    # keeps this run's (_load_training_state), as stage 1's does.
+    self._muon_settings = {
+      "beta": muon_beta,
+      "nesterov": muon_nesterov,
+      "ns_steps": muon_ns_steps,
+    }
+    self._ns_dtype = NS_DTYPES[muon_ns_dtype]
+
+    # Each actor's action terms in its own columns, for the policy statistics, and
+    # the range each column is effectively clipped to (set by construct_algorithm,
+    # which sees the env's action terms).
+    self._stat_terms: dict[str, list[tuple[str, slice]]] = {
+      agent: layout.agent_terms(agent) for agent in AGENTS
+    }
+    self._bounds: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    self.policy_stats: dict[str, float] = {}
+    """Per action term of both actors, from the last update's first minibatch, under
+    stage 1's names: ``std/<term>``, ``noise_gap/<term>`` (``|E[clip(mu + sigma
+    eps)] - clip(mu)|``) and ``mean_outside/<term>`` (the share of means outside
+    the effective range); the OSL actor's term is ``osl_motors``."""
+    self.critic_stats: dict[str, float] = {}
+    """``<agent>/explained_variance`` of the last rollout: ``1 - Var(R - V) /
+    Var(R)`` over the normalized returns and the critic's values."""
 
     self._human_index = layout.index("human", device)
     self._osl_index = layout.index("osl", device)
@@ -320,6 +387,7 @@ class TwoAgentPPO:
     if num_actions is not None and int(num_actions) != layout.total_dim:
       raise ValueError(f"The env has {num_actions} actions; the layout {layout.terms}.")
 
+    check_stage1_knobs(cfg["algorithm"])
     algorithm = {
       k: v
       for k, v in cfg["algorithm"].items()
@@ -373,7 +441,7 @@ class TwoAgentPPO:
       {"human": layout.dim("human"), "osl": layout.dim("osl")},
       device,
     )
-    return TwoAgentPPO(
+    alg = TwoAgentPPO(
       models["human_actor"],
       models["human_critic"],
       models["osl_actor"],
@@ -383,6 +451,11 @@ class TwoAgentPPO:
       device=device,
       **algorithm,
     )
+    manager = env.unwrapped.action_manager
+    alg._bounds = {
+      agent: action_bounds(manager, layout, agent, device) for agent in AGENTS
+    }
+    return alg
 
   ##
   # Schedule.
@@ -477,29 +550,32 @@ class TwoAgentPPO:
     exactly. Without a reward switch both critics load the stage-1 critic and
     both agents' return statistics take its mean and variance, with the count
     reset to ``return_count_iterations`` iterations' samples so they can follow
-    the stage-2 channels (stage 1's ~1e9 would freeze them). An OSL critic that
+    the stage-2 channels (stage 1's ~2e9 would freeze them). An OSL critic that
     also reads the OSL observation gets zero weights on those inputs, so it
     starts as the stage-1 critic, and its observation count is reset to one
-    iteration so the new inputs get statistics. With a reward switch the critics
-    keep their fresh weights but take the stage-1 critic's observation mean and
-    variance (count reset), and the return statistics start fresh. The OSL actor
-    is never warm-started.
+    iteration so the new inputs get statistics. A fresh critic (every critic
+    under a reward switch, the OSL critic under ``osl_critic_init="fresh"``)
+    keeps its own weights but takes the stage-1 critic's observation mean and
+    variance (count reset); under a reward switch the return statistics start
+    fresh too. The OSL actor is never warm-started.
     """
     one_iteration = float(num_envs * num_steps)
     _load_into(self.human_actor, ws.human_actor, "human actor")
     _load_into(self.teacher_head, ws.teacher_head, "teacher head")
     if reward_switch:
       for critic in (self.human_critic, self.osl_critic):
-        state = _normalizer_state(ws.human_critic, critic.obs_dim, one_iteration)
-        _normalizer(critic).load_state_dict(state)
+        _fresh_critic(critic, ws.human_critic, one_iteration)
       self._set_return_stats(0.0, 1.0, RETURN_COUNT_FRESH)
     else:
       _load_into(self.human_critic, ws.human_critic, "human critic")
-      _load_into(
-        self.osl_critic,
-        _widened_critic_state(ws.human_critic, self.osl_critic, one_iteration),
-        "OSL critic",
-      )
+      if self.osl_critic_init == "fresh":
+        _fresh_critic(self.osl_critic, ws.human_critic, one_iteration)
+      else:
+        _load_into(
+          self.osl_critic,
+          _widened_critic_state(ws.human_critic, self.osl_critic, one_iteration),
+          "OSL critic",
+        )
       stats = ws.return_stats
       self._set_return_stats(
         float(stats["mean"]),
@@ -665,7 +741,9 @@ class TwoAgentPPO:
     Returns the minibatch means of ``"<agent>/value"`` (always) and of
     ``"<agent>/surrogate"``, ``"<agent>/entropy"`` and ``"<agent>/clip_fraction"``
     for each actor that trained, with agent ``human`` or ``osl``. Every OSL-actor
-    step is followed by :func:`_keep_std_inside_range`.
+    step is followed by :func:`_keep_std_inside_range`. Records
+    :attr:`critic_stats` from the rollout and :attr:`policy_stats` from the first
+    minibatch, before its step.
     """
     if self.schedule is None:
       raise RuntimeError("TwoAgentPPO.update() needs a schedule: set_schedule().")
@@ -681,6 +759,7 @@ class TwoAgentPPO:
     for name, model in self.models.items():
       model.set_norm_mode("transient" if name in training else "frozen")
     self._close_teacher_rms()
+    self._record_critic_stats()
     for optimizer in self.optimizers.values():
       optimizer.zero_grad(set_to_none=True)
 
@@ -710,6 +789,8 @@ class TwoAgentPPO:
       self.num_mini_batches, self.num_learning_epochs
     )
     for batch in generator:
+      if count == 0:
+        self._record_policy_stats(batch.observations)
       advantages = batch.advantages
       if self.normalize_advantage_per_mini_batch:
         advantages = (advantages - advantages.mean(0)) / (advantages.std(0) + 1e-8)
@@ -760,6 +841,42 @@ class TwoAgentPPO:
       return torch.max((values - returns).square(), (clipped - returns).square()).mean()
     return (values - returns).square().mean()
 
+  @torch.no_grad()
+  def _record_policy_stats(self, observations: TensorDict) -> None:
+    """:attr:`policy_stats` from one minibatch: each actor's mean, in the
+    normalizer mode the update set (``"transient"`` or ``"frozen"``)."""
+    stats: dict[str, float] = {}
+    for agent, actor in (("human", self.human_actor), ("osl", self.osl_actor)):
+      mean = actor(observations)  # The distribution mean.
+      std = distribution_std(actor).detach()
+      bounds = self._bounds.get(agent)
+      gap = outside = None
+      if bounds is not None:
+        lo, hi = bounds
+        expected = expected_clipped_gaussian(mean, std, lo, hi)
+        gap = (expected - torch.minimum(torch.maximum(mean, lo), hi)).abs()
+        outside = ((mean < lo) | (mean > hi)).float()
+      for term, cols in self._stat_terms[agent]:
+        stats[f"std/{term}"] = float(std[cols].mean())
+        if gap is not None and outside is not None:
+          stats[f"noise_gap/{term}"] = float(gap[:, cols].mean())
+          stats[f"mean_outside/{term}"] = float(outside[:, cols].mean())
+    self.policy_stats = stats
+
+  @torch.no_grad()
+  def _record_critic_stats(self) -> None:
+    """:attr:`critic_stats` from the rollout's returns and values (both in
+    normalized return units); a rollout of constant returns has none."""
+    returns = self.storage.returns.flatten(0, 1)
+    values = self.storage.values.flatten(0, 1)
+    stats: dict[str, float] = {}
+    for i, agent in enumerate(AGENTS):
+      var = float(returns[:, i].var())
+      if math.isfinite(var) and var > 1e-12:
+        residual = float((returns[:, i] - values[:, i]).var())
+        stats[f"{agent}/explained_variance"] = 1.0 - residual / var
+    self.critic_stats = stats
+
   def _close_teacher_rms(self) -> None:
     if self._teacher_sq is not None and self._teacher_n > 0:
       self.last_teacher_rms = math.sqrt(float(self._teacher_sq) / self._teacher_n)
@@ -777,23 +894,38 @@ class TwoAgentPPO:
     return self.inference_policy("mean")
 
   def inference_policy(
-    self, human_mode: HumanMode, action_manager: ActionManager | None = None
+    self,
+    human_mode: HumanMode,
+    action_manager: ActionManager | None = None,
+    osl_mode: OslMode = "mean",
   ) -> SplitInferencePolicy:
-    """The deterministic policy, with the human's ``"mean"`` or ``"expected"``
-    (noise-averaged, see :mod:`.expected`) action. ``"expected"`` reads the
-    muscle rows' [0, 1] range from ``action_manager``; a given ``action_manager``
-    must have this algorithm's layout."""
-    bounds = None
+    """The evaluation policy: the human's ``"mean"`` or ``"expected"``
+    (noise-averaged, see :mod:`.expected`) action, and the OSL actor's mean, a
+    sample of it (``"sampled"``) or the teacher head on the human trunk
+    (``"teacher"``: the unified stage-1 policy while the trunk is stage 1's;
+    noise-averaged too under ``"expected"``, as stage 1 averages every row).
+    ``"expected"`` reads the rows' effective ranges from ``action_manager``; a
+    given ``action_manager`` must have this algorithm's layout."""
+    bounds = osl_bounds = None
     if action_manager is not None:
       layout = ActionLayout.from_action_manager(action_manager)
       if layout != self.layout:
         raise ValueError(f"Action layout {layout.terms} != {self.layout.terms}.")
       if human_mode == "expected":
         bounds = action_bounds(action_manager, self.layout, "human", self.device)
+        if osl_mode == "teacher":
+          osl_bounds = action_bounds(action_manager, self.layout, "osl", self.device)
     elif human_mode == "expected":
       raise ValueError("human_mode='expected' needs the env's action_manager.")
     return SplitInferencePolicy(
-      self.human_actor, self.osl_actor, self.layout, human_mode, bounds
+      self.human_actor,
+      self.osl_actor,
+      self.layout,
+      human_mode,
+      bounds,
+      osl_mode=osl_mode,
+      teacher_head=self.teacher_head if osl_mode == "teacher" else None,
+      osl_bounds=osl_bounds,
     )
 
   ##
@@ -833,7 +965,8 @@ class TwoAgentPPO:
 
     Raises:
       ValueError: For anything that is not a stage-2 checkpoint (a stage-1 one is
-        pointed to the warm start).
+        pointed to the warm start), and for a network built otherwise than the
+        checkpoint's (a resume that does not repeat its run's network flags).
     """
     if not isinstance(strict, bool):
       # rsl_rl's runners call alg.load(loaded, load_cfg, strict): load_cfg would
@@ -856,7 +989,19 @@ class TwoAgentPPO:
       )
       raise ValueError(f"Not a stage-2 checkpoint (missing {missing}).{hint}")
     for name in names:
-      self.models[name].load_state_dict(loaded[f"{name}_state_dict"], strict=strict)
+      try:
+        self.models[name].load_state_dict(loaded[f"{name}_state_dict"], strict=strict)
+      except RuntimeError as err:
+        raise ValueError(
+          f"The checkpoint's {name} does not fit this run's: build it as the "
+          f"checkpoint's run did (repeat its --agent.{NETWORK_FLAGS[name]}.hidden-dims"
+          + (
+            ", --agent.algorithm.osl-critic-init and --agent.algorithm.osl-critic-obs"
+            if name == "osl_critic"
+            else ""
+          )
+          + f").\n{err}"
+        ) from err
     self.teacher_head.load_state_dict(loaded["teacher_head_state_dict"], strict=strict)
     if not actors_only:
       self._load_training_state(loaded, strict)
@@ -864,15 +1009,21 @@ class TwoAgentPPO:
       self.set_stage_iteration(self.stage_iteration)
 
   def _load_training_state(self, loaded: dict, strict: bool) -> None:
-    """The part of :meth:`load` only a resumed run needs: the optimizers, the
-    return statistics and the stage iteration."""
+    """The part of :meth:`load` only a resumed run needs: the optimizers (with this
+    run's Muon settings: momentum, Nesterov, Newton-Schulz steps and precision),
+    the return statistics and the stage iteration."""
     optimizer_states = loaded["optimizer_state_dicts"]
     if strict and set(optimizer_states) != set(MODULES):
       raise ValueError(
         f"Optimizer states for {sorted(optimizer_states)}, not {MODULES}."
       )
     for name, state in optimizer_states.items():
-      self.optimizers[name].load_state_dict(state)
+      optimizer = self.optimizers[name]
+      optimizer.load_state_dict(state)
+      # The state brings its run's group settings; this run's Muon settings win.
+      for group in optimizer.param_groups:
+        group.update(self._muon_settings)
+      optimizer.ns_dtype = self._ns_dtype
     stats = loaded["reward_normalization"]
     self._return_mean = stats["mean"].to(self.device, torch.float32).clone()
     self._return_var = stats["var"].to(self.device, torch.float32).clone()
@@ -887,6 +1038,30 @@ class TwoAgentPPO:
 ##
 # Helpers.
 ##
+
+
+def check_stage1_knobs(algorithm: Mapping[str, Any]) -> None:
+  """Refuse a stage-1 setting set to anything but its neutral value
+  (:data:`STAGE1_ONLY_KNOBS`): stage 2 would ignore it."""
+  lines = [
+    f"  {key} = {algorithm[key]!r} (neutral {neutral!r}): use {replacement}"
+    for key, (neutral, replacement) in STAGE1_ONLY_KNOBS.items()
+    if key in algorithm and algorithm[key] != neutral
+  ]
+  if lines:
+    raise ValueError(
+      "Stage-1 algorithm settings that stage 2 does not use; leave them at their "
+      "neutral values:\n" + "\n".join(lines)
+    )
+
+
+def _fresh_critic(
+  critic: MuscleMimicMLPModel, source: Mapping[str, torch.Tensor], count: float
+) -> None:
+  """Leave ``critic``'s weights as built; give it the stage-1 critic's observation
+  statistics (:func:`_normalizer_state`)."""
+  state = _normalizer_state(source, critic.obs_dim, count)
+  _normalizer(critic).load_state_dict(state)
 
 
 def _build_model(

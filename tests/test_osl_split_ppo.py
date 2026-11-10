@@ -14,7 +14,7 @@ from __future__ import annotations
 import copy
 import io
 import math
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -27,7 +27,11 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model
 from mjlab.envs.mdp.actions import TendonEffortAction
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel, RunningMeanStd
 from mjlab.tasks.osl_mimic.rl.ppo import MuscleMimicPPO
-from mjlab.tasks.osl_split.config.rl_cfg import OSL_MIN_STD, osl_split_runner_cfg
+from mjlab.tasks.osl_split.config.rl_cfg import (
+  OSL_MIN_STD,
+  SplitPpoCfg,
+  osl_split_runner_cfg,
+)
 from mjlab.tasks.osl_split.rl.expected import action_bounds, expected_clipped_gaussian
 from mjlab.tasks.osl_split.rl.layout import ActionLayout
 from mjlab.tasks.osl_split.rl.policy import (
@@ -35,7 +39,7 @@ from mjlab.tasks.osl_split.rl.policy import (
   gaussian_distribution,
   std_parameter,
 )
-from mjlab.tasks.osl_split.rl.ppo import TwoAgentPPO
+from mjlab.tasks.osl_split.rl.ppo import STAGE1_ONLY_KNOBS, TwoAgentPPO
 from mjlab.tasks.osl_split.rl.schedules import MODULES, ChannelSchedule, SplitSchedule
 from mjlab.tasks.osl_split.rl.storage import TwoAgentRolloutStorage, obs_group
 
@@ -133,10 +137,14 @@ def _schedule(
     total_iterations=100,
     human_freeze=human_freeze,
     critic_warmup=critic_warmup,
-    critic_lr=4e-4,
+    human_critic_lr=1e-4,
+    osl_critic_lr=3e-4,
+    critic_ramp=critic_warmup,
     osl_actor_lr=4e-4,
-    human_peak_lr=1e-4,
+    human_peak_lr=3e-5,
     human_ramp=5,
+    lr_final_ratio=0.1,
+    human_lr_final_ratio=1.0,
     blend=blend,
     blend_ramp=blend_ramp,
   )
@@ -276,52 +284,109 @@ def test_split_schedule_freeze_and_rates() -> None:
     total_iterations=1000,
     human_freeze=200,
     critic_warmup=10,
-    critic_lr=4e-4,
+    human_critic_lr=1e-4,
+    osl_critic_lr=3e-4,
+    critic_ramp=10,
     osl_actor_lr=4e-4,
-    human_peak_lr=1e-4,
+    human_peak_lr=3e-5,
     human_ramp=50,
+    lr_final_ratio=0.1,
+    human_lr_final_ratio=1.0,
     blend=False,
     blend_ramp=100,
   )
   assert s.osl_actor_frozen(9) and not s.osl_actor_frozen(10)
   assert s.human_actor_frozen(199) and not s.human_actor_frozen(200)
-  # Critics: linear from k = 0 to 0 at the stage end.
-  assert s.lr("human_critic", 0) == pytest.approx(4e-4)
-  assert s.lr("osl_critic", 500) == pytest.approx(2e-4)
-  assert s.lr("human_critic", 1000) == 0.0 and s.lr("osl_critic", 1500) == 0.0
+  # Critics: a ramp over the warm-up, then the decay to 10% at the stage end, held.
+  assert s.lr("human_critic", 0) == pytest.approx(1e-4 * 0.1 * (1.0 - 0.9 * 0.0))
+  assert s.lr("osl_critic", 4) == pytest.approx(3e-4 * 0.5 * (1.0 - 0.9 * 0.004))
+  assert s.lr("osl_critic", 9) == pytest.approx(3e-4 * (1.0 - 0.9 * 0.009))
+  assert s.lr("osl_critic", 500) == pytest.approx(3e-4 * 0.55)
+  assert s.lr("human_critic", 500) == pytest.approx(1e-4 * 0.55)  # Above its floor.
+  assert s.lr("human_critic", 900) == pytest.approx(3e-5)  # 1e-4 * 0.19, floored.
+  for k in (1000, 1500, 10_000):  # The floor, beyond the schedule too.
+    # The human critic's floor is the human actor's peak (3e-5), not 10% (1e-5).
+    assert s.lr("human_critic", k) == pytest.approx(3e-5)
+    assert s.lr("osl_critic", k) == pytest.approx(3e-5)
+    assert s.lr("osl_actor", k) == pytest.approx(4e-5)
   # The OSL actor: 0 in the warm-up, then the critics' decay, not a restart.
   assert s.lr("osl_actor", 9) == 0.0
-  assert s.lr("osl_actor", 10) == pytest.approx(4e-4 * 0.99)
-  assert s.lr("osl_actor", 500) == pytest.approx(2e-4)
-  # The human: 0 while frozen, a ramp from the unfreeze, its own decay to the end.
+  assert s.lr("osl_actor", 10) == pytest.approx(4e-4 * (1.0 - 0.9 * 0.01))
+  assert s.lr("osl_actor", 500) == pytest.approx(4e-4 * 0.55)
+  # The human: 0 while frozen, a ramp from the unfreeze, then its peak held.
   assert s.lr("human_actor", 199) == 0.0
-  assert s.lr("human_actor", 200) == pytest.approx(1e-4 / 50)
-  assert s.lr("human_actor", 249) == pytest.approx(1e-4 * (1.0 - 49 / 800))
-  assert s.lr("human_actor", 600) == pytest.approx(0.5e-4)
-  assert s.lr("human_actor", 1000) == 0.0
-  assert max(s.lr("human_actor", k) for k in range(1001)) <= 1e-4
+  assert s.lr("human_actor", 200) == pytest.approx(3e-5 / 50)
+  assert s.lr("human_actor", 249) == pytest.approx(3e-5)
+  assert s.lr("human_actor", 600) == s.lr("human_actor", 5000) == pytest.approx(3e-5)
+  assert max(s.lr("human_actor", k) for k in range(1001)) <= 3e-5
+  # Below 1 the human decays from the unfreeze to its own floor at the stage end.
+  decaying = replace(s, human_lr_final_ratio=0.5)
+  assert decaying.lr("human_actor", 600) == pytest.approx(3e-5 * 0.75)
+  assert decaying.lr("human_actor", 2000) == pytest.approx(1.5e-5)
   assert s.lrs(300) == {m: s.lr(m, 300) for m in MODULES}
   assert s.beta(0) == 1.0  # No blend.
+  # Without a ramp the critics start at full rate.
+  assert replace(s, critic_ramp=0).lr("human_critic", 0) == pytest.approx(1e-4)
   with pytest.raises(KeyError):
     s.lr("teacher_head", 0)
+  with pytest.raises(ValueError, match="lr_final_ratio"):
+    replace(s, lr_final_ratio=1.5)
+  with pytest.raises(ValueError, match="human_lr_final_ratio"):
+    replace(s, human_lr_final_ratio=-0.1)
+
+
+def test_split_schedule_from_saved_replays_old_checkpoints() -> None:
+  """A checkpoint from before the separate critic rates, the critic ramp and the
+  floors kept one critic rate and decayed every rate to 0: it replays that way."""
+  old = {
+    "total_iterations": 100,
+    "human_freeze": 20,
+    "critic_warmup": 5,
+    "critic_lr": 4e-4,
+    "osl_actor_lr": 4e-4,
+    "human_peak_lr": 1e-4,
+    "human_ramp": 10,
+    "blend": False,
+    "blend_ramp": 0,
+  }
+  s = SplitSchedule.from_saved(old)
+  assert (s.human_critic_lr, s.osl_critic_lr, s.critic_ramp) == (4e-4, 4e-4, 0)
+  assert (s.lr_final_ratio, s.human_lr_final_ratio) == (0.0, 0.0)
+  assert s.lr("human_critic", 0) == pytest.approx(4e-4)
+  assert s.lr("osl_critic", 100) == 0.0 and s.lr("osl_actor", 100) == 0.0
+  assert s.lr("human_actor", 100) == 0.0
+  assert s.lr("human_actor", 29) == pytest.approx(1e-4 * (1.0 - 9 / 80))
+  new = SplitSchedule.from_saved(asdict(_schedule()))  # A new one round-trips.
+  assert new == _schedule()
 
 
 def test_split_schedule_from_train_cfg_and_blend() -> None:
   cfg = asdict(osl_split_runner_cfg("msk", "compliant", "clf", "test"))
   s = SplitSchedule.from_train_cfg(cfg, total_iterations=1000, reward_switch=False)
   assert (s.human_freeze, s.critic_warmup, s.human_ramp) == (200, 10, 50)
-  assert (s.critic_lr, s.osl_actor_lr, s.human_peak_lr) == (4e-4, 4e-4, 1e-4)
-  assert not s.blend and s.total_iterations == 1000
-  # A reward switch starts the critics fresh: the longer warm-up.
+  assert (s.human_critic_lr, s.osl_critic_lr) == (1e-4, 3e-4)
+  assert (s.osl_actor_lr, s.human_peak_lr) == (4e-4, 3e-5)
+  assert s.critic_ramp == s.critic_warmup  # The critics ramp over the warm-up.
+  assert (s.lr_final_ratio, s.human_lr_final_ratio) == (0.1, 1.0)
+  assert s.total_iterations == 1000
+  # The blend is on by default: warm-up 10 + ramp 100 <= freeze 200.
+  assert s.blend and s.blend_ramp == 100
+  assert [s.beta(k) for k in (0, 10, 60, 110, 500)] == [0.0, 0.0, 0.5, 1.0, 1.0]
+  # A reward switch starts the critics fresh: the longer warm-up and ramp; so does
+  # a fresh OSL critic.
   switched = SplitSchedule.from_train_cfg(cfg, 1000, reward_switch=True)
-  assert switched.critic_warmup == 50 and switched.osl_actor_frozen(49)
+  assert switched.critic_warmup == switched.critic_ramp == 50
+  assert switched.osl_actor_frozen(49) and switched.beta(100) == 0.5
+  fresh_cfg = copy.deepcopy(cfg)
+  fresh_cfg["algorithm"]["osl_critic_init"] = "fresh"
+  fresh = SplitSchedule.from_train_cfg(fresh_cfg, 1000, reward_switch=False)
+  assert fresh == switched
 
-  cfg["blend"]["enabled"] = True  # Warm-up 10 + ramp 100 <= freeze 200.
-  blend = SplitSchedule.from_train_cfg(cfg, 1000, reward_switch=False)
-  assert [blend.beta(k) for k in (0, 10, 60, 110, 500)] == [0.0, 0.0, 0.5, 1.0, 1.0]
   cfg["freeze"]["human_actor_iterations"] = 100  # beta would be < 1 at the unfreeze.
   with pytest.raises(ValueError, match="human unfreeze"):
     SplitSchedule.from_train_cfg(cfg, 1000, reward_switch=False)
+  cfg["blend"]["enabled"] = False
+  assert not SplitSchedule.from_train_cfg(cfg, 1000, reward_switch=False).blend
   with pytest.raises(ValueError, match="total_iterations"):
     _ = SplitSchedule.from_train_cfg(cfg, 0, reward_switch=False)
 
@@ -329,18 +394,21 @@ def test_split_schedule_from_train_cfg_and_blend() -> None:
 def test_channel_schedule() -> None:
   cfg = asdict(osl_split_runner_cfg("msk", "compliant", "clf", "test"))
   ch = ChannelSchedule.from_train_cfg(cfg)
-  assert (ch.anneal_start, ch.anneal_iterations) == (200, 200)  # -1: the unfreeze.
+  # From the critic warm-up's end, done before the human unfreezes.
+  assert (ch.anneal_start, ch.anneal_iterations) == (10, 150)
   stage1 = {"human": 1.0, "osl_sites": 1.0, "osl_joints": 0.0}
   assert ch.weights(0) == {"human": stage1, "osl": stage1}
-  assert ch.weights(200) == {"human": stage1, "osl": stage1}
-  assert ch.weights(300)["osl"] == pytest.approx(
+  assert ch.weights(10) == {"human": stage1, "osl": stage1}
+  assert ch.weights(85)["osl"] == pytest.approx(
     {"human": 0.75, "osl_sites": 1.0, "osl_joints": 5.0}
   )
   end = {"human": 0.5, "osl_sites": 1.0, "osl_joints": 10.0}
-  assert ch.weights(400) == {"human": stage1, "osl": end}
+  assert ch.weights(160) == {"human": stage1, "osl": end}
   assert ch.weights(10_000)["osl"] == end
   cfg["channels"]["osl_end"]["human"] = 7.0  # The schedule holds its own copies.
   assert ch.weights(400)["osl"]["human"] == 0.5
+  cfg["channels"]["anneal_start_iteration"] = -1  # -1: the human unfreeze.
+  assert ChannelSchedule.from_train_cfg(cfg).anneal_start == 200
 
   with pytest.raises(ValueError, match="no positive weight"):
     ChannelSchedule({"osl": {"a": 0.0}}, {"osl": {"a": 0.0}}, 0, 1)
@@ -477,6 +545,15 @@ def test_action_bounds() -> None:
   assert lo.tolist() == [-1.0] * HUMAN_DIM
   with pytest.raises(ValueError, match="dims"):
     action_bounds(_action_manager("msk"), ActionLayout.for_model("msk", 9), "human")
+
+
+def test_agent_terms() -> None:
+  """Each agent's action terms in its own columns, in action-manager order."""
+  msk = ActionLayout.for_model("msk", HUMAN_DIM + 2)
+  assert msk.agent_terms("human") == [("muscles", slice(0, HUMAN_DIM))]
+  assert msk.agent_terms("osl") == [("osl_motors", slice(0, 2))]
+  mixed = ActionLayout((("servos", 3), ("osl_motors", 2), ("extra", 4)))
+  assert mixed.agent_terms("human") == [("servos", slice(0, 3)), ("extra", slice(3, 7))]
 
 
 ##
@@ -662,8 +739,9 @@ def test_actors_only_load_plays_a_wider_critic() -> None:
   buffer.seek(0)
   loaded = torch.load(buffer, weights_only=False)
 
-  with pytest.raises(RuntimeError, match="size mismatch"):
+  with pytest.raises(ValueError, match="osl-critic-obs") as err:
     _alg().load(loaded)  # A full restore needs the run's critics.
+  assert "size mismatch" in str(err.value)
   played = _alg()  # The registered default, osl_critic_obs="full".
   played.set_schedule(_schedule())
   critics = {
@@ -829,3 +907,177 @@ def test_construct_algorithm_contract() -> None:
   cfg["multi_gpu"] = {"world_size": 2}
   with pytest.raises(NotImplementedError):
     TwoAgentPPO.construct_algorithm(_obs(), _env(), cfg, "cpu")
+
+
+def test_stage1_knobs_are_neutral_or_refused() -> None:
+  """Stage-1 settings stage 2 does not use keep neutral values in the split config,
+  and anything else fails loudly instead of doing nothing."""
+  cfg = osl_split_runner_cfg("msk", "compliant", "clf", "test")
+  algorithm = asdict(cfg.algorithm)
+  for key, (neutral, _) in STAGE1_ONLY_KNOBS.items():
+    assert algorithm[key] == neutral, key
+  # The recipe's own values never reach the split config.
+  assert algorithm["std_cap_start"] == 0.0 and algorithm["init_std_terms"] == {}
+  assert algorithm["lr_final_ratio"] == 0.1  # Stage 2's schedule floor.
+  # Newton-Schulz runs at the stage-1 recipe's precision: bfloat16 for MSK, the
+  # robot's float32.
+  assert algorithm["muon_ns_dtype"] == "bfloat16"
+  robot = osl_split_runner_cfg("robot", "compliant", "clf", "test").algorithm
+  assert robot.muon_ns_dtype == "float32"
+  _alg()  # The defaults build.
+  # On the command line (tyro builds the config) before the env is built...
+  with pytest.raises(ValueError, match="std_floor = 0.03"):
+    SplitPpoCfg(std_floor=0.03)
+  with pytest.raises(ValueError, match="std_cap_end = 0.05"):
+    replace(cfg.algorithm, std_cap_end=0.05)
+  # ...and again on the runner's dict.
+  overrides: dict[str, Any] = {
+    "std_cap_end": 0.05,
+    "std_floor": 0.03,
+    "init_std_terms": {"osl_motors": 0.3},
+    "learning_rate": 1e-4,
+    "lr_schedule_updates": 4000,
+    "lr_schedule_offset": 10,
+    "actor_bias_init": "qpos0",
+    "desired_kl": 0.02,
+  }
+  for key, value in overrides.items():
+    with pytest.raises(ValueError, match=f"{key} = ") as refused:
+      _alg(**{key: value})
+    assert "use " in str(refused.value)
+
+
+def test_muon_settings_pass_through_and_survive_resume() -> None:
+  alg = _alg()
+  assert {opt.ns_dtype for opt in alg.optimizers.values()} == {torch.bfloat16}
+  assert {o.ns_dtype for o in _alg(muon_ns_dtype="float32").optimizers.values()} == {
+    None
+  }
+  with pytest.raises(ValueError, match="muon_ns_dtype"):
+    _alg(muon_ns_dtype="float16")
+
+  # A checkpoint trained with other Muon settings resumes on this run's.
+  torch.manual_seed(0)
+  trained = _alg(muon_beta=0.8, muon_ns_steps=3, muon_ns_dtype="float32")
+  trained.set_schedule(_schedule(human_freeze=0, critic_warmup=0))
+  _rollout(trained)
+  trained.update()
+  buffer = io.BytesIO()
+  torch.save(trained.save(), buffer)
+  buffer.seek(0)
+  resumed = _alg()
+  resumed.load(torch.load(buffer, weights_only=False))
+  for optimizer in resumed.optimizers.values():
+    assert optimizer.ns_dtype is torch.bfloat16
+    for group in optimizer.param_groups:
+      assert (group["beta"], group["nesterov"], group["ns_steps"]) == (0.95, True, 5)
+  # The momenta themselves come from the checkpoint.
+  _assert_same(
+    resumed.optimizers["osl_critic"].state_dict()["state"],
+    trained.optimizers["osl_critic"].state_dict()["state"],
+  )
+
+
+def test_policy_and_critic_stats() -> None:
+  torch.manual_seed(0)
+  alg = _alg()
+  alg.set_schedule(_schedule(human_freeze=10, critic_warmup=0))  # Human frozen.
+  with torch.no_grad():
+    std_parameter(alg.human_actor).fill_(math.log(0.07))
+    _output(alg.osl_actor).bias.copy_(torch.tensor([3.0, 0.0]))  # Knee saturated.
+  _rollout(alg)
+  returns = alg.storage.returns.flatten(0, 1).clone()
+  values = alg.storage.values.flatten(0, 1).clone()
+  osl_std = float(alg.osl_std.mean())  # Recorded before the update's first step.
+  alg.update()
+
+  stats = alg.policy_stats
+  assert set(stats) == {
+    f"{kind}/{term}"
+    for kind in ("std", "noise_gap", "mean_outside")
+    for term in ("muscles", "osl_motors")
+  }
+  assert stats["std/muscles"] == pytest.approx(0.07, rel=1e-5)
+  assert stats["std/osl_motors"] == pytest.approx(osl_std, rel=1e-5)
+  assert stats["mean_outside/osl_motors"] == pytest.approx(0.5)  # Knee, not ankle.
+  assert 0.0 < stats["noise_gap/osl_motors"]
+  assert 0.0 <= stats["mean_outside/muscles"] <= 1.0
+  for i, agent in enumerate(("human", "osl")):
+    residual = (returns[:, i] - values[:, i]).var() / returns[:, i].var()
+    expected = 1.0 - float(residual)
+    got = alg.critic_stats[f"{agent}/explained_variance"]
+    assert got == pytest.approx(expected, abs=1e-5)  # float32 variances.
+
+
+def test_inference_policy_osl_modes() -> None:
+  """The teacher family is the unified stage-1 policy (human trunk, its OSL head),
+  raw or noise-averaged on every row as stage 1 averages it; the sampled family
+  samples the OSL actor, reproducibly under a seed."""
+  torch.manual_seed(0)
+  alg = _alg()
+  ws, unified, _ = _stage1(alg)
+  _warm_start(alg, ws, reward_switch=False)
+  alg.set_schedule(_schedule())
+  obs = _obs()
+  rows_h, rows_o = alg.layout.rows("human"), alg.layout.rows("osl")
+  manager = _env().unwrapped.action_manager
+  # Stage 1's bounds in action order: muscles [0, 1], OSL motors [-1, 1].
+  lo = torch.zeros(alg.layout.total_dim)
+  lo[rows_o] = -1.0
+  with torch.inference_mode():
+    teacher = alg.inference_policy("mean", osl_mode="teacher")(obs)
+    torch.testing.assert_close(teacher, unified(obs))  # Every row, in place.
+    teacher_expected = alg.inference_policy("expected", manager, "teacher")(obs)
+    stage1_expected = expected_clipped_gaussian(
+      unified(obs), distribution_std(unified), lo, torch.ones_like(lo)
+    )
+    torch.testing.assert_close(teacher_expected, stage1_expected)
+    assert not torch.allclose(teacher_expected[:, rows_o], teacher[:, rows_o])
+    mean = alg.get_policy()(obs)
+    sampled = alg.inference_policy("mean", osl_mode="sampled")
+    torch.manual_seed(3)
+    first = sampled(obs)
+    torch.manual_seed(3)
+    again = sampled(obs)
+  assert torch.equal(first, again)
+  torch.testing.assert_close(first[:, rows_h], mean[:, rows_h])
+  noise = (first[:, rows_o] - mean[:, rows_o]) / alg.osl_std
+  assert 0.2 < float(noise.std()) < 5.0  # Samples at the OSL actor's std.
+  with pytest.raises(ValueError, match="osl_mode"):
+    alg.inference_policy("mean", osl_mode=cast(Any, "teacher_sampled"))
+
+
+def test_fresh_osl_critic() -> None:
+  """osl_critic_init="fresh" keeps the OSL critic's own weights (it may be built
+  smaller) on the stage-1 critic's observation statistics; the human critic and the
+  return statistics still come from stage 1."""
+  torch.manual_seed(0)
+  alg = _alg(osl_critic_init="fresh")
+  fresh = _state(alg.osl_critic)
+  ws, _, _ = _stage1(alg)
+  _warm_start(alg, ws, reward_switch=False)
+  _assert_same(alg.human_critic.state_dict(), ws.human_critic)
+  after = _state(alg.osl_critic)
+  for key, value in fresh.items():
+    if not key.startswith("obs_normalizer."):
+      assert torch.equal(after[key], value), key
+  assert torch.equal(
+    after["obs_normalizer.mean"], ws.human_critic["obs_normalizer.mean"]
+  )
+  assert after["obs_normalizer.count"].item() == NUM_ENVS * NUM_STEPS
+  stats = alg.save()["reward_normalization"]
+  torch.testing.assert_close(stats["mean"], torch.full((2,), 0.3))
+  with pytest.raises(ValueError, match="osl_critic_init"):
+    _alg(osl_critic_init="copied")
+
+  # A resume must build the OSL critic as its run did: a smaller fresh one does
+  # not load into the default width, and the error names the flags to repeat.
+  cfg = _train_cfg(osl_critic_init="fresh")
+  cfg["osl_critic"]["hidden_dims"] = (8,)
+  small = TwoAgentPPO.construct_algorithm(_obs(), _env(), cfg, "cpu")
+  buffer = io.BytesIO()
+  torch.save(small.save(), buffer)
+  buffer.seek(0)
+  with pytest.raises(ValueError, match="--agent.osl-critic.hidden-dims") as err:
+    alg.load(torch.load(buffer, weights_only=False))
+  assert "--agent.algorithm.osl-critic-init" in str(err.value)

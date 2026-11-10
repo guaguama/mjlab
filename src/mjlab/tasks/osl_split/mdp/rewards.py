@@ -37,6 +37,10 @@ stage-1 imitation reward, apart from the owner penalty split
 
 The additive terms (the twist reward) are separate manager terms; the runner adds
 them to the channels.
+
+When the scene has the OSL/left-leg contact sensor (the split env config adds it),
+the term also reports the leg-crossing diagnostics :data:`SPLIT_CONTACT_DIAGNOSTICS`.
+No reward uses them yet.
 """
 
 from __future__ import annotations
@@ -58,6 +62,7 @@ from mjlab.tasks.osl_mimic.mdp.rewards import (
   ClfCfg,
   mimic_reward,
 )
+from mjlab.tasks.osl_split.config.sensors import LEG_CONTACT_SENSOR
 from mjlab.tasks.osl_split.rl.layout import AGENTS, ActionLayout
 
 if TYPE_CHECKING:
@@ -111,6 +116,15 @@ SPLIT_DIAGNOSTICS: tuple[str, ...] = (
 """Every key :class:`split_mimic_reward` adds to ``components``, (B,) each, read by
 ``osl_mimic.mdp.mimic_component``. The penalties include the CLF violation, as
 stage 1's ``penalty_total`` does; ``split_err_osl_*`` are ``|q - q_ref|`` in rad."""
+SPLIT_CONTACT_DIAGNOSTICS: tuple[str, ...] = (
+  "split_leg_contact",
+  "split_leg_contact_force",
+)
+"""The leg-crossing diagnostics, added to ``components`` when the scene has the
+:data:`~..config.sensors.LEG_CONTACT_SENSOR`: ``split_leg_contact`` is 1 where an OSL
+collision geom touched the biological left leg in any physics substep of the step
+(its mean is a contact rate), ``split_leg_contact_force`` the largest net contact
+force over those substeps (N)."""
 
 Weights = dict[str, dict[str, float]]
 
@@ -269,6 +283,7 @@ class split_mimic_reward(mimic_reward):
       self._setup_clf_split(self._clf, len(relative), osl_sites, env)
 
     self.channel_rewards = torch.zeros(env.num_envs, len(CHANNELS), device=device)
+    self._leg_contact = _scene_sensor(env, LEG_CONTACT_SENSOR)
     self._group_weights: Weights = {}
     initial = channels.initial_weights
     self.set_group_weights(
@@ -486,6 +501,8 @@ class split_mimic_reward(mimic_reward):
     osl_err = self._stash("joint_q_err").index_select(-1, self._osl_joint_ids).abs()
     diagnostics["split_err_osl_knee"] = osl_err[:, 0]
     diagnostics["split_err_osl_ankle"] = osl_err[:, 1]
+    if self._leg_contact is not None:
+      diagnostics.update(leg_contact_diagnostics(self._leg_contact.data))
     self.components.update(diagnostics)
 
   ##
@@ -646,3 +663,27 @@ class split_mimic_reward(mimic_reward):
         penalty = penalty - torque.index_select(-1, index).sum(-1)
       out[agent] = penalty.clamp(min=-1.0)
     return out
+
+
+##
+# Leg contact.
+##
+
+
+def _scene_sensor(env: Any, name: str) -> Any | None:
+  """The scene's sensor ``name``, or None (a scene without it, or a fake env)."""
+  sensors = getattr(getattr(env, "scene", None), "sensors", None)
+  return sensors.get(name) if isinstance(sensors, Mapping) else None
+
+
+def leg_contact_diagnostics(data: Any) -> dict[str, torch.Tensor]:
+  """:data:`SPLIT_CONTACT_DIAGNOSTICS` from the leg-contact sensor's
+  ``ContactData``: the largest net-force magnitude over its substep history (the
+  current force without one) and over its primaries, and whether it is non-zero."""
+  history = getattr(data, "force_history", None)  # (B, P, H, 3)
+  if history is not None:
+    force = history.norm(dim=-1).amax(dim=-1)
+  else:
+    force = data.force.norm(dim=-1)  # (B, P, 3) -> (B, P)
+  force = force.amax(dim=-1)
+  return {"split_leg_contact": (force > 0.0).float(), "split_leg_contact_force": force}

@@ -7,7 +7,10 @@ W&B runs and ``play``) and any step can be redone on its own:
 1. **Stage 1**: ``python -m mjlab.scripts.train
    Mjlab-Gait-Library-Unicycle-OSL-Fullbody<tags>``, unless ``--stage1.run-dir``
    names an existing run. ``--stage1.iterations`` sets both ``max_iterations`` and
-   ``lr_schedule_updates``, so the learning rate reaches 0 at the last iteration.
+   ``lr_schedule_updates``, so the rate's linear decay ends at the last iteration,
+   at the task's ``lr_final_ratio``. The default (musclemimic's budget) is shorter
+   than the MSK unicycle recipe's 4500 iterations, whose std cap and env stages
+   count updates up to 4000.
 2. **The split**: ``python -m mjlab.tasks.osl_split.scripts.split`` converts the
    run's highest-numbered checkpoint (or ``--stage1.checkpoint``) into
    ``<log-root>/pipelines/<name>_warm_start.pt``, on the CPU
@@ -81,6 +84,9 @@ model_<N>.pt``). A resumed run counts ``--agent.max-iterations`` from ``N``, so 
 the iterations still to go. A resumed stage 2 keeps the curriculum its checkpoint
 was trained with (freeze, warm-up, learning rates, blend and reward channels), and
 warns about any flag that sets it otherwise, so its stage-2 flags need not be
+repeated (``--agent.resume-curriculum config`` takes the command line's curriculum
+instead, e.g. to extend the schedule with ``--agent.algorithm.schedule-iterations``);
+its network flags (an OSL critic's ``--agent.osl-critic.hidden-dims``, say) must be
 repeated. After a stage-1 resume, continue with ``--stage1.run-dir`` on the resumed
 run. Before the split, the driver compares the run's highest-numbered checkpoint
 with the last iteration its ``params/agent.yaml`` plans (``max_iterations``,
@@ -141,8 +147,8 @@ STAGE2_TASK = "Mjlab-Split-Unicycle-OSL-Fullbody"
 TRAIN_MODULE = "mjlab.scripts.train"
 SPLIT_MODULE = "mjlab.tasks.osl_split.scripts.split"
 STAGE1_ITERATIONS = 3051
-"""Stage 1's full budget: musclemimic's 1e9 steps at 4096 envs x 80 steps, as the
-live unified run uses."""
+"""musclemimic's budget: 1e9 steps at 4096 envs x 80 steps (the MSK unicycle recipe
+trains 4500 iterations)."""
 NVIDIA_SMI_QUERY = (
   "nvidia-smi",
   "--query-compute-apps=pid,process_name,used_memory",

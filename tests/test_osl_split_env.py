@@ -745,10 +745,14 @@ def test_env_cfg_contract(
   split = {name for name in cfg.metrics if name not in base.metrics}
   clf_only = set(mdp.SPLIT_CLF_DIAGNOSTICS)
   assert clf_only <= set(mdp.SPLIT_DIAGNOSTICS)
-  assert split == set(mdp.SPLIT_DIAGNOSTICS) - (set() if reward == "clf" else clf_only)
+  diagnostics = set(mdp.SPLIT_DIAGNOSTICS) - (set() if reward == "clf" else clf_only)
+  assert split == diagnostics | set(mdp.SPLIT_CONTACT_DIAGNOSTICS)
   for name in split:
     assert cfg.metrics[name].func is mimic_component
     assert cfg.metrics[name].params == {"name": name}
+  # The scene adds the leg-contact sensor only (test_leg_contact_sensor).
+  assert [sensor.name for sensor in cfg.scene.sensors] == [sensors.LEG_CONTACT_SENSOR]
+  assert base.scene.sensors == ()
 
   # Everything else is stage 1's: physics randomization (actuator delays included),
   # terminations, command, simulation, actions.
@@ -786,6 +790,52 @@ def test_env_cfg_spec_fn_adds_the_sensors_over_the_foot_priority() -> None:
   assert set(sensors.OSL_SENSORS) <= {sensor.name for sensor in spec.sensors}
   feet = [g for g in spec.geoms if re.fullmatch(FOOT_GEOMS, g.name)]
   assert len(feet) == 8 and {int(g.priority) for g in feet} == {1}
+
+
+def test_leg_contact_sensor() -> None:
+  """The split scene carries a contact sensor between the OSL's subtree and the
+  biological left leg's, kept over a control step's substeps, with two metrics. In
+  plain MuJoCo it reads nothing standing and a hull strike once the right hip
+  adducts the prosthesis into the left leg (a sensor changes no physics)."""
+  from mjlab.scene import Scene
+  from mjlab.sensor import ContactMatch, ContactSensorCfg
+
+  cfg = osl_split_env_cfg("robot", "rigid", "clf", "train")
+  (sensor,) = [s for s in cfg.scene.sensors if s.name == sensors.LEG_CONTACT_SENSOR]
+  assert isinstance(sensor, ContactSensorCfg)
+  assert sensor.primary == ContactMatch(
+    mode="subtree", pattern=f"^{sensors.OSL_ROOT_BODY}$", entity="robot"
+  )
+  assert sensor.secondary == ContactMatch(
+    mode="subtree", pattern=sensors.LEFT_LEG_BODY, entity="robot"
+  )
+  assert sensor.reduce == "netforce" and sensor.history_length == cfg.decimation
+  for name in mdp.SPLIT_CONTACT_DIAGNOSTICS:
+    assert cfg.metrics[name].func is mimic_component
+    assert cfg.metrics[name].params == {"name": name}
+  assert cfg.metrics["split_leg_contact"].reduce == "mean"  # A contact rate.
+  assert cfg.metrics["split_leg_contact_force"].reduce == "max"  # The hardest hit.
+
+  cfg.scene.num_envs = 1
+  model = Scene(cfg.scene, "cpu").compile()
+  (index,) = [
+    i for i in range(model.nsensor) if model.sensor(i).name.startswith(sensor.name)
+  ]
+  assert model.sensor_type[index] == mujoco.mjtSensor.mjSENS_CONTACT
+  assert model.body(model.sensor_objid[index]).name == f"robot/{sensors.OSL_ROOT_BODY}"
+  assert model.body(model.sensor_refid[index]).name == f"robot/{sensors.LEFT_LEG_BODY}"
+  data = mujoco.MjData(model)
+  hip = model.joint("robot/hip_adduction_r").qposadr[0]
+  free = model.jnt_qposadr[0]
+  readings = []
+  for angle in (0.0, 0.3):
+    mujoco.mj_resetData(model, data)
+    data.qpos[free + 2] += 1.0  # Off the floor.
+    data.qpos[hip] = angle
+    mujoco.mj_forward(model, data)
+    adr = model.sensor_adr[index]
+    readings.append(float(np.linalg.norm(data.sensordata[adr : adr + 3])))
+  assert readings[0] == 0.0 and readings[1] > 1.0
 
 
 def test_env_cfg_options_and_refusals() -> None:

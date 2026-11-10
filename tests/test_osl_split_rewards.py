@@ -49,10 +49,12 @@ from mjlab.tasks.osl_mimic.mdp.rewards import (
   mimic_reward,
 )
 from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
+from mjlab.tasks.osl_split.config.sensors import LEG_CONTACT_SENSOR
 from mjlab.tasks.osl_split.mdp.rewards import (
   CHANNELS,
   GROUPS,
   SPLIT_CLF_DIAGNOSTICS,
+  SPLIT_CONTACT_DIAGNOSTICS,
   SPLIT_DIAGNOSTICS,
   SplitRewardCfg,
   split_mimic_reward,
@@ -1160,3 +1162,36 @@ def test_runner_channel_defaults_match(reward: str) -> None:
   )
   assert set(GROUPS) == set(asdict(channels.osl_end))
   assert SplitRewardCfg() == SplitRewardCfg(True, 0.2, None)
+
+
+def test_leg_contact_diagnostics() -> None:
+  """With the scene's OSL/left-leg contact sensor the term reports, per env,
+  whether a contact force acted in any substep of the step and the largest net
+  force; without the sensor it reports neither."""
+  history = torch.zeros(NUM_ENVS, 1, 5, 3)  # (envs, primaries, substeps, xyz)
+  history[1, 0, 2] = torch.tensor([3.0, 4.0, 0.0])  # 5 N mid-step only.
+  history[2, 0, 0] = torch.tensor([0.0, 0.0, 12.0])
+  history[2, 0, 4] = torch.tensor([0.0, 1.0, 0.0])
+  sensor = SimpleNamespace(
+    data=SimpleNamespace(force=history[:, :, 0], force_history=history)
+  )
+  cmd = _FakeCommand(0)
+  env = _fake_env(cmd)
+  env.scene = SimpleNamespace(sensors={LEG_CONTACT_SENSOR: sensor})
+  params: dict[str, Any] = {**_params("clf"), "channels": SplitRewardCfg()}
+  cfg = RewardTermCfg(func=split_mimic_reward, weight=1.0, params=params)
+  term = split_mimic_reward(cfg, env)
+  _advance(env, cmd)
+  term(env, **params)
+  contact = term.components["split_leg_contact"]
+  assert contact.tolist() == [0.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+  force = term.components["split_leg_contact_force"]
+  torch.testing.assert_close(force, torch.tensor([0.0, 5.0, 12.0, 0.0, 0.0, 0.0]))
+  assert set(SPLIT_CONTACT_DIAGNOSTICS) <= set(term.components)
+  # Without a substep history, the current force.
+  sensor.data = SimpleNamespace(force=history[:, :, 4], force_history=None)
+  term(env, **params)
+  assert term.components["split_leg_contact"].tolist() == [0, 0, 1, 0, 0, 0]
+  # Without the sensor (a scene without it), no contact keys.
+  bare, *_ = _split("clf")
+  assert not set(SPLIT_CONTACT_DIAGNOSTICS) & set(bare.components)

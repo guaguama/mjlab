@@ -17,7 +17,8 @@ from dataclasses import asdict
 from datetime import datetime
 from itertools import chain
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -25,25 +26,38 @@ import yaml
 from tensordict import TensorDict
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_cfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward, _actions
+from mjlab.tasks.osl_mimic.config.rl_cfg import MuscleMimicPpoCfg
+from mjlab.tasks.osl_mimic.mdp.rewards import ClfCfg
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_mimic.rl.muon import MuonAdam
+from mjlab.tasks.osl_mimic.rl.ppo import MuscleMimicPPO
 from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
 from mjlab.tasks.osl_split.rl.layout import ActionLayout
 from mjlab.tasks.osl_split.rl.warmstart import (
   LINEAGE_KEYS,
   LOG_STD,
+  OPTIONAL_LINEAGE_KEYS,
   WARM_START_FORMAT,
   WarmStart,
   architecture_mismatches,
   build_warm_start,
   check_compatible,
+  compare_library_releases,
   default_output_path,
+  env_cfg_settings,
+  env_stages_in_force,
   find_wandb_run_id,
+  library_release,
+  lineage_warnings,
   lineage_yaml_path,
   load_warm_start,
   resolve_stage1_checkpoint,
+  stage1_env_settings,
+  stage1_learning_rate,
+  stage1_std_cap,
   verify_warm_start,
 )
 from mjlab.tasks.osl_split.scripts.split import main
@@ -309,6 +323,29 @@ def test_lineage(tmp_path: Path, model: Model) -> None:
   assert datetime.fromisoformat(lineage["created"]).tzinfo is not None
   assert lineage["verified_max_abs_diff"] is None
   assert lineage["library_dir"] == LIBRARY
+  # Stage 1's end state, from agent.yaml (and env.yaml, which here records only
+  # the library): its last rate and std cap, the env stages then in force, the
+  # planned end, and the library (not on this machine: named by its folder).
+  agent = osl_gait_library_runner_cfg(model, "compliant", "clf", "x", "unicycle")
+  algorithm = agent.algorithm
+  assert isinstance(algorithm, MuscleMimicPpoCfg)
+  final = algorithm.lr_final_ratio
+  fraction = 1.0 - 12 / algorithm.lr_schedule_updates
+  assert lineage["stage1_lr"] == pytest.approx(4e-4 * (final + (1 - final) * fraction))
+  assert lineage["stage1_std_cap"] == (1.0 if model == "msk" else None)
+  stages = (
+    {"terminations.root_deviation.threshold": 1.0, "rewards.twist.weight": 0.06}
+    if model == "msk"
+    else {}
+  )
+  assert lineage["stage1_env"] == {
+    "clf_pen_w": None,
+    "twist_weight": stages.get("rewards.twist.weight"),
+    "root_deviation": stages.get("terminations.root_deviation.threshold"),
+    "env_stages_in_force": stages,
+  }
+  assert lineage["stage1_planned_last_iteration"] == agent.max_iterations - 1
+  assert lineage["library_release"] == {"release": "unicycle_v001", "sha256": None}
   assert yaml.safe_load(yaml.safe_dump(lineage)) == lineage  # Plain types only.
 
 
@@ -501,6 +538,153 @@ def test_find_wandb_run_id_ignores_runs_started_from_it(
   _wandb_run(wandb, "run-20261108_100005-stage2id", stage2, source, files=(name,))
   assert find_wandb_run_id(run_dir) == WANDB_ID
   assert find_wandb_run_id(stage2) == "stage2id"
+
+
+##
+# Provenance.
+##
+
+
+@pytest.mark.parametrize(
+  "algorithm",
+  [
+    {"learning_rate": 4e-4, "lr_schedule_updates": 4000, "lr_final_ratio": 0.1},
+    {"learning_rate": 4e-4, "lr_schedule_updates": 3051},  # musclemimic's.
+    {
+      "learning_rate": 3e-5,
+      "lr_schedule": "constant",
+      "lr_schedule_updates": 4000,
+    },
+    {
+      "learning_rate": 1e-4,
+      "lr_schedule_updates": 1500,
+      "lr_schedule_offset": 4500,
+      "lr_final_ratio": 0.3,
+    },
+  ],
+)
+def test_stage1_rate_and_cap_follow_muscle_mimic_ppo(algorithm: dict) -> None:
+  """The lineage's rate and std cap are MuscleMimicPPO's own, from agent.yaml."""
+  cfg = {
+    **algorithm,
+    "std_cap_start": 1.0,
+    "std_cap_end": 0.07,
+    "std_cap_begin_update": 300,
+    "std_cap_end_update": 4000,
+  }
+  ppo = SimpleNamespace(
+    base_learning_rate=cfg["learning_rate"],
+    lr_schedule=cfg.get("lr_schedule", "linear"),
+    lr_schedule_updates=cfg["lr_schedule_updates"],
+    lr_schedule_offset=cfg.get("lr_schedule_offset", 0),
+    lr_final_ratio=cfg.get("lr_final_ratio", 0.0),
+    std_cap_start=1.0,
+    std_cap_end=0.07,
+    std_cap_begin_update=300,
+    std_cap_end_update=4000,
+  )
+  for update in (0, 299, 1000, 3999, 4500, 5999, 7000):
+    ppo.num_updates_done = update
+    lr = MuscleMimicPPO.scheduled_learning_rate(cast(Any, ppo))
+    assert stage1_learning_rate(cfg, update) == pytest.approx(lr, rel=1e-12)
+    assert stage1_std_cap(cfg, update) == pytest.approx(
+      MuscleMimicPPO.std_cap(cast(Any, ppo), update), rel=1e-12
+    )
+  assert stage1_std_cap({"std_cap_start": 0.0}, 100) is None
+  assert stage1_learning_rate({}, 100) is None
+
+
+def test_stage1_env_settings(tmp_path: Path) -> None:
+  """The env settings of stage 1's last update: env.yaml's final values, with the
+  env stages still in force at that update on top."""
+  env_cfg = osl_gait_library_env_cfg("msk", "compliant", "clf", "train", "unicycle")
+  clf = env_cfg.rewards["mimic"].params["clf"]
+  assert isinstance(clf, ClfCfg)
+  clf.pen_w = 0.25
+  dump_yaml(tmp_path / "params" / "env.yaml", asdict(env_cfg))
+  agent = {
+    "env_stages": (
+      (1500, "terminations.root_deviation.threshold", 1.0),
+      (3000, "rewards.twist.weight", 0.06),
+    )
+  }
+  settings = stage1_env_settings(tmp_path, agent, num_updates_done=2000)
+  assert settings == {
+    "clf_pen_w": 0.25,
+    "twist_weight": 0.06,  # Staged until update 3000.
+    "root_deviation": 2.0,  # The env config's own from update 1500.
+    "env_stages_in_force": {"rewards.twist.weight": 0.06},
+  }
+  done = stage1_env_settings(tmp_path, agent, num_updates_done=4500)
+  assert done is not None and done["twist_weight"] == 0.2
+  # The live config reads alike; validation has no root-deviation limit.
+  assert env_cfg_settings(env_cfg) == {
+    "clf_pen_w": 0.25,
+    "twist_weight": 0.2,
+    "root_deviation": 2.0,
+  }
+  validation = osl_gait_library_env_cfg("msk", "compliant", "mimic", "validation")
+  assert env_cfg_settings(validation)["clf_pen_w"] is None
+  assert env_cfg_settings(validation)["root_deviation"] is None
+  assert stage1_env_settings(tmp_path / "missing", agent, 10) is None
+  assert env_stages_in_force(agent["env_stages"], 1499) == {
+    "terminations.root_deviation.threshold": 1.0,
+    "rewards.twist.weight": 0.06,
+  }
+
+
+def test_library_release(tmp_path: Path) -> None:
+  library = tmp_path / "unicycle_v001"
+  library.mkdir()
+  (library / "library.json").write_text('{"release": "unicycle_v001", "nodes": []}')
+  release = library_release(library)
+  assert release is not None and release["release"] == "unicycle_v001"
+  digest = release["sha256"]
+  assert digest is not None and len(digest) == 64
+  # The same release elsewhere (a cluster run's path, unreadable here): by name.
+  cluster = library_release("/cluster/gait_libraries/unicycle_v001")
+  assert cluster == {"release": "unicycle_v001", "sha256": None}
+  assert library_release("") is None
+  level, text = cast(tuple, compare_library_releases(release, dict(release)))
+  assert level == "INFO" and "same library release" in text
+  level, text = cast(tuple, compare_library_releases(cluster, release))
+  assert level == "INFO" and "by name" in text
+  # The same release converted again: its library.json records the conversion's
+  # time and path, so the bytes differ under the same name.
+  again = {"release": "unicycle_v001", "sha256": "e" * 64}
+  level, text = cast(tuple, compare_library_releases(release, again))
+  assert level == "WARN" and "same release name, converted again" in text
+  other = {"release": "unicycle_v003", "sha256": "f" * 64}
+  level, text = cast(tuple, compare_library_releases(release, other))
+  assert level == "WARN" and "unicycle_v003" in text and "another library" in text
+  level, _ = cast(tuple, compare_library_releases(cluster, {**other, "sha256": None}))
+  assert level == "WARN"
+  assert compare_library_releases(None, release) is None
+
+
+def test_lineage_warnings() -> None:
+  lineage = {
+    "iter": 5999,
+    "human_std": {"median": 0.07},
+    "stage1_planned_last_iteration": 5999,
+  }
+  assert lineage_warnings(lineage) == []
+  noisy = {**lineage, "human_std": {"median": 0.86}}
+  assert "median std is 0.86" in lineage_warnings(noisy)[0]
+  unfinished = {**lineage, "iter": 500}
+  assert "unfinished" in lineage_warnings(unfinished)[0]
+  assert lineage_warnings({"iter": 3, "human_std": {"median": 0.1}}) == []
+
+
+def test_old_warm_start_files_load(tmp_path: Path) -> None:
+  """A file converted before the provenance keys loads, and summarizes."""
+  ws = build_warm_start(_stage1_run(tmp_path, "msk"), verify=False)
+  for key in OPTIONAL_LINEAGE_KEYS:
+    del ws.lineage[key]
+  ws.save(tmp_path / "old.pt")
+  old = WarmStart.load(tmp_path / "old.pt")
+  assert not set(OPTIONAL_LINEAGE_KEYS) & set(old.lineage)
+  assert "Warm start from" in old.summary()
 
 
 ##

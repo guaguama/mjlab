@@ -527,7 +527,7 @@ def export_bundle(
     output: The bundle folder (default ``<run>/deploy/<checkpoint stem>``).
     library: The clip folder, when the run's is not on this machine.
     inference: The manifest's default inference; None picks ``expected`` for MSK
-      policies and ``mean`` for robot ones.
+      policies whose median muscle std exceeds 0.3 and ``mean`` for the others.
     overwrite: Replace an existing bundle (once the new one is complete).
     solver_iterations, ls_solver_iterations: The bundle model's solver caps (see
       :func:`build_components`); recorded in the manifest's ``deployment``.
@@ -718,7 +718,7 @@ class ExportConfig:
   """Clip folder, when the run's ``library_dir`` is not on this machine."""
   inference: Literal["auto", "mean", "expected"] = "auto"
   """Default inference written to the manifest: ``auto`` picks ``expected`` for MSK
-  policies and ``mean`` for robot ones."""
+  policies whose median muscle std exceeds 0.3 and ``mean`` for the others."""
   overwrite: bool = False
   """Replace an existing bundle."""
   hf_repo: str | None = None

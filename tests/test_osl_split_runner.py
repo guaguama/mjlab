@@ -97,7 +97,11 @@ from mjlab.tasks.osl_split.rl.export import (
   term_channels,
 )
 from mjlab.tasks.osl_split.rl.layout import ActionLayout
-from mjlab.tasks.osl_split.rl.policy import distribution_std
+from mjlab.tasks.osl_split.rl.policy import (
+  SplitInferencePolicy,
+  distribution_std,
+  std_parameter,
+)
 from mjlab.tasks.osl_split.rl.runner import AgentRewards, SplitOnPolicyRunner
 from mjlab.tasks.osl_split.rl.schedules import ChannelSchedule
 from mjlab.tasks.osl_split.rl.storage import obs_group
@@ -105,6 +109,7 @@ from mjlab.tasks.osl_split.rl.warmstart import (
   LINEAGE_KEYS,
   WARM_START_FORMAT,
   WarmStart,
+  library_release,
   load_warm_start,
 )
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
@@ -266,7 +271,12 @@ class _FakeEnv:
     self.action_manager = _action_manager()
     self.reward_manager = _FakeRewardManager(num_envs)
     self.observation_manager = _observation_manager()
-    clips = SimpleNamespace(clip_groups=["fwd", "turn"], num_clips=2)
+    # A tight left arc and a right pivot (wz > 0 turns left).
+    clips = SimpleNamespace(
+      clip_groups=["fwd_tight", "turn"],
+      num_clips=2,
+      twists=torch.tensor([[0.5, 0.0, 0.6], [0.0, 0.0, -0.5]]),
+    )
     self.command_manager = SimpleNamespace(get_term=lambda name: clips)
     self.sim = SimpleNamespace(mj_model=mujoco.MjModel.from_xml_string(MOTORS_XML))
     self.expected_agent_rewards: list[torch.Tensor] = []
@@ -308,6 +318,7 @@ class _FakeEnv:
       "split_reward_human": channels[:, 0],
       "split_reward_osl": channels[:, 1],
       "err_site_abs": self._rand(n),
+      "split_leg_contact_force": 100.0 * self._rand(n),
     }
     manager.twist.components = {"twist_reward": twist / TWIST_WEIGHT}
     manager._step_reward = torch.stack((mimic, twist), dim=-1)
@@ -327,10 +338,13 @@ class _FakeEnv:
 
 
 class _Runner(SplitOnPolicyRunner):
-  """The runner with a fake validation env (the real one is an mjlab env)."""
+  """The runner with fake evaluation envs (the real ones are mjlab envs)."""
 
   def _make_validation_env(self) -> Any:
     return _FakeEnv(num_envs=4, seed=1)
+
+  def _make_stress_env(self) -> Any:
+    return _FakeEnv(num_envs=5, seed=2)
 
 
 def _layout() -> ActionLayout:
@@ -447,8 +461,10 @@ def _train_cfg(warm_start: Path | None) -> dict[str, Any]:
   cfg["save_interval"] = 2
   cfg["logger"] = "tensorboard"
   cfg["upload_model"] = False
-  cfg["validation"].update(interval=2, num_steps=5, num_envs=4)
+  cfg["validation"].update(interval=2, num_steps=5, num_envs=4, stress_num_steps=4)
   cfg["freeze"].update(human_actor_iterations=2, critic_warmup_iterations=1)
+  # The blend is on by default, with a ramp longer than this two-iteration freeze.
+  cfg["blend"]["enabled"] = False
   cfg["channels"].update(anneal_start_iteration=0, anneal_iterations=2)
   cfg["channels"]["additive_term_weights"] = {"twist": TWIST_SPLIT}
   cfg["warm_start"]["path"] = str(warm_start) if warm_start is not None else ""
@@ -460,6 +476,13 @@ def _scalars(log_dir: Path, *tags: str) -> dict[str, dict[int, float]]:
   events = EventAccumulator(str(log_dir), size_guidance={"scalars": 0})
   events.Reload()
   return {tag: {e.step: e.value for e in events.Scalars(tag)} for tag in tags}
+
+
+def _tags(log_dir: Path) -> set[str]:
+  """Every scalar tag the run logged."""
+  events = EventAccumulator(str(log_dir), size_guidance={"scalars": 0})
+  events.Reload()
+  return set(events.Tags()["scalars"])
 
 
 def _states(runner: SplitOnPolicyRunner) -> dict[str, dict[str, torch.Tensor]]:
@@ -673,14 +696,26 @@ def test_osl_policy_metadata() -> None:
   assert meta["std"] == pytest.approx([0.2, 0.3])
   assert meta["lineage"] == lineage
   assert "osl_actuator_delay_s" not in meta["randomization"]
+  # How to run it: the mean, the reset conventions, CPU MuJoCo's solver caps.
+  assert meta["default_inference"] == "mean"
+  assert "first frame" in meta["reset"]["history"]
+  assert meta["reset"]["last_action"].startswith("0")
+  deployment = meta["deployment"]
+  assert deployment["solver"] == {"iterations": 10, "ls_iterations": 20}
+  assert deployment["training_solver"] is None  # The fake env has no sim config.
 
-  # With the real training config, the OSL motors' delay and strength ranges.
+  # With the real training config, the OSL motors' delay and strength ranges, and
+  # the training solver caps (mujoco_warp's 4/8) raised for CPU MuJoCo.
   env.cfg = osl_split_env_cfg("msk", "compliant", "clf", "train")
-  randomization = osl_policy_metadata(cast(Any, env), cast(Any, alg), None)[
-    "randomization"
-  ]
+  real = osl_policy_metadata(cast(Any, env), cast(Any, alg), None)
+  randomization = real["randomization"]
   assert randomization["osl_actuator_delay_s"] == pytest.approx([0.0, 0.02])
   assert randomization["osl_motor_strength"] == pytest.approx([0.9, 1.1])
+  assert real["deployment"]["training_solver"] == {"iterations": 4, "ls_iterations": 8}
+  assert real["deployment"]["solver"] == {"iterations": 10, "ls_iterations": 20}
+  env.cfg.sim.mujoco.iterations = 12  # A higher training cap is kept.
+  solver = osl_policy_metadata(cast(Any, env), cast(Any, alg), None)["deployment"]
+  assert solver["solver"] == {"iterations": 12, "ls_iterations": 20}
 
   actor.obs_dim = OSL_DIM - 1
   with pytest.raises(ValueError, match="OSL actor reads"):
@@ -763,9 +798,12 @@ def test_runner_trains_validates_saves_and_resumes(
   _write_warm_start(ws_path)
   log_dir = tmp_path / "run"
   cfg = _train_cfg(ws_path)
+  cfg["blend"].update(enabled=True, ramp_iterations=1)  # Warm-up 1 + 1 <= freeze 2.
+  cfg["validation"]["stress_interval"] = 2
   env = _FakeEnv()
   runner = _Runner(cast(Any, env), cfg, str(log_dir), "cpu")
   assert runner.stage_start == runner.current_learning_iteration == STAGE_START
+  assert runner.schedule.blend
   assert env.common_step_counter == STAGE1_COUNTER
   assert runner.lineage is not None and runner.lineage["iter"] == STAGE1_ITER
   assert not runner.reward_switch and runner.schedule_iterations == ITERATIONS
@@ -790,9 +828,12 @@ def test_runner_trains_validates_saves_and_resumes(
   weights = [channels.weights(k) for k in range(ITERATIONS)]
   assert env.reward_manager.mimic.weights_set == weights
   assert weights[1]["osl"]["osl_joints"] == 5.0  # Half-way to osl_end.
-  # ...and the validation env's before each validation: zero-shot, then k = 1.
+  # ...and the evaluation envs' before each evaluation: validation and stress at
+  # zero-shot, then at k = 1.
   validation_env = cast(_FakeEnv, runner._validation_env)
   assert validation_env.reward_manager.mimic.weights_set == weights[:2]
+  stress_env = cast(_FakeEnv, runner._stress_env)
+  assert stress_env.reward_manager.mimic.weights_set == weights[:2]
 
   steps = [STAGE_START + k for k in range(ITERATIONS)]
   logged = _scalars(
@@ -810,8 +851,27 @@ def test_runner_trains_validates_saves_and_resumes(
     "Train/human/mean_reward",
     "Train/osl/mean_reward",
     "Validation/mean_episode_return_osl",
-    "ValidationExpected/mean_episode_return_human",
+    "ValidationTeacher/mean_episode_return_osl",
+    "ValidationTeacherExpected/mean_episode_return_human",
     "Validation/split_reward_osl/turn",
+    "Validation/early_termination_rate/fwd_tight_left",
+    "Validation/early_termination_rate/turn_right",
+    "Validation/split_leg_contact_force_peak",
+    "Stress/survival_rate",
+    "Stress/mean_first_episode_return_osl",
+    "StressOslSampled/survival_rate",
+    "StressTeacher/survival_rate",
+    "Perf/zero_shot_validation_time",
+    "Perf/zero_shot_stress_time",
+    "Perf/validation_time",
+    "Perf/stress_time",
+    "Policy/std/muscles",
+    "Policy/std/osl_motors",
+    "Policy/mean_outside/osl_motors",
+    "Policy/noise_gap/muscles",
+    "Critic/human/explained_variance",
+    "Critic/osl/explained_variance",
+    "Stage2/blend_beta",
   )
   assert logged["Stage2/iteration"] == {s: float(k) for k, s in enumerate(steps)}
   assert list(logged["Stage2/human_frozen"].values()) == [1.0, 1.0, 0.0]
@@ -829,17 +889,49 @@ def test_runner_trains_validates_saves_and_resumes(
     assert set(logged[tag]) == set(steps), tag
   for tag in (
     "Validation/mean_episode_return_osl",
-    "ValidationExpected/mean_episode_return_human",
     "Validation/split_reward_osl/turn",
+    "Validation/early_termination_rate/fwd_tight_left",
+    "Validation/early_termination_rate/turn_right",
+    "Validation/split_leg_contact_force_peak",
   ):
     assert set(logged[tag]) == {steps[0], steps[1]}, tag  # Zero-shot, then k = 1.
+  # The teacher's families at zero-shot only: the stage-1 policy, raw and
+  # noise-averaged (validation), raw (stress)...
+  for tag in (
+    "ValidationTeacher/mean_episode_return_osl",
+    "ValidationTeacherExpected/mean_episode_return_human",
+    "StressTeacher/survival_rate",
+    "Perf/zero_shot_validation_time",
+    "Perf/zero_shot_stress_time",
+  ):
+    assert set(logged[tag]) == {steps[0]}, tag
+  # ...and the stress families of the OSL actor at its interval only (k = 1): the
+  # fresh actor at zero-shot would fail at the floor.
+  for tag in (
+    "Stress/survival_rate",
+    "Stress/mean_first_episode_return_osl",
+    "StressOslSampled/survival_rate",
+    "Perf/validation_time",
+    "Perf/stress_time",
+  ):
+    assert set(logged[tag]) == {steps[1]}, tag
+  tags = _tags(log_dir)
+  assert not any(tag.startswith("ValidationExpected/") for tag in tags)
+  assert not any(tag.startswith("ValidationOslSampled/") for tag in tags)
+  for tag in ("Policy/std/muscles", "Critic/osl/explained_variance"):
+    assert set(logged[tag]) == set(steps), tag
+  assert logged["Policy/std/osl_motors"][steps[0]] == pytest.approx(0.2)
+  # The blend: the teacher drives the OSL through k = 1, the actor from k = 2.
+  assert list(logged["Stage2/blend_beta"].values()) == [0.0, 0.0, 1.0]
 
-  # Saves at k = 0 and 2, each with the OSL actor's export.
-  for it in (steps[0], steps[2]):
-    assert (log_dir / f"model_{it}.pt").is_file()
-    assert (log_dir / "exported" / f"osl_policy_{it}.onnx").is_file()
-    assert (log_dir / "exported" / f"osl_policy_{it}.json").is_file()
-  assert not (log_dir / f"model_{steps[1]}.pt").exists()
+  # A save at k = 2 only (k = 0, the launch's first iteration, is skipped), with
+  # the OSL actor's export.
+  it = steps[2]
+  assert (log_dir / f"model_{it}.pt").is_file()
+  assert (log_dir / "exported" / f"osl_policy_{it}.onnx").is_file()
+  assert (log_dir / "exported" / f"osl_policy_{it}.json").is_file()
+  for it in steps[:2]:
+    assert not (log_dir / f"model_{it}.pt").exists()
   meta = json.loads((log_dir / "exported" / f"osl_policy_{steps[2]}.json").read_text())
   assert meta["lineage"] == runner.lineage
 
@@ -907,9 +999,9 @@ def test_warm_start_refusals_and_reward_switch(tmp_path: Path) -> None:
 
 
 def _quick_cfg(warm_start: Path | None) -> dict[str, Any]:
-  """:func:`_train_cfg` without validation or ONNX exports."""
+  """:func:`_train_cfg` without validation, stress validation or ONNX exports."""
   cfg = _train_cfg(warm_start)
-  cfg["validation"]["interval"] = 0
+  cfg["validation"].update(interval=0, stress_interval=0)
   cfg["export_osl_onnx"] = False
   return cfg
 
@@ -972,7 +1064,8 @@ def test_resume_keeps_the_checkpoint_curriculum(
   cfg = _quick_cfg(ws_path)
   cfg["algorithm"].update(
     schedule_iterations=10,
-    critic_lr=3e-4,
+    human_critic_lr=2e-4,
+    osl_critic_lr=5e-4,
     human_actor_peak_lr=2e-4,
     human_actor_ramp_iterations=1,
   )
@@ -991,7 +1084,7 @@ def test_resume_keeps_the_checkpoint_curriculum(
   assert split["additive_term_weights"] == {"twist": list(TWIST_SPLIT)}
 
   # Resumed with the task's own curriculum: a 200-iteration freeze, the channels'
-  # anneal from there, default rates and the twist counted fully in both agents.
+  # anneal from iteration 10, default rates and the twist counted fully in both.
   stock = asdict(osl_split_runner_cfg("msk", "compliant", "clf", "test"))
   resumed_cfg = _quick_cfg(None)
   for key in ("freeze", "channels"):
@@ -1008,11 +1101,13 @@ def test_resume_keeps_the_checkpoint_curriculum(
   for name in (
     "schedule.human_freeze: checkpoint 2, config 200",
     "schedule.critic_warmup: checkpoint 1, config 10",
-    "schedule.critic_lr",
+    "schedule.critic_ramp: checkpoint 1, config 10",
+    "schedule.human_critic_lr",
+    "schedule.osl_critic_lr",
     "schedule.human_peak_lr",
     "schedule.human_ramp",
-    "channel_schedule.anneal_start: checkpoint 0, config 200",
-    "channel_schedule.anneal_iterations: checkpoint 2, config 200",
+    "channel_schedule.anneal_start: checkpoint 0, config 10",
+    "channel_schedule.anneal_iterations: checkpoint 2, config 150",
     "additive_term_weights.twist",
   ):
     assert name in out, name
@@ -1124,6 +1219,429 @@ def test_validation_env_follows_the_training_env(
   # The training env's config is left as it was.
   assert train.observations["osl"] == osl_observation_group("train", osl_obs)
 
+  # Every command-line setting of the run reaches validation: the simulation,
+  # every shared reward term's weight and params, and the OSL lag (the middle of
+  # the training range).
+  train = osl_split_env_cfg("msk", "compliant", "clf", "train")
+  train.sim.mujoco.iterations = 7
+  train.rewards["twist"].weight = 0.35
+  train.rewards["twist"].params["std"] = 0.2
+  for name in ("actpack", "loadcell"):
+    train.observations["osl"].terms[name].delay_max_lag = 4
+  cfg = validation_cfg(train)
+  assert cfg.sim.mujoco.iterations == 7
+  assert cfg.rewards["twist"].weight == 0.35
+  assert cfg.rewards["twist"].params["std"] == 0.2
+  for name in ("actpack", "loadcell"):
+    term = cfg.observations["osl"].terms[name]
+    assert (term.delay_min_lag, term.delay_max_lag) == (2, 2)
+    assert not term.params["randomize"]
+  # Validation keeps its own mode: terminations and commands.
+  assert "root_deviation" not in cfg.terminations
+  assert not cfg.observations["actor"].enable_corruption
+
+  # Stress validation plays a copy of the training config: the OSL sensor noise
+  # and every randomization stay. Only the run's seed goes: an env built with one
+  # re-seeds every generator, so the stress seed would not set its draws.
+  train.seed = 7
+  stress = runner._eval_env_cfg("stress")
+  assert stress.seed is None and train.seed == 7
+  assert replace(stress, seed=7) == train and stress is not train
+  assert stress.observations["osl"].terms["actpack"].params["randomize"]
+  assert stress.observations["osl"].terms["actpack"].delay_max_lag == 4
+
+
+def test_evaluations_are_guarded_and_timed(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """A failing evaluation (here every validation and stress pass, as an
+  out-of-memory error would) prints a warning and training goes on; each
+  evaluation's wall time is logged."""
+  ws_path = tmp_path / "ws.pt"
+  _write_warm_start(ws_path)
+  cfg = _train_cfg(ws_path)
+  cfg["validation"].update(stress_interval=2)
+  log_dir = tmp_path / "run"
+  runner = _Runner(cast(Any, _FakeEnv()), cfg, str(log_dir), "cpu")
+
+  def fail(it: int, zero_shot: bool = False) -> dict[str, float]:
+    raise RuntimeError("CUDA out of memory")
+
+  runner.validate = fail  # type: ignore[method-assign]
+  runner.stress_validate = fail  # type: ignore[method-assign]
+
+  # As on a GPU: the memory is logged every iteration, and once more after the
+  # last save and video.
+  def memory() -> dict[str, float]:
+    return {"Perf/gpu_max_allocated_gib": 1.5}
+
+  runner._gpu_memory = memory  # type: ignore[method-assign]
+  capsys.readouterr()
+  runner.learn(ITERATIONS)
+  out = capsys.readouterr().out
+  steps = [STAGE_START + k for k in range(ITERATIONS)]
+  for name, it in (
+    ("zero_shot_validation", steps[0]),
+    ("zero_shot_stress", steps[0]),
+    ("validation", steps[1]),
+    ("stress", steps[1]),
+  ):
+    assert f"[WARN] {name} at it={it} failed (training continues)" in out, name
+  assert (log_dir / f"model_{steps[-1]}.pt").is_file()  # Training finished.
+  logged = _scalars(
+    log_dir,
+    "Perf/zero_shot_validation_time",
+    "Perf/zero_shot_stress_time",
+    "Perf/validation_time",
+    "Perf/stress_time",
+    "Perf/video_time",
+  )
+  assert set(logged["Perf/zero_shot_validation_time"]) == {steps[0]}
+  assert set(logged["Perf/validation_time"]) == set(logged["Perf/stress_time"])
+  assert set(logged["Perf/stress_time"]) == {steps[1]}
+  assert set(logged["Perf/video_time"]) == {steps[2]}  # The k = 2 save.
+  events = EventAccumulator(str(log_dir), size_guidance={"scalars": 0})
+  events.Reload()
+  memory_steps = [e.step for e in events.Scalars("Perf/gpu_max_allocated_gib")]
+  assert memory_steps == [*steps, steps[-1]]
+  # CPU: no GPU memory to log.
+  assert SplitOnPolicyRunner._gpu_memory(runner) == {}
+
+
+def test_video_plays_the_human_action_by_its_std(tmp_path: Path) -> None:
+  """``video.inference`` "auto" is stage 1's rule on the human's muscle std: the
+  noise-averaged action above a median of 0.3, the raw mean at the recipe's 0.07;
+  the OSL actor plays its mean. Other modes are refused at construction."""
+  ws_path = tmp_path / "ws.pt"
+  _write_warm_start(ws_path)  # A random human std around 1.
+  runner = _Runner(cast(Any, _FakeEnv()), _quick_cfg(ws_path), None, "cpu")
+  env = cast(Any, _FakeEnv())
+  assert runner._video_inference(env) == "expected"
+  with torch.no_grad():
+    std_parameter(runner.alg.human_actor).fill_(math.log(0.07))
+  assert runner._video_inference(env) == "mean"
+  with runner._video_policy(env) as policy:
+    assert isinstance(policy, SplitInferencePolicy)
+    assert (policy.human_mode, policy.osl_mode) == ("mean", "mean")
+  runner.video_cfg["inference"] = "expected"
+  assert runner._video_inference(env) == "expected"
+  cfg = _quick_cfg(ws_path)
+  cfg["video"]["inference"] = "sampled"
+  with pytest.raises(ValueError, match="video.inference"):
+    _Runner(cast(Any, _FakeEnv()), cfg, None, "cpu")
+
+
+def test_stress_pass_counts_each_env_first_episode() -> None:
+  """Env 1 terminates at step 2 and env 2 is truncated at step 3 (both then
+  auto-reset and keep running); envs 0 and 3 survive the whole window. Each agent's
+  first-episode return sums its reward over the env's first episode only."""
+  n, num_steps = 4, 5
+  runner = SplitOnPolicyRunner.__new__(SplitOnPolicyRunner)
+  runner.validation_cfg = {"stress_num_steps": num_steps}
+  runner.device = "cpu"
+  step_count = 0
+  term = SimpleNamespace(components={"err_site_abs": torch.zeros(n)})
+
+  class Rewards:
+    def __init__(self) -> None:
+      self.term = term
+
+    def __call__(self) -> torch.Tensor:  # Human 1, OSL 2 per step.
+      return torch.tensor([[1.0, 2.0]]).expand(n, -1)
+
+  def reset() -> tuple[TensorDict, dict]:
+    return TensorDict({"actor": torch.zeros(n, 1)}, batch_size=[n]), {}
+
+  def step(actions: torch.Tensor):
+    nonlocal step_count
+    step_count += 1
+    dones, time_outs = torch.zeros(n), torch.zeros(n)
+    if step_count == 2:
+      dones[1] = 1.0
+    if step_count == 3:
+      dones[2] = time_outs[2] = 1.0
+    if step_count == 4:  # Second episodes count for nothing.
+      dones[1] = dones[2] = 1.0
+    term.components["err_site_abs"] = torch.arange(n, dtype=torch.float32)
+    # The hardest strike of a first episode is env 3's; env 1's is in its second.
+    force = torch.zeros(n)
+    force[1] = 500.0 if step_count == 4 else 0.0
+    force[3] = 80.0 if step_count == 5 else 0.0
+    term.components["split_leg_contact_force"] = force
+    obs = TensorDict({"actor": torch.zeros(n, 1)}, batch_size=[n])
+    return obs, torch.full((n,), 0.5), dones, {"time_outs": time_outs}
+
+  mimic = SimpleNamespace(func=term)
+  manager = SimpleNamespace(active_terms=["mimic"], get_term_cfg=lambda name: mimic)
+  env = SimpleNamespace(num_envs=n, device="cpu", step_dt=0.01, reward_manager=manager)
+  vec = SimpleNamespace(unwrapped=env, device="cpu", reset=reset, step=step)
+
+  def policy(obs: TensorDict) -> torch.Tensor:
+    return torch.zeros(n, HUMAN_DIM + 2)
+
+  metrics = runner._split_stress_pass(
+    cast(Any, vec), cast(Any, policy), cast(Any, Rewards())
+  )
+  assert metrics["survival_rate"] == pytest.approx(3 / 4)
+  lengths = torch.tensor([5.0, 2.0, 3.0, 5.0])  # First-episode lengths.
+  assert metrics["mean_first_episode_s"] == pytest.approx(float(lengths.mean()) * 0.01)
+  assert metrics["mean_first_episode_return"] == pytest.approx(0.5 * 15 / 4)
+  assert metrics["mean_first_episode_return_human"] == pytest.approx(15 / 4)
+  assert metrics["mean_first_episode_return_osl"] == pytest.approx(2.0 * 15 / 4)
+  assert metrics["err_site_abs"] == pytest.approx((1.5 * 2 + 5 / 3 + 1.5 * 2) / 5)
+  assert metrics["split_leg_contact_force_peak"] == 80.0
+
+
+def test_validation_pass_group_means_and_peaks() -> None:
+  """The per-group diagnostics are each group's mean over its envs at every step
+  (weighted sums, no boolean indexing), and the leg-contact force's peak is the
+  largest over every env and step."""
+  n, num_steps = 6, 3
+  runner = SplitOnPolicyRunner.__new__(SplitOnPolicyRunner)
+  runner.validation_cfg = {"num_steps": num_steps}
+  runner.device = "cpu"
+  masks = {
+    "left": torch.tensor([True, True, False, False, False, False]),
+    "right": torch.tensor([False, False, True, False, False, True]),
+  }
+  runner._validation_groups = lambda env: masks
+  values = torch.arange(num_steps * n, dtype=torch.float32).reshape(num_steps, n)
+  forces = torch.zeros(num_steps, n)
+  forces[1, 4] = 250.0
+  term = SimpleNamespace(components={})
+  step_count = 0
+
+  class Rewards:
+    def __init__(self) -> None:
+      self.term = term
+
+    def __call__(self) -> torch.Tensor:
+      return torch.ones(n, 2)
+
+  def reset() -> tuple[TensorDict, dict]:
+    return TensorDict({"actor": torch.zeros(n, 1)}, batch_size=[n]), {}
+
+  def step(actions: torch.Tensor):
+    nonlocal step_count
+    term.components = {
+      "err_site_abs": values[step_count],
+      "split_leg_contact_force": forces[step_count],
+    }
+    step_count += 1
+    obs = TensorDict({"actor": torch.zeros(n, 1)}, batch_size=[n])
+    return obs, torch.ones(n), torch.zeros(n), {"time_outs": torch.zeros(n)}
+
+  mimic = SimpleNamespace(func=term)
+  manager = SimpleNamespace(active_terms=["mimic"], get_term_cfg=lambda name: mimic)
+  env = SimpleNamespace(num_envs=n, device="cpu", reward_manager=manager)
+  vec = SimpleNamespace(unwrapped=env, device="cpu", reset=reset, step=step)
+
+  def policy(obs: TensorDict) -> torch.Tensor:
+    return torch.zeros(n, HUMAN_DIM + 2)
+
+  metrics = runner._validation_pass(
+    cast(Any, vec), cast(Any, policy), cast(Any, Rewards())
+  )
+  for group, mask in masks.items():
+    expected = float(values[:, mask].mean(dim=1).mean())
+    assert metrics[f"err_site_abs/{group}"] == pytest.approx(expected), group
+  assert metrics["err_site_abs"] == pytest.approx(float(values.mean()))
+  assert metrics["split_leg_contact_force_peak"] == 250.0
+  assert metrics["split_leg_contact_force"] == pytest.approx(250.0 / (n * num_steps))
+
+
+def test_zero_shot_families() -> None:
+  """The families each evaluation plays: at zero-shot the fresh OSL actor's raw
+  mean and the teacher's (raw and noise-averaged in validation, raw in stress);
+  then the configured ones. The teacher's are refused anywhere else."""
+  runner = SplitOnPolicyRunner.__new__(SplitOnPolicyRunner)
+  defaults = asdict(osl_split_runner_cfg("msk", "compliant", "clf", "test"))
+  runner.validation_cfg = defaults["validation"]
+  assert runner._families("validation", zero_shot=True) == [
+    "mean",
+    "teacher",
+    "teacher_expected",
+  ]
+  assert runner._families("stress", zero_shot=True) == ["teacher"]
+  assert runner._families("validation", zero_shot=False) == ["mean"]
+  assert runner._families("stress", zero_shot=False) == ["mean", "osl_sampled"]
+  runner.validation_cfg = {**defaults["validation"], "teacher": False}
+  assert runner._families("stress", zero_shot=True) == []
+  assert runner._families("validation", zero_shot=True) == ["mean"]
+  for setting in ("zero_shot_stress_inference", "inference"):
+    cfg = _quick_cfg(None)
+    cfg["validation"][setting] = ("teacher_expected",)
+    with pytest.raises(ValueError, match="zero-shot only"):
+      _Runner(cast(Any, _FakeEnv()), cfg, None, "cpu")
+
+
+def test_validation_groups_by_turn_direction() -> None:
+  """Stage 1's families plus the tight arcs and pivots by direction; env ``i``
+  plays clip ``i % num_clips``."""
+  twists = torch.tensor(
+    [
+      [0.0, 0.0, 0.0],  # idle
+      [0.5, 0.0, 0.8],  # tight left arc
+      [0.5, 0.0, -0.8],  # tight right arc
+      [0.5, 0.0, 0.3],  # gentle arc
+      [0.0, 0.0, 0.5],  # left pivot
+      [0.0, 0.0, -0.5],  # right pivot
+      [-0.5, 0.0, 0.8],  # backward arc
+    ]
+  )
+  from mjlab.tasks.osl_gait_library.mdp import clip_group
+
+  cmd = SimpleNamespace(
+    clip_groups=[clip_group(t.numpy()) for t in twists],
+    num_clips=len(twists),
+    twists=twists,
+  )
+  env = SimpleNamespace(
+    num_envs=9, device="cpu", command_manager=SimpleNamespace(get_term=lambda n: cmd)
+  )
+  runner = SplitOnPolicyRunner.__new__(SplitOnPolicyRunner)
+  groups = {
+    name: mask.nonzero().squeeze(-1).tolist()
+    for name, mask in runner._validation_groups(cast(Any, env)).items()
+  }
+  assert groups["fwd_tight"] == [1, 2, 8] and groups["turn"] == [4, 5]
+  assert groups["fwd_tight_left"] == [1, 8] and groups["fwd_tight_right"] == [2]
+  assert groups["turn_left"] == [4] and groups["turn_right"] == [5]
+  assert groups["fwd"] == [3] and groups["bck"] == [6]
+
+
+def test_resume_takes_the_config_curriculum(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """--agent.resume-curriculum config: the resumed run trains on the command line's
+  curriculum, here a longer schedule and other rates, and says what changed."""
+  ws_path = tmp_path / "ws.pt"
+  _write_warm_start(ws_path)
+  cfg = _quick_cfg(ws_path)
+  cfg["algorithm"]["schedule_iterations"] = ITERATIONS
+  runner = _Runner(cast(Any, _FakeEnv()), cfg, str(tmp_path / "run"), "cpu")
+  runner.learn(ITERATIONS)
+  checkpoint = tmp_path / "run" / f"model_{STAGE_START + ITERATIONS - 1}.pt"
+  k = ITERATIONS  # Past the first run's schedule: its rates sit at their floors.
+  assert runner.schedule.lr("osl_actor", k) == pytest.approx(0.1 * 4e-4)
+
+  resumed_cfg = _quick_cfg(None)
+  resumed_cfg["resume_curriculum"] = "config"
+  resumed_cfg["algorithm"].update(schedule_iterations=20, osl_actor_lr=2e-4)
+  resumed_cfg["channels"]["anneal_iterations"] = 5
+  resumed = _Runner(cast(Any, _FakeEnv(seed=1)), resumed_cfg, None, "cpu")
+  capsys.readouterr()
+  resumed.load(str(checkpoint))
+  out = capsys.readouterr().out
+  assert "takes the config's curriculum" in out
+  assert "schedule.total_iterations: checkpoint 3, config 20" in out
+  assert "schedule.osl_actor_lr: checkpoint 0.0004, config 0.0002" in out
+  assert "channel_schedule.anneal_iterations: checkpoint 2, config 5" in out
+  assert f"osl_actor rate at k={k}: 4e-05 -> " in out
+  assert resumed.schedule_iterations == 20
+  assert resumed.channel_schedule.anneal_iterations == 5
+  assert resumed.schedule.lr("osl_actor", k) == pytest.approx(
+    2e-4 * (0.1 + 0.9 * (1.0 - k / 20))
+  )
+  resumed.learn(1)
+  assert resumed.alg.lrs["osl_actor"] == resumed.schedule.lr("osl_actor", k)
+
+  # A config that freezes the human again is applied, with a warning.
+  refrozen_cfg = _quick_cfg(None)
+  refrozen_cfg["resume_curriculum"] = "config"
+  refrozen_cfg["freeze"]["human_actor_iterations"] = 50
+  refrozen = _Runner(cast(Any, _FakeEnv(seed=2)), refrozen_cfg, None, "cpu")
+  capsys.readouterr()
+  refrozen.load(str(checkpoint))
+  assert "freezes the human actor again at k=3" in capsys.readouterr().out
+  assert refrozen.alg.human_actor_frozen
+
+
+def _provenance_lineage(**changes: Any) -> dict[str, Any]:
+  lineage = {
+    **_lineage(),
+    "human_std": {"min": 0.07, "median": 0.07, "max": 0.07},
+    "stage1_lr": 3e-5,
+    "stage1_std_cap": 0.07,
+    "stage1_env": {
+      "clf_pen_w": 0.0,
+      "twist_weight": 0.2,
+      "root_deviation": 2.0,
+      "env_stages_in_force": {},
+    },
+    "stage1_planned_last_iteration": STAGE1_ITER,
+    "library_release": {"release": "unicycle_v001", "sha256": "0" * 64},
+  }
+  lineage.update(changes)
+  return lineage
+
+
+def test_warm_start_provenance(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """Stage 1's recorded end state against stage 2's settings: another CLF penalty
+  weight is refused unless allowed; other env settings, another library, a large
+  human std, an unfinished run and a human rate above stage 1's last are
+  reported."""
+  library = tmp_path / "unicycle_v001"
+  library.mkdir()
+  (library / "library.json").write_text('{"release": "unicycle_v001"}')
+  digest = library_release(library)
+  assert digest is not None and digest["sha256"] is not None
+  ws = _write_warm_start(tmp_path / "ws.pt")
+  train = osl_split_env_cfg("msk", "compliant", "clf", "train")
+  motion = train.commands["motion"]
+  assert isinstance(motion, GaitLibraryCommandCfg)
+  motion.library_dir = str(library)
+
+  def runner(allow: bool = False) -> _Runner:
+    env = _FakeEnv()
+    env.cfg = train  # The real training config, for its env settings.
+    cfg = _quick_cfg(None)
+    cfg["warm_start"]["allow_pen_w_mismatch"] = allow
+    return _Runner(cast(Any, env), cfg, None, "cpu")
+
+  # A matching warm start reports its end state and the same library release.
+  capsys.readouterr()
+  runner().warm_start(replace(ws, lineage=_provenance_lineage(library_release=digest)))
+  out = capsys.readouterr().out
+  assert "stage 1 at its end: learning rate 3e-05, std cap 0.07" in out
+  assert "same library release unicycle_v001" in out
+  assert "[WARN]" not in out
+
+  lineage = _provenance_lineage(
+    stage1_env={
+      "clf_pen_w": 0.25,
+      "twist_weight": 0.06,
+      "root_deviation": 1.0,
+      "env_stages_in_force": {"rewards.twist.weight": 0.06},
+    },
+    stage1_lr=1e-5,
+    human_std={"min": 0.5, "median": 0.8, "max": 1.0},
+    stage1_planned_last_iteration=STAGE1_ITER + 100,
+  )
+  with pytest.raises(ValueError, match="pen_w 0.25; stage 2's is 0"):
+    runner().warm_start(replace(ws, lineage=lineage))
+  capsys.readouterr()
+  allowed = runner(allow=True)
+  allowed.warm_start(replace(ws, lineage=lineage))
+  out = capsys.readouterr().out
+  assert allowed._ready
+  for text in (
+    "Allowed (warm_start.allow_pen_w_mismatch)",
+    "twist weight 0.06; stage 2 uses 0.2",
+    "root-deviation limit 1; stage 2 uses 2",
+    "unicycle_v001, but their library.json differ",  # Same name, other bytes.
+    "The human's peak rate 3e-05 exceeds stage 1's last rate 1e-05",
+    "median std is 0.8",
+    f"set to end at {STAGE1_ITER + 100}",
+  ):
+    assert text in out, text
+  # A reward switch starts the critics fresh: another pen_w is only reported.
+  capsys.readouterr()
+  runner().warm_start(replace(ws, lineage={**lineage, "reward": "mimic"}))
+  assert "The reward switches" in capsys.readouterr().out
+
 
 ##
 # GPU smoke test (slow; needs a library and a stage-1 run).
@@ -1140,8 +1658,9 @@ STAGE1_RUN_ENV_VAR = "MJLAB_OSL_SPLIT_STAGE1_RUN"
   "checkpoint or converted warm start) to run the stage-2 smoke test.",
 )
 def test_stage2_smoke_on_gpu(tmp_path: Path) -> None:
-  """Two stage-2 iterations of the real task: warm start, the zero-shot and a
-  regular validation, checkpoints with their exports, then play's load."""
+  """Two stage-2 iterations of the real task: warm start, the zero-shot and regular
+  validations and stress validations (the teacher included), checkpoints with
+  their exports, then play's load."""
   if not torch.cuda.is_available():
     pytest.skip("Needs a GPU.")
   device = "cuda:0"
@@ -1170,10 +1689,16 @@ def test_stage2_smoke_on_gpu(tmp_path: Path) -> None:
   agent.upload_model = False
   agent.freeze.human_actor_iterations = 1
   agent.freeze.critic_warmup_iterations = 0
+  agent.blend.ramp_iterations = 1
   agent.validation.interval = 1
   agent.validation.num_envs = 4
   agent.validation.num_steps = 20
+  agent.validation.stress_interval = 1
+  agent.validation.stress_num_envs = 4
+  agent.validation.stress_num_steps = 20
   agent.warm_start.path = str(ws_path)
+  # Any stage-1 run will do for plumbing, whatever its CLF penalty weight.
+  agent.warm_start.allow_pen_w_mismatch = True
 
   env = make_env(play=False, num_envs=8)
   log_dir = tmp_path / "run"
@@ -1181,16 +1706,32 @@ def test_stage2_smoke_on_gpu(tmp_path: Path) -> None:
   runner.learn(agent.max_iterations)
   runner.close()
   start = int(lineage["iter"]) + 1
-  for it in (start, start + 1):
-    assert (log_dir / f"model_{it}.pt").is_file()
-    assert (log_dir / "exported" / f"osl_policy_{it}.onnx").is_file()
+  # No checkpoint at the launch's first iteration; the second is the last.
+  assert not (log_dir / f"model_{start}.pt").exists()
+  assert (log_dir / f"model_{start + 1}.pt").is_file()
+  assert (log_dir / "exported" / f"osl_policy_{start + 1}.onnx").is_file()
   # Logged at every validation (the episode length only once one finishes).
-  tags = (
+  logged = _scalars(
+    log_dir,
     "Validation/early_termination_rate",
-    "ValidationExpected/early_termination_rate",
+    "Stress/survival_rate",
+    "StressOslSampled/survival_rate",
+    "ValidationTeacher/early_termination_rate",
+    "ValidationTeacherExpected/early_termination_rate",
+    "StressTeacher/survival_rate",
   )
-  for steps in _scalars(log_dir, *tags).values():
-    assert set(steps) == {start, start + 1}  # Zero-shot and k = 0, then k = 1.
+  for tag in (
+    "Validation/early_termination_rate",  # Zero-shot and k = 0, then k = 1.
+    "Stress/survival_rate",  # k = 0, then k = 1.
+    "StressOslSampled/survival_rate",
+  ):
+    assert set(logged[tag]) == {start, start + 1}, tag
+  for tag in (
+    "ValidationTeacher/early_termination_rate",
+    "ValidationTeacherExpected/early_termination_rate",
+    "StressTeacher/survival_rate",
+  ):
+    assert set(logged[tag]) == {start}, tag  # Zero-shot only.
   env.close()
 
   play_env = make_env(play=True, num_envs=2)
