@@ -65,6 +65,7 @@ from .config.env_cfgs import Variant, osl_gait_library_env_cfg
 from .mdp import GaitLibraryCommand, GaitLibraryCommandCfg
 
 if TYPE_CHECKING:
+  from mjlab.envs import ManagerBasedRlEnvCfg
   from mjlab.envs.mdp.actions.actions import BaseAction
 
 ACTOR_CLASS = "mjlab.tasks.osl_mimic.rl.models:MuscleMimicMLPModel"
@@ -276,8 +277,6 @@ def build_components(
       checkout differs from the run's in a setting the policy depends on, or the
       library folder is missing.
   """
-  from mjlab.scene import Scene
-
   checkpoint = Path(checkpoint).resolve()
   params = checkpoint.parent / "params"
   agent, saved = read_config(params / "agent.yaml"), read_config(params / "env.yaml")
@@ -285,6 +284,35 @@ def build_components(
   cfg = osl_gait_library_env_cfg(
     spec.model, spec.socket, spec.reward, "train", spec.variant
   )
+  check_actor_config(cfg, saved)
+  env, command, actions, solver = compile_task(
+    cfg, saved, library, solver_iterations, ls_solver_iterations
+  )
+  command_cfg = command.cfg
+  actor = cfg.observations["actor"]
+  parts = PolicyParts(
+    model=env.sim.mj_model,
+    joint_names=list(env.scene["robot"].joint_names),
+    obs_terms=list(actor.terms),
+    obs_term_cfgs=dict(actor.terms),
+    actions=actions,
+    site_bodies=list(command_cfg.site_bodies),
+    lookahead_steps=int(command_cfg.lookahead_steps),
+    decimation=int(cfg.decimation),
+    step_dt=float(env.step_dt),
+    entity_cfg=cfg.scene.entities["robot"],
+    obs_group_history=actor.history_length,
+  )
+  return Components(spec, cfg, env, command, parts, solver)
+
+
+def check_actor_config(cfg: Any, saved: dict[str, Any]) -> None:
+  """Refuse a run whose actor input is processed, or whose config rebuilt from
+  this checkout differs from its ``env.yaml`` (:func:`config_mismatches`).
+
+  Raises:
+    ValueError: On either.
+  """
   saved_actor = saved["observations"]["actor"]
   processed = unsupported_processing(
     saved_actor["terms"], saved_actor.get("history_length")
@@ -297,6 +325,27 @@ def build_components(
       "The task rebuilt from this checkout differs from the run in: "
       + ", ".join(issues)
     )
+
+
+def compile_task(
+  cfg: ManagerBasedRlEnvCfg,
+  saved: dict[str, Any],
+  library: str | Path | None = None,
+  solver_iterations: int | None = None,
+  ls_solver_iterations: int | None = None,
+) -> tuple[SimpleNamespace, GaitLibraryCommand, dict[str, BaseAction], dict]:
+  """Compile a gait-library task config on CPU: the run's reference settings and
+  library, the deployment solver caps, the scene, the command and the actions.
+
+  ``cfg`` is edited in place (its command settings and solver caps). Returns the
+  CPU env namespace, the command, the action terms in action-manager order and
+  the solver caps (``training`` and ``deployment``).
+
+  Raises:
+    ValueError: If the run's command cannot be reproduced, the library folder is
+      missing or a solver cap is not positive.
+  """
+  from mjlab.scene import Scene
 
   command_cfg = cfg.commands["motion"]
   assert isinstance(command_cfg, GaitLibraryCommandCfg)
@@ -353,51 +402,58 @@ def build_components(
     name: cast("BaseAction", action.build(env))  # type: ignore[arg-type]
     for name, action in cfg.actions.items()
   }
-  actor = cfg.observations["actor"]
-  parts = PolicyParts(
-    model=model,
-    joint_names=list(scene["robot"].joint_names),
-    obs_terms=list(actor.terms),
-    obs_term_cfgs=dict(actor.terms),
-    actions=actions,
-    site_bodies=list(command_cfg.site_bodies),
-    lookahead_steps=int(command_cfg.lookahead_steps),
-    decimation=int(cfg.decimation),
-    step_dt=float(env.step_dt),
-    entity_cfg=cfg.scene.entities["robot"],
-    obs_group_history=actor.history_length,
-  )
-  return Components(spec, cfg, env, command, parts, solver)
+  return env, command, actions, solver
 
 
 def load_actor(checkpoint: str | Path, action_dim: int) -> torch.nn.Module:
   """The checkpoint's actor, loaded strictly, normalizer frozen, in eval mode."""
-  from tensordict import TensorDict
-
-  from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
-
   checkpoint = Path(checkpoint)
   agent = read_config(checkpoint.parent / "params" / "agent.yaml")
-  actor_cfg = dict(agent["actor"])
-  if actor_cfg.pop("class_name") != ACTOR_CLASS:
-    raise ValueError(f"Unsupported actor model; expected {ACTOR_CLASS}.")
   if agent.get("clip_actions") is not None:
     raise ValueError("Wrapper action clipping is outside the bundle schema.")
   if list(agent["obs_groups"]["actor"]) != ["actor"]:
     raise ValueError("The actor must read the 'actor' observation group alone.")
+  payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+  return build_actor(agent["actor"], payload["actor_state_dict"], "actor", action_dim)
+
+
+def build_actor(
+  model_cfg: dict[str, Any],
+  state: dict[str, torch.Tensor],
+  obs_group: str,
+  action_dim: int,
+) -> torch.nn.Module:
+  """A :data:`ACTOR_CLASS` actor from its saved model config and state dict,
+  loaded strictly, normalizer frozen, in eval mode.
+
+  Args:
+    model_cfg: The actor's section of ``params/agent.yaml``.
+    state: Its state dict from the checkpoint.
+    obs_group: The observation group it reads (its input width comes from the
+      state's normalizer).
+    action_dim: Its output width.
+
+  Raises:
+    ValueError: For another model class, or a convolutional or recurrent actor.
+  """
+  from tensordict import TensorDict
+
+  from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
+
+  actor_cfg = dict(model_cfg)
+  if actor_cfg.pop("class_name") != ACTOR_CLASS:
+    raise ValueError(f"Unsupported actor model; expected {ACTOR_CLASS}.")
   for key in ("cnn_cfg", "rnn_type"):
     if actor_cfg.pop(key, None) is not None:
       raise ValueError("The bundle schema supports feed-forward actors only.")
   for key in ("rnn_hidden_dim", "rnn_num_layers"):
     actor_cfg.pop(key, None)
-  payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-  state = payload["actor_state_dict"]
   obs_dim = int(state["obs_normalizer.mean"].numel())
   # Shapes on the meta device: an orthogonal init of 25M weights costs seconds.
   with torch.device("meta"):
-    obs = TensorDict({"actor": torch.zeros(1, obs_dim)}, batch_size=[1])
+    obs = TensorDict({obs_group: torch.zeros(1, obs_dim)}, batch_size=[1])
     actor = MuscleMimicMLPModel(
-      obs, {"actor": ["actor"]}, "actor", action_dim, **actor_cfg
+      obs, {"actor": [obs_group]}, "actor", action_dim, **actor_cfg
     )
   actor.load_state_dict(state, strict=True, assign=True)
   actor.set_norm_mode("frozen")
@@ -427,11 +483,16 @@ def _git(root: Path, *args: str) -> str | None:
     return None
 
 
-def _provenance(checkpoint: Path, library: Path, iteration: int | None) -> dict:
+def _provenance(
+  checkpoint: Path,
+  library: Path,
+  iteration: int | None,
+  source_folders: tuple[str, ...] = SOURCE_FOLDERS,
+) -> dict:
   import mjlab
 
   root = Path(mjlab.__file__).resolve().parent
-  status = _git(root, "status", "--porcelain", "--", *SOURCE_FOLDERS)
+  status = _git(root, "status", "--porcelain", "--", *source_folders)
   return {
     "checkpoint": str(checkpoint),
     "checkpoint_sha256": sha256(checkpoint),
@@ -442,7 +503,7 @@ def _provenance(checkpoint: Path, library: Path, iteration: int | None) -> dict:
     "library": {p.name: sha256(p) for p in sorted(library.glob("*.npz"))},
     "training_sources": {
       str(p.relative_to(root)): sha256(p)
-      for folder in SOURCE_FOLDERS
+      for folder in source_folders
       for p in sorted((root / folder).rglob("*"))
       if p.is_file() and p.suffix in (".py", ".xml")
     },

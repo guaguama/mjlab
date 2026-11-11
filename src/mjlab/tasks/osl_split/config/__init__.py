@@ -26,6 +26,8 @@ both actors at their mean action, with the library in ``MJLAB_OSL_UNICYCLE_LIBRA
 
 Every checkpoint comes with the OSL actor alone, the deployable part, as
 ``exported/osl_policy_<N>.onnx`` plus its metadata ``.json``. ``uv run --no-sync
+python -m mjlab.tasks.osl_split.export <stage-2 run>/model_<N>.pt`` exports both
+actors as one osl_deploy bundle (:mod:`mjlab.tasks.osl_split.export`). ``uv run --no-sync
 python src/mjlab/tasks/osl_split/scripts/two_stage.py`` (a file, not ``-m``: see its
 docstring) runs stage 1, the conversion and stage 2 in sequence.
 """

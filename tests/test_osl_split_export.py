@@ -1,0 +1,308 @@
+"""Two-controller deployment export of stage-2 split runs (CPU only).
+
+A four-clip library is generated from the real model by forward kinematics, and a
+fake stage-2 run directory holds the task's own saved configs and two small
+actors, so ``export_bundle`` runs end to end on both models. The OSL observation
+conformance sequence is checked against a NumPy rebuild from the bundle's own
+files, the way a deployment consumer builds it.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from dataclasses import asdict
+from pathlib import Path
+
+import mujoco
+import numpy as np
+import onnxruntime as ort
+import pytest
+import torch
+import yaml
+from tensordict import TensorDict
+
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import get_spec
+from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
+from mjlab.tasks.osl_split import export as split_export
+from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
+from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
+from mjlab.utils.os import dump_yaml
+
+DT = 0.01
+HIDDEN = (16, 16)
+OSL_OBS = 600
+# (model, socket, reward) -> (human obs width, env action terms).
+CASES = {
+  ("robot", "rigid", "mimic"): (635, [["servos", 27], ["osl_motors", 2]]),
+  ("msk", "compliant", "clf"): (2338, [["osl_motors", 2], ["muscles", 339]]),
+}
+
+
+def _clip(model, data, frames, vel, wz):
+  """``frames`` of the start pose moving at world velocity ``vel`` and yaw rate
+  ``wz``, as clipper's mjlab format stores them."""
+  base = model.qpos0.copy()
+  pos, quat, joints = [], [], []
+  for t in range(frames):
+    q = base.copy()
+    q[:2] = np.asarray(vel[:2]) * t * DT
+    yaw = wz * t * DT
+    q[3:7] = [math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
+    data.qpos[:] = q
+    mujoco.mj_kinematics(model, data)
+    pos.append(data.xpos[1:].copy())
+    quat.append(data.xquat[1:].copy())
+    joints.append(q[7:].copy())
+  body_pos = np.stack(pos)
+  ang = np.zeros_like(body_pos)
+  ang[..., 2] = wz
+  return {
+    "joint_pos": np.stack(joints),
+    "joint_vel": np.zeros((frames, model.nq - 7)),
+    "body_pos_w": body_pos,
+    "body_quat_w": np.stack(quat),
+    "body_lin_vel_w": np.gradient(body_pos, DT, axis=0),
+    "body_ang_vel_w": ang,
+    "fps": np.array([1.0 / DT]),
+  }
+
+
+def _se2(x, y, yaw):
+  c, s = math.cos(yaw), math.sin(yaw)
+  return np.array([[c, -s, x], [s, c, y], [0.0, 0.0, 1.0]])
+
+
+@pytest.fixture(scope="module")
+def library(tmp_path_factory) -> Path:
+  folder = tmp_path_factory.mktemp("library")
+  model = get_spec("robot", "rigid").compile()
+  data = mujoco.MjData(model)
+  frames, v, wz = 50, 0.8, 0.6
+  # Forward is the root's body -y, which is world -y at zero yaw.
+  clips = {
+    "idle": ((0, 0, 0), (0.0, 0.0, 0.0), 0.0, _se2(0, 0, 0)),
+    "walk_fwd": ((0, -v, 0), (v, 0.0, 0.0), 0.0, _se2(0, -v * frames * DT, 0)),
+    "walk_bck": ((0, v, 0), (-v, 0.0, 0.0), 0.0, _se2(0, v * frames * DT, 0)),
+    "walk_turn": ((0, 0, 0), (0.0, 0.0, wz), wz, _se2(0, 0, wz * frames * DT)),
+  }
+  for name, (vel, twist, rate, stride) in clips.items():
+    clip = _clip(model, data, frames, vel, rate)
+    np.savez(folder / f"{name}.npz", twist=np.array(twist), stride_se2=stride, **clip)
+  return folder
+
+
+def _actor(group: str, obs_dim: int, action_dim: int, distribution: dict):
+  obs = TensorDict({group: torch.zeros(1, obs_dim)}, batch_size=[1])
+  actor = MuscleMimicMLPModel(
+    obs,
+    {"actor": [group]},
+    "actor",
+    action_dim,
+    hidden_dims=HIDDEN,
+    distribution_cfg=distribution,
+  )
+  actor.obs_normalizer.mean.uniform_(-1.0, 1.0)  # type: ignore[union-attr]
+  actor.obs_normalizer.var.uniform_(0.5, 2.0)  # type: ignore[union-attr]
+  return actor
+
+
+def _make_run(root: Path, case, library: Path) -> Path:
+  model, socket, reward = case
+  obs_dim, terms = CASES[case]
+  run = root / f"{model}_{socket}" / "run"
+  env_cfg = osl_split_env_cfg(model, socket, reward, "train")
+  env_cfg.commands["motion"].library_dir = str(library)  # type: ignore[attr-defined]
+  agent = osl_split_runner_cfg(model, socket, reward, "exp")
+  agent.actor.hidden_dims = HIDDEN
+  agent.osl_actor.hidden_dims = HIDDEN
+  dump_yaml(run / "params" / "env.yaml", asdict(env_cfg))
+  dump_yaml(run / "params" / "agent.yaml", asdict(agent))
+  torch.manual_seed(0)
+  human_dim = sum(int(dim) for name, dim in terms if name != "osl_motors")
+  human = _actor("actor", obs_dim, human_dim, dict(agent.actor.distribution_cfg or {}))
+  osl = _actor("osl", OSL_OBS, 2, dict(agent.osl_actor.distribution_cfg or {}))
+  lineage = {
+    "model": model,
+    "socket": socket,
+    "action_terms": terms,
+    "stage1_checkpoint": "/stage1/run/model_4.pt",
+  }
+  torch.save(
+    {
+      "human_actor_state_dict": human.state_dict(),
+      "osl_actor_state_dict": osl.state_dict(),
+      "iter": 7,
+      "stage_iteration": 2,
+      "infos": {"split": {"stage_start": 5, "lineage": lineage}},
+    },
+    run / "model_7.pt",
+  )
+  return run / "model_7.pt"
+
+
+@pytest.fixture(scope="module", params=list(CASES), ids=lambda c: "-".join(c))
+def exported(request, tmp_path_factory, library):
+  checkpoint = _make_run(tmp_path_factory.mktemp("runs"), request.param, library)
+  bundle = split_export.export_bundle(checkpoint)
+  manifest = json.loads((bundle / "manifest.json").read_text())
+  return request.param, checkpoint, bundle, manifest
+
+
+def test_bundle_contract(exported) -> None:
+  case, checkpoint, bundle, m = exported
+  obs_dim, terms = CASES[case]
+  assert bundle == checkpoint.parent / "deploy" / "model_7"
+  assert (m["schema_version"], m["kind"]) == (2, "osl_split_dual")
+  assert m["run"]["task"].startswith("Mjlab-Split-Unicycle-OSL-Fullbody")
+  assert m["composition"]["env_action_terms"] == terms
+  human, osl = m["controllers"]["human"], m["controllers"]["osl"]
+  assert human["observation"]["schema"] == "osl_mimic_gait_v1"
+  assert human["io"]["input_shape"] == [1, obs_dim]
+  assert osl["observation"]["schema"] == "osl_split_sensors_v1"
+  assert osl["io"]["input_shape"] == [1, OSL_OBS]
+  assert osl["observation"]["terms"] == ["actpack", "loadcell", "last_action"]
+  # Each controller's blocks start at 0 in its own output, and together they
+  # drive every actuator exactly once.
+  model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
+  ids = []
+  for name, section in m["controllers"].items():
+    blocks = section["action"]["blocks"]
+    assert blocks[0]["start"] == 0
+    assert [b["name"] for b in blocks] == (
+      ["osl_motors"] if name == "osl" else [t for t, _ in terms if t != "osl_motors"]
+    )
+    ids += [model.actuator(n).id for n in section["action"]["actuator_names"]]
+  assert sorted(ids) == list(range(model.nu))
+  assert osl["action"]["default_inference"] == "mean"
+  # Fixture std: MSK 3.0 (expected), robot 0.2 (mean).
+  assert human["action"]["default_inference"] == (
+    "expected" if case[0] == "msk" else "mean"
+  )
+  assert osl["training"]["actuator_delay"]["osl_motors"]["seconds"] == [0.0, 0.02]
+  buses = osl["observation"]["latency"]["buses"]
+  assert set(buses) == {"actpack", "loadcell"}
+  assert buses["actpack"] == {
+    "training_steps": [0, 2],
+    "held_per_episode": True,
+    "validation_steps": 1,
+  }
+  # The OSL sensors are compiled into the bundle's model.
+  for sensor in osl["observation"]["sensors"]["sensors"]:
+    assert model.sensor(sensor["scene_name"]).dim[0] == sensor["dim"]
+  for name, digest in m["files"].items():
+    assert hashlib.sha256((bundle / name).read_bytes()).hexdigest() == digest
+
+
+def test_onnx_parity_and_metadata(exported) -> None:
+  _, _, bundle, m = exported
+  parity = np.load(bundle / "parity.npz")
+  for name, section in m["controllers"].items():
+    session = ort.InferenceSession(
+      str(bundle / section["onnx"]), providers=["CPUExecutionProvider"]
+    )
+    io = section["io"]
+    assert session.get_inputs()[0].name == io["input"]
+    assert session.get_outputs()[0].shape == io["output_shape"]
+    out = np.stack(
+      [
+        np.asarray(session.run(None, {io["input"]: o[None]})[0])[0]
+        for o in parity[f"{name}_observations"]
+      ]
+    )
+    np.testing.assert_allclose(out, parity[f"{name}_means"], atol=1e-6)
+    meta = json.loads(session.get_modelmeta().custom_metadata_map["osl_policy"])
+    assert meta["controller"] == name and meta["kind"] == "osl_split_dual"
+
+
+def test_osl_conformance_matches_a_numpy_rebuild(exported) -> None:
+  """A consumer's OSL observation, from model.mjb and the manifest alone,
+  reproduces mjlab's own terms and buffers at every training latency."""
+  _, _, bundle, m = exported
+  model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
+  obs = m["controllers"]["osl"]["observation"]
+  sensors = {s["name"]: s for s in obs["sensors"]["sensors"]}
+  tare = obs["sensors"]["load_cell_tare"]["values"]
+  parity = np.load(bundle / "parity.npz")
+  c = {k: parity[f"osl_conformance_{k}"] for k in ("qpos", "qvel", "act", "ctrl")}
+  last = parity["osl_conformance_last_action"]
+  assert np.all(last[0] == 0.0) and np.abs(last).max() > 1.0
+
+  def read(data, name):
+    s = model.sensor(sensors[name]["scene_name"])
+    value = data.sensordata[s.adr[0] : s.adr[0] + s.dim[0]].copy()
+    if sensors[name]["saturation"] is not None:
+      value = np.clip(value, -sensors[name]["saturation"], sensors[name]["saturation"])
+    return value - np.asarray(tare.get(name, 0.0))
+
+  data = mujoco.MjData(model)
+  frames = []
+  for t in range(len(last)):
+    mujoco.mj_resetData(model, data)
+    data.qpos[:], data.qvel[:] = c["qpos"][t], c["qvel"][t]
+    data.act[:], data.ctrl[:] = c["act"][t], c["ctrl"][t]
+    mujoco.mj_forward(model, data)
+    frames.append(
+      {
+        term["name"]: np.clip(last[t], -1.0, 1.0)
+        if term["name"] == "last_action"
+        else np.concatenate([read(data, s) for s in term["sensors"]])
+        for term in obs["term_layout"]
+      }
+    )
+  flat = np.stack(
+    [np.concatenate([f[t["name"]] for t in obs["term_layout"]]) for f in frames]
+  )
+  np.testing.assert_allclose(
+    flat, parity["osl_conformance_frames"], rtol=1e-5, atol=1e-4
+  )
+  for lag in parity["osl_conformance_lags"]:
+    rows = []
+    for k in range(len(frames)):
+      parts = []
+      for term in obs["term_layout"]:
+        delay = int(lag) if term["name"] in obs["latency"]["buses"] else 0
+        h = term["history_length"]
+        # History slot j (0 oldest) holds the delayed frame of step k - (h-1-j),
+        # backfilled before the reset; step s's delayed frame is max(s-L, 0)'s.
+        parts += [
+          frames[max(max(k - (h - 1 - j), 0) - delay, 0)][term["name"]]
+          for j in range(h)
+        ]
+      rows.append(np.concatenate(parts))
+    np.testing.assert_allclose(
+      np.stack(rows),
+      parity[f"osl_conformance_obs_lag{int(lag)}"],
+      rtol=1e-5,
+      atol=1e-4,
+    )
+
+
+def test_refuses_stage1_runs_and_osl_drift(exported, tmp_path) -> None:
+  _, checkpoint, _, _ = exported
+  run = checkpoint.parent
+  payload = torch.load(checkpoint, weights_only=False)
+  stage1 = tmp_path / "stage1.pt"
+  torch.save({"actor_state_dict": payload["human_actor_state_dict"]}, stage1)
+  with pytest.raises(ValueError, match="stage-1 checkpoint"):
+    split_export.load_payload(stage1)
+
+  agent = yaml.safe_load(
+    (run / "params/agent.yaml").read_text().replace("!!python/tuple", "")
+  )
+  agent["algorithm"]["class_name"] = "mjlab.tasks.osl_mimic.rl.ppo:MuscleMimicPPO"
+  with pytest.raises(ValueError, match="not a stage-2 split run"):
+    split_export.split_run_spec(checkpoint, agent)
+
+  cfg = osl_split_env_cfg("msk", "compliant", "clf", "train")
+  saved = split_export.gl.read_config(run / "params/env.yaml")["observations"]["osl"]
+  saved["terms"]["actpack"]["params"]["projected_gravity"] = True
+  saved["terms"]["actpack"]["delay_max_lag"] = 3
+  group = cfg.observations["osl"]
+  split_export.apply_osl_group(group, saved)
+  assert group.terms["actpack"].params["projected_gravity"] is True
+  assert group.terms["actpack"].delay_max_lag == 3
+  saved["terms"]["loadcell"]["func"] = "somewhere.else"
+  with pytest.raises(ValueError, match="loadcell.func"):
+    split_export.apply_osl_group(cfg.observations["osl"], saved)

@@ -271,13 +271,21 @@ def _effective_bounds(
 
 
 def action_metadata(
-  parts: PolicyParts, std: np.ndarray, inference: Inference
+  parts: PolicyParts, std: np.ndarray, inference: Inference, complete: bool = True
 ) -> dict[str, Any]:
-  """The ``action`` section: blocks, the affine maps, clips, std and bounds."""
+  """The ``action`` section: blocks, the affine maps, clips, std and bounds.
+
+  ``complete`` requires the terms to drive every actuator of the model, as one
+  policy over the whole body does; without it they drive a subset (one controller
+  of several, whose union the caller checks), each actuator still at most once.
+  Block ``start`` offsets count within this policy's own output.
+  """
   model = parts.model
   actuators = _actuators(model, parts.actions)
   ids = [a for a, _ in actuators]
-  if len(set(ids)) != len(ids) or sorted(ids) != list(range(model.nu)):
+  if len(set(ids)) != len(ids):
+    raise ValueError("The action terms drive an actuator more than once.")
+  if complete and sorted(ids) != list(range(model.nu)):
     raise ValueError("The action terms must drive every actuator exactly once.")
   if std.shape != (len(ids),):
     raise ValueError(f"std has {std.shape} values for {len(ids)} outputs.")
@@ -373,9 +381,16 @@ def training_metadata(parts: PolicyParts) -> dict[str, Any]:
 
 
 def policy_metadata(
-  parts: PolicyParts, std: np.ndarray, obs_dim: int, inference: Inference | None
+  parts: PolicyParts,
+  std: np.ndarray,
+  obs_dim: int,
+  inference: Inference | None,
+  complete: bool = True,
 ) -> dict[str, Any]:
   """The deployment contract of one policy (see the module docstring).
+
+  ``complete=False`` is for one controller of several: its action terms drive a
+  subset of the actuators (see :func:`action_metadata`).
 
   Raises:
     ValueError: If the actor's input width differs from the schema's, or an actor
@@ -402,7 +417,7 @@ def policy_metadata(
       "output_shape": [1, len(std)],
     },
     "observation": observation_metadata(parts, obs_dim),
-    "action": action_metadata(parts, std, inference),
+    "action": action_metadata(parts, std, inference, complete),
     "training": training_metadata(parts),
   }
 
