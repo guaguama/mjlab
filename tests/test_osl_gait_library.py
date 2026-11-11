@@ -828,6 +828,11 @@ def test_reference_ghost_is_the_robot_model_with_socket_and_osl(
   drawn = [geom for geom in scene.geoms[: scene.ngeom]]
   geoms = {geom.objid for geom in drawn if geom.objtype == mujoco.mjtObj.mjOBJ_GEOM}
   assert geoms == set(np.flatnonzero(shown).tolist())
+  # In osl_deploy's flat blue, at its alpha: mjVIS_TRANSPARENT does not scale it.
+  for geom in drawn:
+    if geom.objtype == mujoco.mjtObj.mjOBJ_GEOM:
+      np.testing.assert_allclose(geom.rgba, (0.2, 0.65, 1.0, 0.28), atol=1e-6)
+      assert geom.matid == -1
 
 
 def test_no_disturbances_runs_the_validation_plant() -> None:

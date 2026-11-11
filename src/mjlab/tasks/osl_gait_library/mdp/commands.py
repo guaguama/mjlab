@@ -285,8 +285,9 @@ class GaitLibraryCommandCfg(CommandTermCfg):
   that clip's label, as such a policy saw in training; continuous sampling commands
   the twist itself. None: the sampler. Play's ``--twist`` sets it; the viewer's
   twist controls change it at run time through ``set_fixed_twist``."""
-  ghost_color: tuple[float, float, float, float] = (0.5, 0.7, 0.5, 0.5)
-  """Colour of the reference ghost drawn when ``debug_vis`` is on."""
+  ghost_color: tuple[float, float, float, float] = (0.2, 0.65, 1.0, 0.28)
+  """Colour of the reference ghost drawn when ``debug_vis`` is on, alpha included:
+  osl_deploy's reference ghost, flat and untextured."""
 
   def build(self, env: ManagerBasedRlEnv) -> GaitLibraryCommand:
     return GaitLibraryCommand(self, env)
@@ -1247,6 +1248,10 @@ class GaitLibraryCommand(CommandTerm):
     model = spec.compile()
     shown = model.geom_group == GHOST_GEOM_GROUP
     model.geom_rgba[shown] = self.cfg.ghost_color
+    model.geom_matid[shown] = -1  # Flat colour: no bone textures.
+    # The native viewers draw ghosts with mjVIS_TRANSPARENT, which scales each
+    # alpha by vis.map.alpha (0.3); 1 keeps ghost_color's alpha as drawn.
+    model.vis.map.alpha = 1.0
     model.geom_rgba[~shown, 3] = 0.0
     model.site_rgba[:, 3] = 0.0
     model.tendon_rgba[:, 3] = 0.0
@@ -1288,7 +1293,10 @@ class GaitLibraryCommand(CommandTerm):
     assert self._ghost is not None
     for row, env in enumerate(env_ids):
       visualizer.add_ghost_mesh(
-        qpos[row], model=self._ghost.model, label=f"ghost_{env}"
+        qpos[row],
+        model=self._ghost.model,
+        alpha=self.cfg.ghost_color[3],  # Viser's opacity; native reads geom_rgba.
+        label=f"ghost_{env}",
       )
 
   def create_gui(
