@@ -68,11 +68,20 @@ Added
   robot policies and for musculoskeletal ones whose median muscle std is at most
   0.3, the noise-averaged clipped-Gaussian action above that, and records the
   actuator delays it trained with.
+- Two-controller deployment export for the stage-2 split runs. ``python -m
+  mjlab.tasks.osl_split.export <checkpoint>`` writes one bundle with both actors
+  (``human_actor.onnx`` on the stage-1 observation, ``osl_actor.onnx`` on the
+  prosthesis's sensors), the compiled model with the OSL sensors, the reference and
+  a schema-2 manifest giving each controller its observation contract (for the OSL:
+  channels, sensors, tare, saturation, history, latency and reset), action blocks
+  and training delays. Its ``parity.npz`` includes an OSL observation conformance
+  sequence that mjlab's own terms build from CPU MuJoCo states.
 - Play controls for the gait-library tasks, after sesteban's G1 unicycle play:
   ``--twist vx,vy,wz`` pins every env to the clip nearest a twist, the native viewer
   drives the pin from the keyboard (arrow keys, Page Up/Down, Delete, Home) and viser
   from a "Twist command" panel, and the viewer draws the served reference as a ghost
-  of the robot model (socket and OSL included, for the musculoskeletal tasks too).
+  of the robot model (socket and OSL included, for the musculoskeletal tasks too) in
+  osl_deploy's flat translucent blue.
   ``--no-disturbances`` replays on the nominal plant: every event but the resets is
   removed, tracking tasks zero their reset noise, and gait-library tasks fix each
   actuator delay at the middle of its range, as their validation does.
