@@ -9,8 +9,8 @@ path:
   and accelerometer, plus two off-by-default extras: projected gravity (an
   orientation estimator's output rather than a raw channel) and the joints' applied
   torque (the drive's current-based estimate);
-* ``loadcell``: the load-cell bus, the six-axis cell above the ankle and, on by
-  default, the one below the socket, both tared;
+* ``loadcell``: the load-cell bus, the six-axis cell above the ankle and the one below
+  the socket, both on by default (either can be switched off, not both), both tared;
 * ``last_action``: the controller's own previous command, which crosses no bus.
 
 Perception randomization models the hardware and applies in training only, from the
@@ -84,7 +84,12 @@ OSL_LAST_ACTION_DIM = len(OSL_TORQUE_JOINTS)
 """The knee and ankle commands."""
 _BUS_TERMS = OSL_OBS_TERMS[:2]
 """The terms that cross a hardware bus, so lag."""
-_SWITCH_DEFAULTS = {"projected_gravity": False, "applied_torque": False, "socket": True}
+_SWITCH_DEFAULTS = {
+  "projected_gravity": False,
+  "applied_torque": False,
+  "ankle": True,
+  "socket": True,
+}
 """A class term's switches when its params leave them out."""
 
 
@@ -95,7 +100,8 @@ class OslObsCfg:
   The randomization applies in training only. Stds are Gaussian white noise per
   sample; biases are uniform in +-value per component, drawn at every reset and held
   for the episode. The switches, bounds and stds reach the class terms as their
-  params, under the same names (``socket_load_cell`` as ``socket``).
+  params, under the same names (``ankle_load_cell`` as ``ankle``,
+  ``socket_load_cell`` as ``socket``).
   """
 
   history_length: int = 25
@@ -104,7 +110,10 @@ class OslObsCfg:
   """Sensor latency per bus (min, max) in control steps, 0-20 ms at 100 Hz."""
   validation_delay_steps: int = 1
   """The fixed latency of validation: the middle of the training range."""
+  ankle_load_cell: bool = True
+  """The six-axis cell above the ankle (``loadcell``'s first six channels)."""
   socket_load_cell: bool = True
+  """The six-axis cell below the socket. At least one of the two cells must be on."""
   projected_gravity: bool = False
   applied_torque: bool = False
   encoder_bias_rad: float = 0.015
@@ -137,6 +146,8 @@ class OslObsCfg:
       raise ValueError(f"delay_steps must satisfy 0 <= min <= max: {self.delay_steps}")
     if self.history_length < 0 or self.validation_delay_steps < 0:
       raise ValueError("history_length and validation_delay_steps must be >= 0.")
+    if not (self.ankle_load_cell or self.socket_load_cell):
+      raise ValueError("At least one load cell (ankle or socket) must be on.")
     magnitudes = {
       name: getattr(self, name)
       for name in self.__dataclass_fields__
@@ -153,8 +164,8 @@ def osl_actpack_dim(cfg: OslObsCfg) -> int:
 
 
 def osl_loadcell_dim(cfg: OslObsCfg) -> int:
-  """The ankle cell's force and torque, then the socket cell's if on."""
-  return 6 + 6 * cfg.socket_load_cell
+  """The ankle cell's force and torque if on, then the socket cell's if on."""
+  return 6 * cfg.ankle_load_cell + 6 * cfg.socket_load_cell
 
 
 def osl_obs_frame_dim(cfg: OslObsCfg) -> int:
@@ -191,12 +202,32 @@ def osl_noise_std(term: str, params: Mapping[str, Any]) -> tuple[float, ...] | N
     return stds
   if term == "loadcell":
     cell = std("force_noise", 3) + std("torque_noise", 3)
-    return cell * (2 if _switch(params, "socket") else 1)
+    return cell * (int(_switch(params, "ankle")) + int(_switch(params, "socket")))
   return None
 
 
 def _switch(params: Mapping[str, Any], name: str) -> bool:
   return bool(params.get(name, _SWITCH_DEFAULTS[name]))
+
+
+def load_cell_sensor_names(params: Mapping[str, Any]) -> list[str]:
+  """The sensors the ``loadcell`` term reads under its params, in channel order: the
+  ankle cell's force and torque when ``ankle``, then the socket cell's when
+  ``socket``.
+
+  Raises:
+    ValueError: If both cells are switched off.
+  """
+  names: list[str] = []
+  if _switch(params, "ankle"):
+    names += [ANKLE_FORCE, ANKLE_LOAD_TORQUE]
+  if _switch(params, "socket"):
+    names += [SOCKET_FORCE, SOCKET_TORQUE]
+  if not names:
+    raise ValueError(
+      "The loadcell term needs at least one load cell: ankle and socket are both off."
+    )
+  return names
 
 
 def _noise_std(term: str, params: Mapping[str, Any], device: str) -> torch.Tensor:
@@ -338,8 +369,8 @@ class osl_actpack(ManagerTermBase):
 
 
 class osl_load_cells(ManagerTermBase):
-  """The load-cell bus: the ankle cell's force (3) and torque (3), then the socket
-  cell's when ``socket``, so (B, 12) by default.
+  """The load-cell bus: the ankle cell's force (3) and torque (3) when ``ankle``, then
+  the socket cell's when ``socket``, so (B, 12) by default and (B, 6) with one cell.
 
   Each reading is in its site's frame (OpenSim axes, y up the limb), minus its
   static tare: what the cell reads with the leg hanging still, computed once from the
@@ -350,7 +381,8 @@ class osl_load_cells(ManagerTermBase):
   then white noise, one Gaussian draw per component and sample
   (:func:`osl_noise_std`).
 
-  Params: ``entity_name``; ``socket`` (include the socket cell); ``randomize`` (draw
+  Params: ``entity_name``; ``ankle`` and ``socket`` (include that cell; at least one
+  must be on); ``randomize`` (draw
   the biases at every reset and add the noise); ``force_bias`` (N) and
   ``torque_bias`` (N m), uniform per component; and the noise stds ``force_noise``
   and ``torque_noise``. Bounds and stds the params leave out take
@@ -369,9 +401,7 @@ class osl_load_cells(ManagerTermBase):
     defaults = OslObsCfg()
     entity = params.get("entity_name", "robot")
     self._randomize = bool(params.get("randomize", False))
-    names = [ANKLE_FORCE, ANKLE_LOAD_TORQUE]
-    if _switch(params, "socket"):
-      names += [SOCKET_FORCE, SOCKET_TORQUE]
+    names = load_cell_sensor_names(params)
     self._sensors = [env.scene[scene_sensor_name(name, entity)] for name in names]
     tare = static_load_cell_tare(env.sim.mj_model, prefix=f"{entity}/")
     self.tare = torch.as_tensor(
@@ -528,6 +558,7 @@ def _training_group(cfg: OslObsCfg) -> ObservationGroupCfg:
     func=osl_load_cells,
     params={
       "entity_name": "robot",
+      "ankle": cfg.ankle_load_cell,
       "socket": cfg.socket_load_cell,
       "randomize": True,
       "force_bias": cfg.force_bias,

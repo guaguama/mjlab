@@ -54,8 +54,6 @@ from mjlab.tasks.osl_gait_library.export import (
 )
 from mjlab.tasks.osl_split.config.sensors import (
   ACC_RANGE,
-  ANKLE_FORCE,
-  ANKLE_LOAD_TORQUE,
   ANKLE_POS,
   ANKLE_TORQUE,
   ANKLE_VEL,
@@ -69,11 +67,12 @@ from mjlab.tasks.osl_split.config.sensors import (
   OSL_IMU_POS,
   OSL_IMU_SITE,
   OSL_SENSOR_SPECS,
-  SOCKET_FORCE,
-  SOCKET_TORQUE,
   scene_sensor_name,
 )
-from mjlab.tasks.osl_split.mdp.observations import osl_noise_std
+from mjlab.tasks.osl_split.mdp.observations import (
+  load_cell_sensor_names,
+  osl_noise_std,
+)
 
 from .layout import OSL_ACTION_TERM
 from .ppo import OSL_OBS_GROUP, TwoAgentPPO
@@ -285,10 +284,7 @@ def term_channels(name: str, params: Mapping[str, Any]) -> list[Channel]:
       channels += [_scalar(KNEE_TORQUE), _scalar(ANKLE_TORQUE)]
     return channels
   if name == "loadcell":
-    channels = _vector(ANKLE_FORCE) + _vector(ANKLE_LOAD_TORQUE)
-    if params.get("socket", True):
-      channels += _vector(SOCKET_FORCE) + _vector(SOCKET_TORQUE)
-    return channels
+    return [c for sensor in load_cell_sensor_names(params) for c in _vector(sensor)]
   if name == "last_action":
     # The previous command, in normalized units: what the controller sent.
     return [(f"osl_{joint}_command", "1", None) for joint in _JOINT_LABELS]
@@ -348,9 +344,7 @@ def _load_cell_tare(env: ManagerBasedRlEnv) -> dict[str, list[float]]:
   if "loadcell" not in manager.active_terms[OSL_OBS_GROUP]:
     return {}
   cfg = manager.get_term_cfg(OSL_OBS_GROUP, "loadcell")
-  names = [ANKLE_FORCE, ANKLE_LOAD_TORQUE]
-  if cfg.params.get("socket", True):
-    names += [SOCKET_FORCE, SOCKET_TORQUE]
+  names = load_cell_sensor_names(cfg.params)
   values = [float(v) for v in torch.as_tensor(cfg.func.tare).reshape(-1).tolist()]
   if len(values) != 3 * len(names):
     raise ValueError(f"The load-cell tare has {len(values)} values for {names}.")

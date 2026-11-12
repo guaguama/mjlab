@@ -403,6 +403,12 @@ def test_load_cells_subtract_the_tare(scene_model: mujoco.MjModel) -> None:
   torch.testing.assert_close(both(env), torch.zeros(n, 12), atol=1e-5, rtol=0.0)
   ankle = _load_cells(env, socket=False, randomize=False)
   torch.testing.assert_close(ankle(env), torch.zeros(n, 6), atol=1e-5, rtol=0.0)
+  socket = _load_cells(env, ankle=False, socket=True, randomize=False)
+  assert socket.tare.shape == (6,)
+  torch.testing.assert_close(socket.tare, both.tare[6:])
+  torch.testing.assert_close(socket(env), torch.zeros(n, 6), atol=1e-5, rtol=0.0)
+  with pytest.raises(ValueError, match="at least one load cell"):
+    _load_cells(env, ankle=False, socket=False, randomize=False)
   # Loaded in stance, a tared cell reads minus the transmitted load.
   _set(env, sensors.ANKLE_FORCE, torch.as_tensor(tare[sensors.ANKLE_FORCE]) - 800.0)
   torch.testing.assert_close(ankle(env)[:, :3], torch.full((n, 3), -800.0))
@@ -611,6 +617,7 @@ SWITCH_FLIPS: tuple[tuple[str, str, bool, dict[str, Any]], ...] = (
   ("actpack", "projected_gravity", True, {"projected_gravity": True}),
   ("actpack", "applied_torque", True, {"applied_torque": True}),
   ("loadcell", "socket", False, {"socket_load_cell": False}),
+  ("loadcell", "ankle", False, {"ankle_load_cell": False}),
 )
 """A switch the train CLI can flip on a term's params, and its ``OslObsCfg`` field."""
 

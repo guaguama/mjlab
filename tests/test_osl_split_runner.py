@@ -736,6 +736,13 @@ def test_term_channels_follow_the_options() -> None:
   ]
   ankle_only = term_channels("loadcell", {"socket": False})
   assert len(ankle_only) == osl_loadcell_dim(OslObsCfg(socket_load_cell=False))
+  socket_only = term_channels("loadcell", {"ankle": False})
+  assert len(socket_only) == osl_loadcell_dim(OslObsCfg(ankle_load_cell=False)) == 6
+  assert [c for c, _, _ in socket_only] == [
+    c for c, _, _ in term_channels("loadcell", {})[6:]
+  ]
+  with pytest.raises(ValueError, match="At least one load cell"):
+    OslObsCfg(ankle_load_cell=False, socket_load_cell=False)
   with pytest.raises(ValueError, match="Unknown OSL observation term"):
     term_channels("phase", {})
 

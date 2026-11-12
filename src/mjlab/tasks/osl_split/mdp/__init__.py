@@ -1,5 +1,6 @@
 from .observations import OSL_OBS_TERMS as OSL_OBS_TERMS
 from .observations import OslObsCfg as OslObsCfg
+from .observations import load_cell_sensor_names as load_cell_sensor_names
 from .observations import osl_actpack as osl_actpack
 from .observations import osl_actpack_dim as osl_actpack_dim
 from .observations import osl_last_action as osl_last_action

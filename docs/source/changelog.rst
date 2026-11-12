@@ -76,6 +76,11 @@ Added
   channels, sensors, tare, saturation, history, latency and reset), action blocks
   and training delays. Its ``parity.npz`` includes an OSL observation conformance
   sequence that mjlab's own terms build from CPU MuJoCo states.
+- The stage-2 OSL actor's ankle load cell can be switched off like its socket cell
+  (``OslObsCfg.ankle_load_cell``, or on the train CLI
+  ``--env.observations.osl.terms.loadcell.params.ankle False``), for training on
+  reduced sensing; at least one cell must stay on, and the exported observation
+  contract lists only the cells in use.
 - Play controls for the gait-library tasks, after sesteban's G1 unicycle play:
   ``--twist vx,vy,wz`` pins every env to the clip nearest a twist, the native viewer
   drives the pin from the keyboard (arrow keys, Page Up/Down, Delete, Home) and viser
