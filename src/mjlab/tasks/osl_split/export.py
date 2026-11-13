@@ -18,7 +18,8 @@ osl_deploy can run them side by side in plain CPU MuJoCo:
   contract of :mod:`.rl.export`: channels, sensors, tare, saturation, history,
   latency and reset;
 * ``model.mjb``: the compiled stage-2 scene (with the OSL's IMU site and sensors)
-  at the deployment solver caps;
+  at the deployment solver caps, with the OSL foot touch sites the run trained with
+  (the manifest's ``touch_sites`` declares them, read from this file);
 * ``reference.npz``: the library as the training command preprocessed it;
 * ``parity.npz``: each actor's ONNX outputs on inputs drawn from its own
   statistics, and an OSL observation conformance sequence: CPU MuJoCo states and
@@ -36,10 +37,13 @@ every actuator exactly once::
     [--library <clip folder>] [--hf-repo <user>/<repo>]
 
 The bundle goes to ``<run>/deploy/model_<N>`` unless ``--output`` says otherwise.
-The run's ``params/`` decide the model, socket and reward, its env.yaml must match
-the task rebuilt from this checkout (simulation, decimation, the human's
-observation, actions, actuator delays), and its ``osl`` observation settings
-(switches, error bounds, history, latency) are taken from the run.
+The run's ``params/`` decide the model, socket and reward. The task is rebuilt
+from this checkout with the OSL foot touch sites the checkpoint was trained with
+(its ``osl_touch_sites`` key, else ``original``), which its warm start's stage 1
+must share; its env.yaml must match the rebuilt task (touch sites, simulation,
+decimation, the human's observation, actions, actuator delays), and its ``osl``
+observation settings (switches, error bounds, history, latency) are taken from the
+run.
 """
 
 from __future__ import annotations
@@ -60,7 +64,7 @@ import numpy as np
 import torch
 import tyro
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket, TouchSites
 from mjlab.tasks.osl_gait_library import export as gl
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.rl.export import (
@@ -75,6 +79,12 @@ from mjlab.tasks.osl_mimic.rl.export import (
   policy_metadata,
   training_metadata,
 )
+from mjlab.tasks.osl_mimic.touch_sites import (
+  run_touch_sites,
+  set_touch_sites,
+  touch_sites_manifest,
+  touch_sites_readme_line,
+)
 
 from .config.env_cfgs import osl_split_env_cfg
 from .mdp.observations import osl_validation_group
@@ -82,6 +92,7 @@ from .rl.export import DEFAULT_INFERENCE as OSL_INFERENCE
 from .rl.export import osl_policy_metadata
 from .rl.layout import OSL_ACTION_TERM, ActionLayout, Agent
 from .rl.ppo import OSL_OBS_GROUP
+from .rl.warmstart import lineage_touch_sites
 
 if TYPE_CHECKING:
   from mjlab.envs.mdp.actions.actions import BaseAction
@@ -215,19 +226,23 @@ def load_payload(checkpoint: Path) -> dict[str, Any]:
   return payload
 
 
-def split_config(spec: SplitRunSpec, saved: dict[str, Any]) -> Any:
-  """The run's stage-2 env config, rebuilt from this checkout in train mode.
+def split_config(
+  spec: SplitRunSpec, saved: dict[str, Any], *, touch_sites: TouchSites
+) -> Any:
+  """The run's stage-2 env config, rebuilt from this checkout in train mode, with
+  the OSL foot ``touch_sites`` the run trained with.
 
-  The human's observation, the actions, the simulation and the actuator delays
-  must match the run's (:func:`~mjlab.tasks.osl_gait_library.export.
-  check_actor_config`); the ``osl`` group's terms must be the run's, and their
-  params, history and latency are taken from it, so a run trained with OSL
+  The touch sites, the human's observation, the actions, the simulation and the
+  actuator delays must match the run's (:func:`~mjlab.tasks.osl_gait_library.
+  export.check_actor_config`); the ``osl`` group's terms must be the run's, and
+  their params, history and latency are taken from it, so a run trained with OSL
   observation switches flipped on the command line exports as trained.
 
   Raises:
     ValueError: On drift, or ``osl`` processing outside the schema.
   """
   cfg = osl_split_env_cfg(spec.model, spec.socket, spec.reward, "train")
+  set_touch_sites(cfg, touch_sites)
   gl.check_actor_config(cfg, saved)
   spec_fn = str(saved["scene"]["entities"]["robot"].get("spec_fn"))
   if spec_fn != OSL_SPEC_FN:
@@ -693,6 +708,7 @@ osl_deploy (plain CPU MuJoCo {manifest["mujoco_version"]}).
 
 - Model: {run["model"]}, socket: {run["socket"]}, reward: {run["reward"]}, library:
   {run["variant"]} ({len(manifest["reference"]["clip_names"])} clips)
+{touch_sites_readme_line(manifest["touch_sites"])}
 - Checkpoint: `{run["checkpoint"]}` (iteration {run["iteration"]}, stage-2
   iteration {run["stage_iteration"]}); warm start: `{stage1}`
 - Control: {1.0 / manifest["policy_dt"]:g} Hz for both controllers,
@@ -776,8 +792,15 @@ def export_bundle(
     spec.socket,
   ):
     raise ValueError(f"The lineage is a {lineage.get('model')} run, not {spec.model}.")
+  touch = run_touch_sites(checkpoint, payload, saved)
+  if lineage and lineage_touch_sites(lineage) != touch.value:
+    raise ValueError(
+      f"The run trained with the OSL touch sites {touch.value!r}, but its warm "
+      f"start's stage 1 with {lineage_touch_sites(lineage)!r}."
+    )
+  print(f"[INFO] OSL touch sites: {touch.value} (from {touch.source}).")
 
-  cfg = split_config(spec, saved)
+  cfg = split_config(spec, saved, touch_sites=touch.value)
   env, command, actions, solver = gl.compile_task(
     cfg, saved, library, solver_iterations, ls_solver_iterations
   )
@@ -835,6 +858,7 @@ def export_bundle(
       "root_joint": "robot/root",
       "joint_names": [f"robot/{j}" for j in c.joint_names],
       "socket": spec.socket,
+      "touch_sites": touch_sites_manifest(c.model),
       "run": {
         "task": spec.task_id,
         "stage": 2,
@@ -885,6 +909,11 @@ def export_bundle(
       "controllers": sections,
       "lineage": lineage,
     }
+    if manifest["touch_sites"]["version"] != touch.value:
+      raise RuntimeError(
+        f"model.mjb carries the {manifest['touch_sites']['version']!r} touch sites, "
+        f"but the run trained with {touch.value!r}."
+      )
     manifest["provenance"] = gl._provenance(
       checkpoint,
       Path(command.cfg.library_dir),

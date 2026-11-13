@@ -2,17 +2,21 @@
 
 A four-clip library (idle, forward, backward, pivot) is generated from the real
 model by forward kinematics, and a fake run directory holds the task's own saved
-configs and a small actor, so ``export_bundle`` runs end to end on both models.
+configs and a small actor, so ``export_bundle`` runs end to end on both models. A
+robot run from before the OSL touch-site setting exports too.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import math
+import shutil
 import sys
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import mujoco
 import numpy as np
@@ -21,7 +25,7 @@ import torch
 import yaml
 from tensordict import TensorDict
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import get_spec
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import OSL_XMLS, get_spec
 from mjlab.tasks.osl_gait_library import export as gl_export
 from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 from mjlab.tasks.osl_gait_library.config.rl_cfg import (
@@ -30,6 +34,7 @@ from mjlab.tasks.osl_gait_library.config.rl_cfg import (
 )
 from mjlab.tasks.osl_mimic.rl import export as policy_export
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
+from mjlab.tasks.osl_mimic.touch_sites import set_touch_sites
 from mjlab.utils.os import dump_yaml
 
 DT = 0.01
@@ -38,6 +43,52 @@ HIDDEN = (16, 16)
 CASES = {
   ("robot", "rigid", "mimic"): (635, 29, [("servos", 27), ("osl_motors", 2)]),
   ("msk", "compliant", "clf"): (2338, 341, [("osl_motors", 2), ("muscles", 339)]),
+}
+ROBOT = ("robot", "rigid", "mimic")
+R_FOOT = "robot/OSL_KA_L1_r_foot_touch"
+# The manifest's ``touch_sites`` of a heel_extended model: the contract shared with
+# osl_deploy (logs/handover/touch_fix/brief_mjlab.md), verbatim.
+TOUCH_SITES_CONTRACT: dict[str, Any] = {
+  "version": "heel_extended",
+  "edited_from_xml": [R_FOOT],
+  "frame": (
+    "site pos/quat/size in the parent body's frame (MuJoCo site_pos, site_quat, "
+    "site_size; box half-sizes)"
+  ),
+  "sites": {
+    R_FOOT: {
+      "sensor": "robot/r_foot",
+      "body": "robot/OSL_KA_L1_osl_foot_assembly",
+      "type": "box",
+      "pos": [0.01, -0.04, 0.0],
+      "quat": [1.0, 0.0, 0.0, 0.0],
+      "size": [0.065, 0.03, 0.05],
+    },
+    "robot/OSL_KA_L1_r_toes_touch": {
+      "sensor": "robot/r_toes",
+      "body": "robot/OSL_KA_L1_osl_foot_assembly",
+      "type": "box",
+      "pos": [0.215, -0.04, -0.005],
+      "quat": [1.0, 0.0, 0.0, 0.0],
+      "size": [0.075, 0.03, 0.06],
+    },
+    "robot/foot_touch_l": {
+      "sensor": "robot/l_foot",
+      "body": "robot/calcn_l",
+      "type": "box",
+      "pos": [0.09, -0.01, 0.0],
+      "quat": [1.0, 0.0, 0.0, 0.0],
+      "size": [0.1, 0.01, 0.055],
+    },
+    "robot/toes_touch_l": {
+      "sensor": "robot/l_toes",
+      "body": "robot/toes_l",
+      "type": "box",
+      "pos": [0.0275, -0.01, 0.0],
+      "quat": [0.9393726845901743, 0.0, 0.3428978848663966, 0.0],
+      "size": [0.04, 0.01, 0.0675],
+    },
+  },
 }
 
 
@@ -95,7 +146,9 @@ def library(tmp_path_factory) -> Path:
   return folder
 
 
-def _make_run(root: Path, case, library: Path) -> Path:
+def _make_run(root: Path, case, library: Path, legacy: bool = False) -> Path:
+  """A run on the default touch sites; a ``legacy`` run predates the setting, so
+  neither its env.yaml nor its checkpoint records any (``original``)."""
   model, socket, reward = case
   obs_dim, action_dim, _ = CASES[case]
   run = root / f"{model}_{socket}" / "run"
@@ -103,7 +156,10 @@ def _make_run(root: Path, case, library: Path) -> Path:
   env_cfg.commands["motion"].library_dir = str(library)  # type: ignore[attr-defined]
   agent = osl_gait_library_runner_cfg(model, socket, reward, "exp", "unicycle")
   agent.actor.hidden_dims = HIDDEN
-  dump_yaml(run / "params" / "env.yaml", asdict(env_cfg))
+  env = asdict(env_cfg)
+  if legacy:
+    del env["osl_touch_sites"], env["scene"]["entities"]["robot"]["touch_sites"]
+  dump_yaml(run / "params" / "env.yaml", env)
   dump_yaml(run / "params" / "agent.yaml", asdict(agent))
   torch.manual_seed(0)
   obs = TensorDict({"actor": torch.zeros(1, obs_dim)}, batch_size=[1])
@@ -117,7 +173,10 @@ def _make_run(root: Path, case, library: Path) -> Path:
   )
   actor.obs_normalizer.mean.uniform_(-1.0, 1.0)  # type: ignore[union-attr]
   actor.obs_normalizer.var.uniform_(0.5, 2.0)  # type: ignore[union-attr]
-  torch.save({"actor_state_dict": actor.state_dict(), "iter": 7}, run / "model_7.pt")
+  payload = {"actor_state_dict": actor.state_dict(), "iter": 7}
+  if not legacy:  # The OSL runners record the touch sites in every checkpoint.
+    payload["osl_touch_sites"] = env_cfg.osl_touch_sites
+  torch.save(payload, run / "model_7.pt")
   return run / "model_7.pt"
 
 
@@ -126,6 +185,28 @@ def exported(request, tmp_path_factory, library):
   checkpoint = _make_run(tmp_path_factory.mktemp("runs"), request.param, library)
   bundle = gl_export.export_bundle(checkpoint)
   return request.param, checkpoint, bundle
+
+
+@pytest.fixture(scope="module")
+def legacy_bundle(tmp_path_factory, library) -> Path:
+  """The bundle of a robot run from before the touch-site setting."""
+  checkpoint = _make_run(tmp_path_factory.mktemp("legacy"), ROBOT, library, True)
+  return gl_export.export_bundle(checkpoint)
+
+
+def _check_model_touch_sites(bundle: Path, touch_sites: dict) -> mujoco.MjModel:
+  """The bundle's model.mjb carries each touch site exactly as the manifest says."""
+  model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
+  for name, entry in touch_sites["sites"].items():
+    site = model.site(name)
+    assert model.body(int(site.bodyid[0])).name == entry["body"]
+    assert site.type[0] == mujoco.mjtGeom.mjGEOM_BOX and entry["type"] == "box"
+    for key in ("pos", "quat", "size"):
+      assert getattr(site, key).tolist() == entry[key], (name, key)
+    sensor = model.sensor(entry["sensor"])
+    assert sensor.type[0] == mujoco.mjtSensor.mjSENS_TOUCH
+    assert (sensor.objtype[0], sensor.objid[0]) == (mujoco.mjtObj.mjOBJ_SITE, site.id)
+  return model
 
 
 def test_bundle_contract(exported) -> None:
@@ -207,6 +288,7 @@ def test_config_drift_and_missing_library_refuse(exported, tmp_path) -> None:
   _, checkpoint, _ = exported
   run = tmp_path / "run"
   (run / "params").mkdir(parents=True)
+  shutil.copy(checkpoint, run / "model_7.pt")  # Its touch-site key is read first.
   env = gl_export.read_config(checkpoint.parent / "params/env.yaml")
   agent = (checkpoint.parent / "params/agent.yaml").read_text()
   (run / "params/agent.yaml").write_text(agent)
@@ -220,6 +302,66 @@ def test_config_drift_and_missing_library_refuse(exported, tmp_path) -> None:
   (run / "params/env.yaml").write_text(yaml.safe_dump(env, sort_keys=False))
   with pytest.raises(ValueError, match="--library"):
     gl_export.build_components(run / "model_7.pt")
+
+
+def test_bundle_declares_its_touch_sites(exported) -> None:
+  """A run on the default zones: the manifest's ``touch_sites`` is the contract
+  shared with osl_deploy, model.mjb carries exactly those sites, and the README
+  says which zones the bundle has."""
+  _, _, bundle = exported
+  m = json.loads((bundle / "manifest.json").read_text())
+  assert m["touch_sites"] == TOUCH_SITES_CONTRACT
+  _check_model_touch_sites(bundle, m["touch_sites"])
+  readme = (bundle / "README.md").read_text()
+  assert "\n- Touch zones: **heel_extended**, " in readme
+  assert "(foot x -0.055 to 0.075 m; manifest `touch_sites`)" in readme
+
+
+def test_legacy_run_exports_the_xml_touch_sites(legacy_bundle) -> None:
+  """A run from before the setting records no touch sites, so it trained with the
+  model XML's: its bundle says ``original``, edits nothing, and both the manifest
+  and model.mjb carry the XML's ``r_foot`` box; the other zones never change."""
+  m = json.loads((legacy_bundle / "manifest.json").read_text())
+  xml_model = mujoco.MjModel.from_xml_path(str(OSL_XMLS[("robot", "rigid")]))
+  xml = xml_model.site(R_FOOT.removeprefix("robot/"))
+  expected = copy.deepcopy(TOUCH_SITES_CONTRACT)
+  expected.update(version="original", edited_from_xml=[])
+  expected["sites"][R_FOOT].update(
+    pos=xml.pos.tolist(), quat=xml.quat.tolist(), size=xml.size.tolist()
+  )
+  assert m["touch_sites"] == expected
+  model = _check_model_touch_sites(legacy_bundle, m["touch_sites"])
+  for key in ("pos", "quat", "size"):
+    np.testing.assert_array_equal(getattr(model.site(R_FOOT), key), getattr(xml, key))
+  readme = (legacy_bundle / "README.md").read_text()
+  assert "\n- Touch zones: **original**, " in readme
+  assert "(foot x -0.025 to 0.075 m; manifest `touch_sites`)" in readme
+
+
+def test_touch_site_drift_and_disagreement_refuse(library, tmp_path) -> None:
+  """The rebuilt config's touch sites are checked against the run's env.yaml (one
+  without the field trained with ``original``), and a checkpoint whose key
+  disagrees with its run's env.yaml is refused."""
+  checkpoint = _make_run(tmp_path, ROBOT, library)
+  saved = gl_export.read_config(checkpoint.parent / "params/env.yaml")
+  cfg = osl_gait_library_env_cfg("robot", "rigid", "mimic", "train", "unicycle")
+  assert saved["osl_touch_sites"] == cfg.osl_touch_sites == "heel_extended"
+  assert gl_export.config_mismatches(cfg, saved) == []
+  drift = ["osl_touch_sites (original -> heel_extended)"]
+  saved["osl_touch_sites"] = "original"
+  assert gl_export.config_mismatches(cfg, saved) == drift
+  del saved["osl_touch_sites"]
+  assert gl_export.config_mismatches(cfg, saved) == drift
+  set_touch_sites(cfg, "original")
+  assert gl_export.config_mismatches(cfg, saved) == []
+
+  payload = torch.load(checkpoint, weights_only=False)
+  payload["osl_touch_sites"] = "original"
+  moved = checkpoint.with_name("model_8.pt")
+  torch.save(payload, moved)
+  disagree = r"touch sites 'original', but its run's params/env\.yaml records 'heel"
+  with pytest.raises(ValueError, match=disagree):
+    gl_export.build_components(moved)
 
 
 def test_run_spec_reads_the_validation_cfg(tmp_path) -> None:

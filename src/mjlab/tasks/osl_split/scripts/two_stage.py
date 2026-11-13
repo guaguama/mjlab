@@ -18,7 +18,10 @@ W&B runs and ``play``) and any step can be redone on its own:
    refused, unless ``--stage1.checkpoint`` is given (see **Resuming**).
 3. **Stage 2**: ``python -m mjlab.scripts.train
    Mjlab-Split-Unicycle-OSL-Fullbody<tags> --agent.warm-start.path <that file>``.
-   Its iteration numbers continue stage 1's.
+   Its iteration numbers continue stage 1's. It builds the OSL foot touch sites
+   stage 1 trained with: the driver reads them from the lineage the split writes
+   beside the warm start (``<that file>.yaml``) and passes
+   ``--env.osl-touch-sites``, since the stage-2 runner refuses a switch.
 4. **One TensorBoard view** (``--curves offset``): ``<log-root>/pipelines/<name>_tb/``
    holds symlinks to both runs' event files. TensorBoard reads the event files of
    one directory as one run, and stage 2's steps start after stage 1's, so every
@@ -87,13 +90,15 @@ warns about any flag that sets it otherwise, so its stage-2 flags need not be
 repeated (``--agent.resume-curriculum config`` takes the command line's curriculum
 instead, e.g. to extend the schedule with ``--agent.algorithm.schedule-iterations``);
 its network flags (an OSL critic's ``--agent.osl-critic.hidden-dims``, say) must be
-repeated. After a stage-1 resume, continue with ``--stage1.run-dir`` on the resumed
-run. Before the split, the driver compares the run's highest-numbered checkpoint
-with the last iteration its ``params/agent.yaml`` plans (``max_iterations``,
-counted from ``N`` in a resumed run; see :func:`planned_last_iteration`). A
-checkpoint short of it means stage 1 crashed, was stopped or is still training: the
-driver refuses to split it unless ``--stage1.checkpoint`` names the checkpoint to
-use, and with ``--stage2.skip`` it only warns.
+repeated, and so must ``--env.osl-touch-sites original`` for a stage trained with
+the model XML's touch zones (the resumed run refuses other zones). After a stage-1
+resume, continue with ``--stage1.run-dir`` on the resumed run. Before the split,
+the driver compares the run's highest-numbered checkpoint with the last iteration
+its ``params/agent.yaml`` plans (``max_iterations``, counted from ``N`` in a
+resumed run; see :func:`planned_last_iteration`). A checkpoint short of it means
+stage 1 crashed, was stopped or is still training: the driver refuses to split it
+unless ``--stage1.checkpoint`` names the checkpoint to use, and with
+``--stage2.skip`` it only warns.
 
 Run it from the repository root, as a file, e.g.::
 
@@ -128,7 +133,7 @@ from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType, TracebackType
-from typing import IO, Any, Literal
+from typing import IO, Any, Literal, get_args
 
 import tyro
 
@@ -141,6 +146,15 @@ Reward = Literal["mimic", "clf"]
 Curves = Literal["offset", "none"]
 MODEL_TAGS: dict[Model, str] = {"robot": "-ROBOT", "msk": "-MSK"}
 """Mirror of ``osl_constants.MODEL_TAGS``."""
+TouchSites = Literal["original", "heel_extended"]
+"""Mirror of ``osl_constants.TouchSites``."""
+LEGACY_TOUCH_SITES: TouchSites = "original"
+"""Mirror of ``osl_constants.LEGACY_TOUCH_SITES``: what a lineage that records no
+touch sites trained with."""
+TOUCH_SITES_KEY = "osl_touch_sites"
+"""Mirror of ``osl_mimic.touch_sites.ENV_FIELD``: the lineage's key."""
+TOUCH_SITES_FLAG = "--env.osl-touch-sites"
+"""Mirror of ``osl_mimic.touch_sites.CLI_FLAG``."""
 
 STAGE1_TASK = "Mjlab-Gait-Library-Unicycle-OSL-Fullbody"
 STAGE2_TASK = "Mjlab-Split-Unicycle-OSL-Fullbody"
@@ -318,7 +332,10 @@ def stage2_command(
   warm_start: str | Path,
   reward: Reward,
   python: str = sys.executable,
+  touch_sites: str | None = None,
 ) -> list[str]:
+  """Stage 2's ``train`` call; ``touch_sites`` (stage 1's, see
+  :func:`warm_start_touch_sites`) becomes ``--env.osl-touch-sites``."""
   return [
     python,
     "-m",
@@ -336,6 +353,7 @@ def stage2_command(
     str(cfg.stage2.human_freeze_iterations),
     "--log-root",
     _abspath(cfg.log_root),
+    *(() if touch_sites is None else (TOUCH_SITES_FLAG, touch_sites)),
     *shlex.split(cfg.stage2.extra_args),
   ]
 
@@ -423,6 +441,24 @@ def read_run_settings(run_dir: Path) -> dict[str, str]:
         "gait-library run?"
       )
   return settings
+
+
+def warm_start_touch_sites(warm_start: Path) -> str | None:
+  """The OSL foot touch sites a warm start's stage 1 trained with, from the lineage
+  the split writes beside it (``<warm start>.yaml``): its ``osl_touch_sites``, or
+  ``"original"`` when it records none (converted before 2026-11-13). None when
+  there is no lineage to read."""
+  path = warm_start.with_name(f"{warm_start.name}.yaml")
+  try:
+    text = path.read_text(encoding="utf-8")
+  except OSError:
+    return None
+  value = _top_level(text, TOUCH_SITES_KEY)
+  if value is None:
+    return LEGACY_TOUCH_SITES
+  if value not in get_args(TouchSites):
+    raise PipelineError(f"{path} has an unknown {TOUCH_SITES_KEY}: {value!r}.")
+  return value
 
 
 def planned_last_iteration(run_dir: Path) -> int | None:
@@ -927,7 +963,11 @@ class _Pipeline:
       self._check_handover(self.stage1_run)
     self._split()
 
-    command2 = stage2_command(cfg, self.paths.warm_start, reward2, self.python)
+    # A dry run splits nothing, so a lineage at that path would be another run's.
+    touch = None if cfg.dry_run else warm_start_touch_sites(self.paths.warm_start)
+    command2 = stage2_command(
+      cfg, self.paths.warm_start, reward2, self.python, touch_sites=touch
+    )
     if cfg.stage2.skip:
       later = format_command(command2, {"WANDB_RUN_GROUP": cfg.name})
       log.say(f"Stage 2 skipped; to run it later:\n  {later}")

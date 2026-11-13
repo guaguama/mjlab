@@ -17,6 +17,11 @@ Four variants are vendored, selected by ``model`` and ``socket``:
 * ``socket="compliant"`` adds the four socket DoFs (``socket_piston``,
   ``socket_rotation_1..3``) between the residual femur and the prosthesis.
 
+The OSL foot's ``r_foot`` touch zone comes in two versions (:data:`TouchSites`):
+the XML's ``"original"``, which misses the heel and never fires, and
+``"heel_extended"``, which covers it and is the default since 2026-11-13
+(:data:`R_FOOT_TOUCH_BOXES`). Runs record which one they trained with.
+
 In every variant 44 of the non-free joints are driven by ``mjEQ_JOINT`` equality
 constraints. The vendored ``xmls/{body,meshes,scene}`` tree is a **byte-identical**
 copy of musclemimic's ``models/osl_fullbody/``, laid out the same way, so both XML
@@ -33,20 +38,25 @@ XMLs; regenerate them in musclemimic.
    musclemimic.
 """
 
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 import mujoco
+import numpy as np
+import tyro
 
 from mjlab import MJLAB_SRC_PATH
 from mjlab.actuator import XmlActuatorCfg
 from mjlab.actuator.actuator import TransmissionType
-from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
 from mjlab.utils.spec_config import CollisionCfg
 
 Model = Literal["robot", "msk"]
 Socket = Literal["rigid", "compliant"]
 Collision = Literal["mjlab", "xml"]
+TouchSites = Literal["original", "heel_extended"]
+"""The OSL foot's touch-sensor zones (see :data:`R_FOOT_TOUCH_BOXES`)."""
 
 MODEL_TAGS: dict[Model, str] = {"robot": "-ROBOT", "msk": "-MSK"}
 """Each model's tag in the OSL task ids, right after ``OSL-Fullbody``."""
@@ -130,6 +140,55 @@ OSL_FOOT_SHELL_GEOM = "OSL_KA_L1_osl_foot_assembly_geom_1"
 """The OSL foot's visual shell mesh, which collides in the source XML."""
 OSL_SOCKET_BODY = "OSL_KA_L1_osl_generic_socket"
 PELVIS_BODY = "pelvis"
+
+# The four foot touch sensors, each the summed normal force of the contacts in its
+# site's box (MuJoCo counts a contact when a ray from it along the contact normal hits
+# the box). Site -> sensor, in musclemimic's observation order.
+R_FOOT_TOUCH_SITE = "OSL_KA_L1_r_foot_touch"
+R_TOES_TOUCH_SITE = "OSL_KA_L1_r_toes_touch"
+L_FOOT_TOUCH_SITE = "foot_touch_l"
+L_TOES_TOUCH_SITE = "toes_touch_l"
+TOUCH_SITE_SENSORS: dict[str, str] = {
+  R_FOOT_TOUCH_SITE: "r_foot",
+  R_TOES_TOUCH_SITE: "r_toes",
+  L_FOOT_TOUCH_SITE: "l_foot",
+  L_TOES_TOUCH_SITE: "l_toes",
+}
+
+TOUCH_SITES: tuple[TouchSites, ...] = get_args(TouchSites)
+DEFAULT_TOUCH_SITES: TouchSites = "heel_extended"
+"""What a newly configured OSL entity or task builds."""
+LEGACY_TOUCH_SITES: TouchSites = "original"
+"""What a run, checkpoint or bundle that records no touch-site version was trained
+with: everything made before 2026-11-13."""
+
+
+@dataclass(frozen=True)
+class TouchBox:
+  """A box touch site in its body's frame: centre and half-sizes (m)."""
+
+  pos: tuple[float, float, float]
+  size: tuple[float, float, float]
+
+
+R_FOOT_TOUCH_BOXES: dict[TouchSites, TouchBox] = {
+  "original": TouchBox(pos=(0.025, -0.04, 0.0), size=(0.05, 0.03, 0.05)),
+  "heel_extended": TouchBox(pos=(0.01, -0.04, 0.0), size=(0.065, 0.03, 0.05)),
+}
+"""The OSL foot's ``r_foot`` zone per version, in the foot frame
+(``OSL_KA_L1_osl_foot_assembly``: x forward, y up, z lateral).
+
+The OSL foot collides only through its three capsules (the shell mesh is out of
+collision, :func:`_fix_osl_contacts`), and a capsule meets the floor only at its end
+caps: heel contacts at foot x = -0.035..-0.029, toe contacts at x = 0.182..0.200.
+``original`` is the model XML's box, x = -0.025..0.075, unchanged since the upstream
+Open Source Leg model (assist_sim): it ends 5 mm short of the heel, so ``r_foot``
+never fires although the heel carries about 73% of the OSL foot's normal force
+(``r_toes`` catches the rest). ``heel_extended`` moves only its back edge, to
+x = -0.055: every heel-cap point lies inside with at least 1.3 cm to spare, whatever
+the foot's pitch, and ``r_foot`` and ``r_toes`` together catch the whole load without
+counting any contact twice. The height, the width and the front edge are unchanged.
+Sites neither collide nor carry mass, so only the ``r_foot`` reading differs."""
 
 # musclemimic's exact finger lists (``environments/humanoids/osl_fullbody.py``).
 # Exact names, never patterns: the v3 export renamed four right-hand joints (no
@@ -305,8 +364,79 @@ def _fix_osl_contacts(spec: mujoco.MjSpec) -> None:
   spec.add_exclude(bodyname1=PELVIS_BODY, bodyname2=OSL_SOCKET_BODY)
 
 
+def check_touch_sites(value: object, what: str = "OSL touch sites") -> TouchSites:
+  """``value`` if it names a touch-site version; raises ``ValueError`` otherwise."""
+  if value not in TOUCH_SITES:
+    raise ValueError(f"{what} {value!r}: expected one of {list(TOUCH_SITES)}.")
+  return value  # type: ignore[return-value]
+
+
+def apply_touch_sites(spec: mujoco.MjSpec, touch_sites: TouchSites) -> mujoco.MjSpec:
+  """Give the OSL foot's ``r_foot`` zone the box of ``touch_sites``, in place.
+
+  Writes only that site's ``pos`` and ``size`` (:data:`R_FOOT_TOUCH_BOXES`); the
+  other three touch sites, every geom and all physics stay as they are. Either
+  version can be applied over the other, so the last call wins. Returns the spec.
+
+  Raises:
+    ValueError: For an unknown version, or a spec whose ``r_foot`` zone is neither
+      box (a regenerated model: compare it with the XML before updating the boxes).
+  """
+  box = R_FOOT_TOUCH_BOXES[check_touch_sites(touch_sites)]
+  # From the element list, not spec.site(name): once anything has been deleted
+  # from a spec, MuJoCo 3.11's name lookup can miss elements until the next compile.
+  sites = [s for s in spec.sites if s.name == R_FOOT_TOUCH_SITE]
+  if len(sites) != 1:
+    raise ValueError(
+      f"Expected one site {R_FOOT_TOUCH_SITE!r}, found {len(sites)}. Was the model "
+      "regenerated?"
+    )
+  site = sites[0]
+  current = (tuple(float(v) for v in site.pos), tuple(float(v) for v in site.size))
+  if current not in {(b.pos, b.size) for b in R_FOOT_TOUCH_BOXES.values()}:
+    raise ValueError(
+      f"Site {R_FOOT_TOUCH_SITE!r} has pos {current[0]} and size {current[1]}, "
+      "neither OSL touch-site version's box. Was the model regenerated?"
+    )
+  site.pos = box.pos
+  site.size = box.size
+  return spec
+
+
+def touch_sites_of_model(model: mujoco.MjModel, prefix: str = "") -> TouchSites | None:
+  """The touch-site version a compiled model carries, read from its ``r_foot`` box.
+
+  Args:
+    model: A compiled model.
+    prefix: The OSL entity's name prefix: ``"robot/"`` in an mjlab scene, ``""``
+      for a bare model from :func:`get_spec`.
+
+  Returns:
+    The version, or None when the model has no OSL ``r_foot`` touch site.
+
+  Raises:
+    ValueError: If the site's box is neither version's.
+  """
+  site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, prefix + R_FOOT_TOUCH_SITE)
+  if site < 0:
+    return None
+  pos, size = model.site_pos[site], model.site_size[site]
+  for version, box in R_FOOT_TOUCH_BOXES.items():
+    if np.allclose(pos, box.pos, rtol=0.0, atol=1e-12) and np.allclose(
+      size, box.size, rtol=0.0, atol=1e-12
+    ):
+      return version
+  raise ValueError(
+    f"Site {prefix + R_FOOT_TOUCH_SITE!r} has pos {pos.tolist()} and size "
+    f"{size.tolist()}, neither OSL touch-site version's box."
+  )
+
+
 def get_spec(
-  model: Model = "robot", socket: Socket = "rigid", fingers: bool = False
+  model: Model = "robot",
+  socket: Socket = "rigid",
+  fingers: bool = False,
+  touch_sites: TouchSites = DEFAULT_TOUCH_SITES,
 ) -> mujoco.MjSpec:
   """Load a variant and apply every adaptation mjlab needs.
 
@@ -315,9 +445,13 @@ def get_spec(
     socket: ``"rigid"`` or ``"compliant"``.
     fingers: Keep the musculoskeletal model's 40 finger joints and 62 finger
       muscles. The default deletes them, as musclemimic does. The robot has none.
+    touch_sites: The OSL foot's touch zones (:data:`R_FOOT_TOUCH_BOXES`).
+      ``"original"`` keeps the XML's. An :class:`OslEntityCfg` applies its own
+      setting over this one when it builds.
   """
   if fingers and model != "msk":
     raise ValueError("Only the musculoskeletal model has fingers to keep.")
+  check_touch_sites(touch_sites)
   # Load by absolute path: MuJoCo resolves the musculoskeletal model's nested
   # include and skybox against the main file's directory.
   spec = mujoco.MjSpec.from_file(str(OSL_XMLS[(model, socket)]))
@@ -327,6 +461,7 @@ def get_spec(
   if model == "msk" and not fingers:
     _delete_fingers(spec)
   _fix_osl_contacts(spec)
+  apply_touch_sites(spec, touch_sites)
   return spec
 
 
@@ -540,9 +675,35 @@ def _collisions(collision: Collision) -> tuple[CollisionCfg, ...]:
   return (FULL_COLLISION,) if collision == "mjlab" else ()
 
 
+@dataclass
+class OslEntityCfg(EntityCfg):
+  """An OSL full-body entity, which also sets the OSL foot's touch zones.
+
+  :meth:`build` applies ``touch_sites`` (:func:`apply_touch_sites`) to whatever
+  ``spec_fn`` returns, so a task may wrap ``spec_fn`` freely and the entity's setting
+  still wins over the wrapped chain's (``get_spec``'s default included). A scene
+  builds its entities through :meth:`build`; ``Entity(cfg)`` would skip it.
+  """
+
+  touch_sites: tyro.conf.Suppress[TouchSites] = DEFAULT_TOUCH_SITES
+  """Hidden from the command line: an OSL task sets it from its env config's
+  ``osl_touch_sites`` (``--env.osl-touch-sites``), which the run records."""
+
+  def build(self) -> Entity:
+    spec_fn = self.spec_fn
+    touch_sites = check_touch_sites(self.touch_sites)
+
+    def spec_with_touch_sites() -> mujoco.MjSpec:
+      return apply_touch_sites(spec_fn(), touch_sites)
+
+    return Entity(replace(self, spec_fn=spec_with_touch_sites))
+
+
 def get_osl_robot_cfg(
-  socket: Socket = "rigid", collision: Collision = "mjlab"
-) -> EntityCfg:
+  socket: Socket = "rigid",
+  collision: Collision = "mjlab",
+  touch_sites: TouchSites = DEFAULT_TOUCH_SITES,
+) -> OslEntityCfg:
   """Get a fresh OSL full-body robot configuration instance.
 
   Returns a new EntityCfg instance each time to avoid mutation issues when
@@ -552,8 +713,9 @@ def get_osl_robot_cfg(
     socket: ``"rigid"`` or ``"compliant"``.
     collision: ``"mjlab"`` applies :data:`FULL_COLLISION`; ``"xml"`` keeps the
       model's own contact settings, which is what musclemimic simulates.
+    touch_sites: The OSL foot's touch zones (:data:`R_FOOT_TOUCH_BOXES`).
   """
-  return EntityCfg(
+  return OslEntityCfg(
     init_state=WALK_START_KEYFRAME,
     collisions=_collisions(collision),
     spec_fn=_SPEC_FNS[("robot", socket)],
@@ -561,20 +723,25 @@ def get_osl_robot_cfg(
       actuators=(_SERVOS, _OSL_MOTORS),
       soft_joint_pos_limit_factor=_SOFT_JOINT_POS_LIMIT_FACTOR,
     ),
+    touch_sites=check_touch_sites(touch_sites),
   )
 
 
 def get_osl_msk_cfg(
-  socket: Socket = "rigid", collision: Collision = "mjlab", fingers: bool = False
-) -> EntityCfg:
+  socket: Socket = "rigid",
+  collision: Collision = "mjlab",
+  fingers: bool = False,
+  touch_sites: TouchSites = DEFAULT_TOUCH_SITES,
+) -> OslEntityCfg:
   """Get a fresh OSL full-body musculoskeletal configuration instance.
 
   Args:
     socket: ``"rigid"`` or ``"compliant"``.
     collision: See :func:`get_osl_robot_cfg`.
     fingers: Keep the 40 finger joints and 62 finger muscles (default: deleted).
+    touch_sites: The OSL foot's touch zones (:data:`R_FOOT_TOUCH_BOXES`).
   """
-  return EntityCfg(
+  return OslEntityCfg(
     init_state=WALK_START_KEYFRAME,
     collisions=_collisions(collision),
     spec_fn=_FINGERED_SPEC_FNS[socket] if fingers else _SPEC_FNS[("msk", socket)],
@@ -582,6 +749,7 @@ def get_osl_msk_cfg(
       actuators=(_OSL_MOTORS, _MUSCLES),
       soft_joint_pos_limit_factor=_SOFT_JOINT_POS_LIMIT_FACTOR,
     ),
+    touch_sites=check_touch_sites(touch_sites),
   )
 
 
@@ -590,11 +758,9 @@ if __name__ == "__main__":
 
   import mujoco.viewer as viewer
 
-  from mjlab.entity.entity import Entity
-
   model = sys.argv[1] if len(sys.argv) > 1 else "robot"
   socket = sys.argv[2] if len(sys.argv) > 2 else "rigid"
   get_cfg = get_osl_msk_cfg if model == "msk" else get_osl_robot_cfg
-  robot = Entity(get_cfg(socket))  # type: ignore[arg-type]
+  robot = get_cfg(socket).build()  # type: ignore[arg-type]
 
   viewer.launch(robot.spec.compile())

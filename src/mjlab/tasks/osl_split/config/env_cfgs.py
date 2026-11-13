@@ -27,12 +27,12 @@ from __future__ import annotations
 from dataclasses import replace
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
-from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.tasks.osl_gait_library.config.dr import OslDrCfg
 from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward
 from mjlab.tasks.osl_mimic.mdp import mimic_component
+from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
 from mjlab.tasks.osl_split import mdp
 
 from .sensors import leg_contact_sensor_cfg, with_osl_sensors
@@ -48,7 +48,7 @@ def osl_split_env_cfg(
   mode: Mode = "train",
   dr_cfg: OslDrCfg | None = None,
   osl_obs: mdp.OslObsCfg | None = None,
-) -> ManagerBasedRlEnvCfg:
+) -> OslEnvCfg:
   """Create a stage-2 split environment over the unicycle library.
 
   Args:

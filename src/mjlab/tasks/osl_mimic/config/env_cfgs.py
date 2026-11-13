@@ -50,6 +50,7 @@ from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.osl_mimic import mdp
+from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
 from mjlab.terrains import TerrainEntityCfg
 from mjlab.viewer import ViewerConfig
 
@@ -230,7 +231,7 @@ def osl_mimic_env_cfg(
   socket: Socket = "rigid",
   reward: Reward = "mimic",
   mode: Mode = "train",
-) -> ManagerBasedRlEnvCfg:
+) -> OslEnvCfg:
   """Create a musclemimic-style OSL full-body imitation environment.
 
   Args:
@@ -267,7 +268,7 @@ def osl_mimic_env_cfg(
     for name in names
   }
 
-  return ManagerBasedRlEnvCfg(
+  return OslEnvCfg(
     decimation=DECIMATION,
     scene=SceneCfg(
       terrain=TerrainEntityCfg(terrain_type="plane"),

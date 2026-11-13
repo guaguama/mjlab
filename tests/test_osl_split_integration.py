@@ -23,7 +23,10 @@ it. What the module tests cannot see on their own, this checks across them:
 * the scalars stage 2 adds to rsl_rl's, at the right steps and values;
 * a stage-2 task that switches the reward retrains its critics, and one that
   switches the model or the socket is refused, as is a stage-2 config that would
-  build another architecture than stage 1 trained.
+  build another architecture than stage 1 trained;
+* the OSL foot touch sites stage 1 trained with: recorded by the converter, read
+  back by the pipeline driver for stage 2's command line, required by stage 2 and
+  recorded in its checkpoints.
 
 No mjlab env and no GPU: the env is a fake with what the runner, the algorithm and
 the agents' rewards read. Validation and the OSL export have their own tests
@@ -34,6 +37,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import re
 import statistics
 from collections import deque
 from collections.abc import Mapping
@@ -47,7 +51,11 @@ import torch
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from tensordict import TensorDict
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  Model,
+  Socket,
+  TouchSites,
+)
 from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_cfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
@@ -58,8 +66,9 @@ from mjlab.tasks.osl_split.rl.policy import std_parameter
 from mjlab.tasks.osl_split.rl.ppo import RETURN_COUNT_FRESH
 from mjlab.tasks.osl_split.rl.runner import SplitOnPolicyRunner
 from mjlab.tasks.osl_split.rl.schedules import MODULES, ChannelSchedule, SplitSchedule
-from mjlab.tasks.osl_split.rl.warmstart import LOG_STD
+from mjlab.tasks.osl_split.rl.warmstart import LOG_STD, WarmStart
 from mjlab.tasks.osl_split.scripts.split import main as split_main
+from mjlab.tasks.osl_split.scripts.two_stage import warm_start_touch_sites
 from mjlab.utils.os import dump_yaml
 
 NUM_ENVS = 6
@@ -210,10 +219,13 @@ class _FakeEnv:
   Observations and rewards are random. Episodes time out after
   ``EPISODE_STEPS`` steps or end at random. Every step's team reward, the agents'
   rewards it implies (each channel plus the twist times its split) and the dones
-  are recorded, to replay the logged episode means from.
+  are recorded, to replay the logged episode means from. Its config builds the
+  OSL foot's ``touch_sites``, by default a freshly configured run's.
   """
 
-  def __init__(self, model: Model, seed: int = 0) -> None:
+  def __init__(
+    self, model: Model, seed: int = 0, touch_sites: TouchSites = "heel_extended"
+  ) -> None:
     terms = {name: SimpleNamespace(action_dim=dim) for name, dim in ACTION_TERMS[model]}
     self.num_envs = NUM_ENVS
     self.num_actions = sum(term.action_dim for term in terms.values())
@@ -221,7 +233,7 @@ class _FakeEnv:
     self.max_episode_length = 1000
     self.common_step_counter = 0
     self.episode_length_buf = torch.zeros(NUM_ENVS, dtype=torch.long)
-    self.cfg = SimpleNamespace(scale_rewards_by_dt=False)
+    self.cfg = SimpleNamespace(scale_rewards_by_dt=False, osl_touch_sites=touch_sites)
     self.action_manager = SimpleNamespace(
       active_terms=list(terms), get_term=terms.__getitem__
     )
@@ -367,9 +379,16 @@ def _unified_actor(
   return actor
 
 
-def _stage1_run(root: Path, model: Model, reward: Reward) -> tuple[Path, dict]:
+def _stage1_run(
+  root: Path,
+  model: Model,
+  reward: Reward,
+  touch_sites: TouchSites | None = "heel_extended",
+) -> tuple[Path, dict]:
   """A stage-1 run as ``train.py`` leaves one, plus a W&B log naming it; returns
-  the run directory and its checkpoint."""
+  the run directory and its checkpoint. The checkpoint records the OSL foot
+  ``touch_sites`` the run trained with, as the stage-1 runner saves them (None: a
+  run from before the setting, which records none)."""
   experiment = f"osl_fullbody_unicycle_{model}_{reward}_{SOCKET}"
   run_dir = root / "logs" / "rsl_rl" / experiment / "2026-11-06_18-40-18"
   agent = osl_gait_library_runner_cfg(
@@ -386,7 +405,7 @@ def _stage1_run(root: Path, model: Model, reward: Reward) -> tuple[Path, dict]:
     obs, {"critic": ["critic"]}, "critic", 1, hidden_dims=HIDDEN
   )
   optimizer = MuonAdam(itertools.chain(actor.parameters(), critic.parameters()), 4e-4)
-  checkpoint = {
+  checkpoint: dict[str, Any] = {
     "actor_state_dict": _random_state(actor, generator),
     "critic_state_dict": _random_state(critic, generator),
     "optimizer_state_dict": optimizer.state_dict(),
@@ -399,6 +418,8 @@ def _stage1_run(root: Path, model: Model, reward: Reward) -> tuple[Path, dict]:
     "iter": STAGE1_ITER,
     "infos": {"env_state": {"common_step_counter": STAGE1_COUNTER}},
   }
+  if touch_sites is not None:
+    checkpoint["osl_touch_sites"] = touch_sites
   torch.save(checkpoint, run_dir / f"model_{STAGE1_ITER}.pt")
   log = root / "wandb" / f"run-20261106_184026-{WANDB_ID}" / "logs" / "debug.log"
   log.parent.mkdir(parents=True)
@@ -647,6 +668,7 @@ def test_stage2_end_to_end(tmp_path: Path, model: Model, osl_critic_obs: str) ->
   checkpoint = torch.load(final, map_location="cpu", weights_only=False)
   assert checkpoint["iter"] == steps[-1]
   assert checkpoint["stage_iteration"] == ITERATIONS - 1
+  assert checkpoint["osl_touch_sites"] == "heel_extended"  # Stage 1's and the env's.
   assert checkpoint["infos"]["split"] == {
     "stage_start": STAGE_START,
     "lineage": runner.lineage,
@@ -810,6 +832,41 @@ def test_stage2_task_must_match_the_stage1_run(
   assert stats["mean"].tolist() == [0.0, 0.0]
   assert stats["var"].tolist() == [1.0, 1.0]
   torch.testing.assert_close(stats["count"], torch.full((2,), RETURN_COUNT_FRESH))
+
+
+@pytest.mark.parametrize("stage1", ["recorded", "unrecorded", "old_file"])
+def test_stage2_keeps_the_stage1_touch_sites(tmp_path: Path, stage1: str) -> None:
+  """The OSL foot touch sites cross the stages with the run. The converter records
+  stage 1's in the lineage: its checkpoint's (``recorded``), or ``original`` for a
+  run from before the setting, which records none (``unrecorded``); a file
+  converted before the setting records none and means ``original`` too
+  (``old_file``). The pipeline driver reads them from the lineage beside the file
+  for stage 2's ``--env.osl-touch-sites``. Stage 2 in the other zones is refused,
+  naming that flag; in stage 1's it starts, and its checkpoints record them."""
+  torch.manual_seed(0)
+  recorded = stage1 == "recorded"
+  trained: TouchSites = "heel_extended" if recorded else "original"
+  other: TouchSites = "original" if recorded else "heel_extended"
+  run_dir, _ = _stage1_run(
+    tmp_path, "msk", "clf", touch_sites="heel_extended" if recorded else None
+  )
+  ws_path = split_main([str(run_dir), "--out", str(tmp_path / "ws.pt")])
+  if stage1 == "old_file":
+    ws = WarmStart.load(ws_path)
+    del ws.lineage["osl_touch_sites"]
+    ws.save(ws_path)
+  lineage = WarmStart.load(ws_path).lineage
+  assert lineage.get("osl_touch_sites") == (None if stage1 == "old_file" else trained)
+  assert warm_start_touch_sites(ws_path) == trained
+
+  cfg = _stage2_cfg("msk", "clf", ws_path)
+  with pytest.raises(ValueError, match=re.escape(f"--env.osl-touch-sites {trained}")):
+    _Runner(_FakeEnv("msk", touch_sites=other), copy.deepcopy(cfg), None)
+  runner = _Runner(_FakeEnv("msk", touch_sites=trained), cfg, None)
+  assert runner.stage_start == STAGE_START
+  runner.save(str(tmp_path / "model.pt"))
+  saved = torch.load(tmp_path / "model.pt", map_location="cpu", weights_only=False)
+  assert saved["osl_touch_sites"] == trained
 
 
 def test_stage2_builds_the_stage1_architecture(tmp_path: Path) -> None:

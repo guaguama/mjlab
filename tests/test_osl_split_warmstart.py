@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict
 from datetime import datetime
 from itertools import chain
@@ -25,7 +26,7 @@ import torch
 import yaml
 from tensordict import TensorDict
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket, TouchSites
 from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_cfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward, _actions
@@ -34,6 +35,7 @@ from mjlab.tasks.osl_mimic.mdp.rewards import ClfCfg
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_mimic.rl.muon import MuonAdam
 from mjlab.tasks.osl_mimic.rl.ppo import MuscleMimicPPO
+from mjlab.tasks.osl_mimic.touch_sites import CHECKPOINT_KEY, CLI_FLAG, ENV_FIELD
 from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
 from mjlab.tasks.osl_split.rl.layout import ActionLayout
 from mjlab.tasks.osl_split.rl.warmstart import (
@@ -51,9 +53,11 @@ from mjlab.tasks.osl_split.rl.warmstart import (
   env_stages_in_force,
   find_wandb_run_id,
   library_release,
+  lineage_touch_sites,
   lineage_warnings,
   lineage_yaml_path,
   load_warm_start,
+  provenance_lines,
   resolve_stage1_checkpoint,
   stage1_env_settings,
   stage1_learning_rate,
@@ -98,9 +102,13 @@ def _write_agent_yaml(
   dump_yaml(run_dir / "params" / "agent.yaml", asdict(cfg))
 
 
-def _stage1_checkpoint(model: Model, iteration: int) -> dict[str, Any]:
+def _stage1_checkpoint(
+  model: Model, iteration: int, touch_sites: TouchSites | None = None
+) -> dict[str, Any]:
   """The keys ``MuscleMimicPPO.save`` and ``MjlabOnPolicyRunner.save`` write, with
-  every tensor random (exact copies and exact slices then differ from mistakes)."""
+  every tensor random (exact copies and exact slices then differ from mistakes).
+  ``touch_sites`` is the OSL runner's touch-site key; None leaves it out, as in
+  every checkpoint saved before the setting."""
   generator = torch.Generator().manual_seed(iteration)
   obs = TensorDict(
     {"actor": torch.zeros(1, OBS_DIM), "critic": torch.zeros(1, OBS_DIM)},
@@ -130,7 +138,7 @@ def _stage1_checkpoint(model: Model, iteration: int) -> dict[str, Any]:
   actor_state[LOG_STD] = 4.0 * torch.rand(OUT_DIM[model], generator=generator) - 3.0
   updates = iteration + 1
   optimizer = MuonAdam(chain(actor.parameters(), critic.parameters()), lr=4e-4)
-  return {
+  checkpoint: dict[str, Any] = {
     "actor_state_dict": actor_state,
     "critic_state_dict": randomized(critic),
     "optimizer_state_dict": optimizer.state_dict(),
@@ -143,6 +151,9 @@ def _stage1_checkpoint(model: Model, iteration: int) -> dict[str, Any]:
     "iter": iteration,
     "infos": {"env_state": {"common_step_counter": updates * NUM_STEPS}},
   }
+  if touch_sites is not None:
+    checkpoint[CHECKPOINT_KEY] = touch_sites
+  return checkpoint
 
 
 def _stage1_run(
@@ -151,18 +162,34 @@ def _stage1_run(
   socket: Socket = "compliant",
   reward: Reward = "clf",
   iterations: tuple[int, ...] = (9, 12),
+  *,
+  checkpoint_touch: TouchSites | None = None,
+  env_yaml_touch: TouchSites | None = None,
 ) -> Path:
-  """``<root>/logs/rsl_rl/<experiment>/<run>`` plus ``<root>/wandb`` naming it."""
+  """``<root>/logs/rsl_rl/<experiment>/<run>`` plus ``<root>/wandb`` naming it.
+
+  The run records its OSL touch sites nowhere, as every run before the setting,
+  unless ``checkpoint_touch`` gives its checkpoints their key and
+  ``env_yaml_touch`` its ``params/env.yaml`` the field (top level, and the robot
+  entity's, as ``dump_yaml`` writes them)."""
   experiment = f"osl_fullbody_unicycle_{model}_{reward}_{socket}"
   run_dir = root / "logs" / "rsl_rl" / experiment / "2026-11-06_18-40-18"
   _write_agent_yaml(run_dir, model, socket, reward, experiment)
-  (run_dir / "params" / "env.yaml").write_text(
+  env_yaml = (
     "scene:\n  entities:\n    robot:\n      spec_fn: "
     "!!python/name:mjlab.tasks.osl_gait_library.config.dr.fn ''\n"
-    f"commands:\n  motion:\n    library_dir: {LIBRARY}\n"
   )
+  if env_yaml_touch is not None:
+    env_yaml += f"      touch_sites: {env_yaml_touch}\n"
+  env_yaml += f"commands:\n  motion:\n    library_dir: {LIBRARY}\n"
+  if env_yaml_touch is not None:
+    env_yaml += f"{ENV_FIELD}: {env_yaml_touch}\n"
+  (run_dir / "params" / "env.yaml").write_text(env_yaml)
   for iteration in iterations:
-    torch.save(_stage1_checkpoint(model, iteration), run_dir / f"model_{iteration}.pt")
+    torch.save(
+      _stage1_checkpoint(model, iteration, checkpoint_touch),
+      run_dir / f"model_{iteration}.pt",
+    )
   _wandb_run(root / "wandb", f"run-20261106_184026-{WANDB_ID}", run_dir.resolve())
   return run_dir
 
@@ -374,15 +401,142 @@ def test_resolve_stage1_checkpoint_is_numeric(tmp_path: Path) -> None:
 
 def test_check_compatible(tmp_path: Path) -> None:
   ws = build_warm_start(_stage1_run(tmp_path, "msk"), verify=False)
-  assert check_compatible(ws, model="msk", socket="compliant", reward="clf") is False
+  assert ws.lineage[ENV_FIELD] == "original"  # The run records none.
+
+  def check(**changes: str) -> bool:
+    stage2 = {"model": "msk", "socket": "compliant", "reward": "clf"}
+    return check_compatible(ws, **{**stage2, "touch_sites": "original", **changes})
+
+  assert check() is False
   # The reward switch is the one change allowed.
-  assert check_compatible(ws, model="msk", socket="compliant", reward="mimic") is True
+  assert check(reward="mimic") is True
   with pytest.raises(ValueError, match="model cannot switch"):
-    check_compatible(ws, model="robot", socket="compliant", reward="clf")
+    check(model="robot")
   with pytest.raises(ValueError, match="socket cannot switch"):
-    check_compatible(ws, model="msk", socket="rigid", reward="clf")
+    check(socket="rigid")
   with pytest.raises(ValueError, match="Unknown reward"):
-    check_compatible(ws, model="msk", socket="compliant", reward="ppo")
+    check(reward="ppo")
+  with pytest.raises(ValueError, match="expected one of"):
+    check(touch_sites="toes")
+
+  # Nor may the OSL foot's touch sites, either way; the error names the fix.
+  with pytest.raises(ValueError, match="touch sites cannot switch") as error:
+    check(touch_sites="heel_extended")
+  assert f"{CLI_FLAG} original." in str(error.value)
+  assert "records none" not in str(error.value)
+  ws.lineage[ENV_FIELD] = "heel_extended"
+  assert check(touch_sites="heel_extended") is False
+  assert check(touch_sites="heel_extended", reward="mimic") is True
+  with pytest.raises(ValueError, match="touch sites cannot switch") as error:
+    check(touch_sites="original")
+  assert f"{CLI_FLAG} heel_extended." in str(error.value)
+  with pytest.raises(ValueError, match="touch sites cannot switch"):
+    check(touch_sites="original", reward="mimic")  # Not with a reward switch either.
+
+  # A lineage without the key (converted before the setting) asks the stage-1
+  # checkpoint it names, which here records none: "original".
+  del ws.lineage[ENV_FIELD]
+  assert check() is False
+  assert check(reward="mimic") is True
+  with pytest.raises(ValueError, match="not in its lineage, so from its") as error:
+    check(touch_sites="heel_extended")
+  assert f"{CLI_FLAG} original." in str(error.value)
+
+
+def test_an_old_lineage_asks_its_stage1_checkpoint(tmp_path: Path) -> None:
+  """A warm start converted by code from before the setting records no touch sites,
+  even from a stage-1 run that recorded them: the stage-1 checkpoint it names
+  decides, and "original" stands only when that checkpoint is not readable here."""
+  run_dir = _stage1_run(tmp_path, "msk", checkpoint_touch="heel_extended")
+  ws = build_warm_start(run_dir, verify=False)
+  del ws.lineage[ENV_FIELD]  # As an earlier converter wrote it.
+  assert lineage_touch_sites(ws.lineage) == "heel_extended"
+  stage2 = {"model": "msk", "socket": "compliant", "reward": "clf"}
+  assert check_compatible(ws, **stage2, touch_sites="heel_extended") is False
+  with pytest.raises(ValueError, match=f"{CLI_FLAG} heel_extended") as error:
+    check_compatible(ws, **stage2, touch_sites="original")
+  assert "from its stage-1 checkpoint" in str(error.value)
+  assert "stage-1 checkpoint" in provenance_lines(ws.lineage)[0]
+  # Another machine's path: nothing to read, so the zones of every earlier run.
+  ws.lineage["stage1_checkpoint"] = str(tmp_path / "elsewhere" / "model_12.pt")
+  assert lineage_touch_sites(ws.lineage) == "original"
+  assert "not readable here" in provenance_lines(ws.lineage)[0]
+
+
+@pytest.mark.parametrize(
+  ("checkpoint_touch", "env_yaml_touch", "expected"),
+  [
+    ("heel_extended", None, "heel_extended"),  # The checkpoint's own key, ...
+    ("heel_extended", "heel_extended", "heel_extended"),
+    ("original", "original", "original"),
+    (None, "original", "original"),  # ... else "original", which env.yaml may say,
+    (None, None, "original"),  # ... the zones every earlier run trained with.
+  ],
+)
+def test_lineage_records_stage1_touch_sites(
+  tmp_path: Path,
+  checkpoint_touch: TouchSites | None,
+  env_yaml_touch: TouchSites | None,
+  expected: TouchSites,
+) -> None:
+  run_dir = _stage1_run(
+    tmp_path, "msk", checkpoint_touch=checkpoint_touch, env_yaml_touch=env_yaml_touch
+  )
+  ws = build_warm_start(run_dir, verify=False)
+  assert ws.lineage[ENV_FIELD] == expected
+  assert lineage_touch_sites(ws.lineage) == expected
+  assert f"  OSL touch sites: {expected}" in ws.summary().splitlines()
+  # Converting in memory, as stage 2 does when given the run itself, records alike.
+  assert load_warm_start(run_dir, "model_9.pt").lineage[ENV_FIELD] == expected
+
+
+@pytest.mark.parametrize(
+  ("checkpoint_touch", "env_yaml_touch"),
+  [
+    ("heel_extended", "original"),
+    ("original", "heel_extended"),
+    (None, "heel_extended"),
+  ],
+)
+def test_a_checkpoint_contradicting_its_run_is_refused(
+  tmp_path: Path, checkpoint_touch: TouchSites | None, env_yaml_touch: TouchSites
+) -> None:
+  """A checkpoint whose touch sites contradict its run's env.yaml (moved into
+  another run's directory?) is refused, not converted with either value. One without
+  the key trained with "original": every OSL runner has recorded it since."""
+  run_dir = _stage1_run(
+    tmp_path, "robot", checkpoint_touch=checkpoint_touch, env_yaml_touch=env_yaml_touch
+  )
+  recorded = (
+    f"records OSL touch sites {checkpoint_touch!r}"
+    if checkpoint_touch is not None
+    else "records no OSL touch sites (so it predates the setting and trained with "
+    "'original')"
+  )
+  message = f"{recorded}, but its run's params/env.yaml records {env_yaml_touch!r}"
+  with pytest.raises(ValueError, match=re.escape(message)):
+    build_warm_start(run_dir, verify=False)
+  with pytest.raises(ValueError, match=re.escape(message)):
+    main([str(run_dir), "--no-verify"])
+  assert not (run_dir / "warm_start").exists()
+
+
+def test_lineage_reads_a_dumped_env_yaml(tmp_path: Path) -> None:
+  """A run configured today: ``train.py`` dumps its env config, and the converter
+  checks its checkpoint against the top-level ``osl_touch_sites`` (not the robot
+  entity's nested one)."""
+  run_dir = _stage1_run(
+    tmp_path, "msk", iterations=(12,), checkpoint_touch="heel_extended"
+  )
+  env_cfg = osl_gait_library_env_cfg("msk", "compliant", "clf", "train", "unicycle")
+  dump_yaml(run_dir / "params" / "env.yaml", asdict(env_cfg))
+  text = (run_dir / "params" / "env.yaml").read_text()
+  assert f"\n{ENV_FIELD}: heel_extended\n" in text  # The default, at top level.
+  assert build_warm_start(run_dir, verify=False).lineage[ENV_FIELD] == "heel_extended"
+  # A key-less checkpoint in it contradicts that line, and is refused.
+  torch.save(_stage1_checkpoint("msk", 12, None), run_dir / "model_12.pt")
+  with pytest.raises(ValueError, match="records no OSL touch sites"):
+    build_warm_start(run_dir, verify=False)
 
 
 def test_architecture_mismatches(tmp_path: Path) -> None:
@@ -470,6 +624,24 @@ def test_save_load_round_trip(tmp_path: Path) -> None:
     build_warm_start(path)
   with pytest.raises(ValueError, match="not a warm-start file"):
     WarmStart.load(run_dir / "model_9.pt")
+
+
+def test_touch_sites_round_trip(tmp_path: Path) -> None:
+  """The file and its lineage YAML keep stage 1's touch sites; the YAML as a
+  top-level line, which the two-stage driver reads without a YAML parser."""
+  run_dir = _stage1_run(
+    tmp_path, "robot", checkpoint_touch="heel_extended", env_yaml_touch="heel_extended"
+  )
+  ws = build_warm_start(run_dir, verify=False)
+  path = tmp_path / "out" / "ws.pt"
+  ws.save(path)
+  text = lineage_yaml_path(path).read_text()
+  assert re.findall(rf"^{ENV_FIELD}:.*$", text, re.M) == [f"{ENV_FIELD}: heel_extended"]
+  loaded = WarmStart.load(path)
+  assert loaded.lineage[ENV_FIELD] == "heel_extended"
+  assert lineage_touch_sites(loaded.lineage) == "heel_extended"
+  assert load_warm_start(path).lineage == ws.lineage
+  assert "  OSL touch sites: heel_extended" in loaded.summary().splitlines()
 
 
 def test_verification_catches_a_wrong_split(tmp_path: Path) -> None:
@@ -677,14 +849,37 @@ def test_lineage_warnings() -> None:
 
 
 def test_old_warm_start_files_load(tmp_path: Path) -> None:
-  """A file converted before the provenance keys loads, and summarizes."""
+  """A file converted before the provenance keys loads, and summarizes; one
+  converted before the touch-site setting trained with the original zones."""
+  assert ENV_FIELD in OPTIONAL_LINEAGE_KEYS and ENV_FIELD not in LINEAGE_KEYS
   ws = build_warm_start(_stage1_run(tmp_path, "msk"), verify=False)
   for key in OPTIONAL_LINEAGE_KEYS:
     del ws.lineage[key]
   ws.save(tmp_path / "old.pt")
+  assert ENV_FIELD not in lineage_yaml_path(tmp_path / "old.pt").read_text()
   old = WarmStart.load(tmp_path / "old.pt")
   assert not set(OPTIONAL_LINEAGE_KEYS) & set(old.lineage)
-  assert "Warm start from" in old.summary()
+  assert lineage_touch_sites(old.lineage) == "original"
+  summary = old.summary()
+  assert "Warm start from" in summary
+  touch = [line for line in summary.splitlines() if "OSL touch sites" in line]
+  # Not in the lineage, so from its stage-1 checkpoint, which records none either.
+  assert touch[0].startswith("  OSL touch sites: original (not in its lineage")
+
+
+def test_provenance_lines_show_touch_sites() -> None:
+  """The first provenance line: the touch sites stage 1 trained with, and whether
+  the lineage recorded them."""
+  for value in ("original", "heel_extended"):
+    assert provenance_lines({ENV_FIELD: value}) == [f"  OSL touch sites: {value}"]
+  assert provenance_lines({}) == [
+    "  OSL touch sites: original (not recorded: the warm start was converted "
+    "before the setting, and its stage-1 checkpoint is not readable here)"
+  ]
+  lineage = {ENV_FIELD: "heel_extended", "stage1_lr": 4e-5, "stage1_std_cap": 0.07}
+  assert provenance_lines(lineage)[0] == "  OSL touch sites: heel_extended"
+  with pytest.raises(ValueError, match="expected one of"):
+    lineage_touch_sites({ENV_FIELD: "toes"})
 
 
 ##
@@ -703,6 +898,7 @@ def test_cli_writes_file_and_yaml(
   assert ws.lineage["verified_max_abs_diff"] is not None
   printed = capsys.readouterr().out
   assert "stage 2 starts at iteration 13" in printed and str(out) in printed
+  assert "  OSL touch sites: original\n" in printed
 
   # Defaults: beside the run; --checkpoint and --no-verify.
   default = main([str(run_dir), "--checkpoint", "model_9.pt", "--no-verify"])

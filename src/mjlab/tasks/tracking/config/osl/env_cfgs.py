@@ -21,11 +21,11 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   get_spec,
 )
 from mjlab.entity import EntityCfg
-from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointEffortActionCfg, JointPositionActionCfg
 from mjlab.managers import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg
@@ -113,8 +113,13 @@ def _servo_action_scale(spec: mujoco.MjSpec) -> dict[str, float]:
 def osl_fullbody_tracking_env_cfg(
   socket: Socket = "rigid",
   play: bool = False,
-) -> ManagerBasedRlEnvCfg:
-  """Create an OSL full-body (robot) flat terrain tracking configuration."""
+) -> OslEnvCfg:
+  """Create an OSL full-body (robot) flat terrain tracking configuration.
+
+  Its robot builds the OSL foot touch zones ``osl_touch_sites`` names
+  (``--env.osl-touch-sites``), as every OSL task's does; the tracking observation
+  reads no touch sensor.
+  """
   cfg = make_tracking_env_cfg()
 
   cfg.scene.entities = {"robot": _entity_cfg(socket)}
@@ -232,4 +237,4 @@ def osl_fullbody_tracking_env_cfg(
 
     motion.sampling_mode = "start"
 
-  return cfg
+  return OslEnvCfg(**{f.name: getattr(cfg, f.name) for f in fields(cfg)})

@@ -30,13 +30,13 @@ import os
 from typing import Literal
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
-from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.tasks.osl_gait_library import mdp
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward, osl_mimic_env_cfg
 from mjlab.tasks.osl_mimic.mdp import mimic_component
+from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
 
 from .dr import OslDrCfg, apply_osl_dr
 
@@ -121,7 +121,7 @@ def osl_gait_library_env_cfg(
   mode: Mode = "train",
   variant: Variant = "walk_fwd",
   dr_cfg: OslDrCfg | None = None,
-) -> ManagerBasedRlEnvCfg:
+) -> OslEnvCfg:
   """Create a gait-library environment.
 
   Args:

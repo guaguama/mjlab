@@ -46,11 +46,19 @@ from mjlab.scripts.train import TrainConfig
 from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 from mjlab.tasks.osl_gait_library.config.rl_cfg import GaitLibraryRunnerCfg
 from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
+from mjlab.tasks.osl_mimic import touch_sites as mimic_touch_sites
 from mjlab.tasks.osl_mimic.config import env_cfgs as mimic_env_cfgs
 from mjlab.tasks.osl_mimic.config.rl_cfg import MuscleMimicPpoCfg
 from mjlab.tasks.osl_split import config as split_config
 from mjlab.tasks.osl_split import scripts as split_scripts
 from mjlab.tasks.osl_split.config.rl_cfg import SplitRunnerCfg, osl_split_runner_cfg
+from mjlab.tasks.osl_split.rl.warmstart import (
+  LINEAGE_KEYS,
+  WARM_START_FORMAT,
+  WarmStart,
+  lineage_touch_sites,
+  lineage_yaml_path,
+)
 from mjlab.tasks.osl_split.scripts import two_stage
 from mjlab.tasks.osl_split.scripts.two_stage import (
   GpuProcess,
@@ -141,6 +149,36 @@ def make_stage1_run(
   return run
 
 
+def split_lineage(touch_sites: str | None) -> dict[str, Any]:
+  """A lineage as the split builds it, abridged (every required key, in order),
+  recording stage 1's ``touch_sites`` after the socket (None: no key, as in a file
+  converted before the setting)."""
+  values: dict[str, Any] = {
+    "format": WARM_START_FORMAT,
+    "stage1_run_dir": "/logs/rsl_rl/osl_fullbody_unicycle_msk_clf_compliant/run",
+    "iter": 11,
+    "model": "msk",
+    "socket": "compliant",
+    "reward": "clf",
+    "action_terms": [["osl_motors", 2], ["muscles", 339]],
+    "actor_cfg": {"hidden_dims": [1024, 512, 256], "activation": "swish"},
+    "human_std": {"min": 0.05, "median": 0.07, "max": 0.1},
+    "osl_std": [0.12, 0.08],
+  }
+  lineage: dict[str, Any] = {}
+  for key in LINEAGE_KEYS:
+    lineage[key] = values.get(key)
+    if key == "socket" and touch_sites is not None:
+      lineage[mimic_touch_sites.ENV_FIELD] = touch_sites
+  return lineage
+
+
+def save_warm_start(path: Path, lineage: dict[str, Any]) -> None:
+  """``path`` and its lineage YAML, written by the split's own ``WarmStart.save``."""
+  empty: dict[str, Any] = {}
+  WarmStart(empty, empty, empty, empty, lineage).save(path)
+
+
 ##
 # Fakes for the launched steps and for nvidia-smi.
 ##
@@ -207,12 +245,14 @@ def fake_steps(
   root: Path,
   codes: dict[str, int] | None = None,
   events: list[str] | None = None,
+  lineage: dict[str, Any] | None = None,
 ) -> list[Launch]:
   """Replace ``subprocess.Popen`` with the three steps' parts; return the launches.
 
   A training stage creates its run directory (stage 1 also its checkpoints and
   ``params/agent.yaml``) with an event file, and prints ``train``'s run-directory
-  line; the split writes its ``--out`` file.
+  line; the split writes its ``--out`` file: with a ``lineage``, as the real split
+  does (``WarmStart.save``, the lineage YAML beside it), else bytes alone.
   """
   launches: list[Launch] = []
 
@@ -225,7 +265,10 @@ def fake_steps(
       events.append(step)
     if step == "split":
       out = Path(launch.args[launch.args.index("--out") + 1])
-      out.write_bytes(b"warm start")
+      if lineage is None:
+        out.write_bytes(b"warm start")
+      else:
+        save_warm_start(out, lineage)
       return FakeStep(["split: ok\n"], (codes or {}).get(step, 0))
     run = root / "runs" / step
     if step == "stage1":
@@ -477,6 +520,10 @@ def test_literals_mirror_mjlab() -> None:
   assert set(get_args(two_stage.Socket)) == set(get_args(osl_constants.Socket))
   assert set(get_args(two_stage.Reward)) == set(get_args(mimic_env_cfgs.Reward))
   assert two_stage.MODEL_TAGS == osl_constants.MODEL_TAGS
+  assert set(get_args(two_stage.TouchSites)) == set(get_args(osl_constants.TouchSites))
+  assert two_stage.LEGACY_TOUCH_SITES == osl_constants.LEGACY_TOUCH_SITES
+  assert two_stage.TOUCH_SITES_KEY == mimic_touch_sites.ENV_FIELD
+  assert two_stage.TOUCH_SITES_FLAG == mimic_touch_sites.CLI_FLAG
 
 
 @pytest.mark.parametrize(("model", "socket", "reward"), COMBOS)
@@ -568,7 +615,7 @@ def test_commands(tmp_path: Path, library: Path) -> None:
     "--out",
     str(out),
   ]
-  assert two_stage.stage2_command(cfg, out, "mimic", "py") == [
+  stage2 = [
     "py",
     "-m",
     "mjlab.scripts.train",
@@ -588,6 +635,17 @@ def test_commands(tmp_path: Path, library: Path) -> None:
     "--agent.logger",
     "tensorboard",
   ]
+  assert two_stage.stage2_command(cfg, out, "mimic", "py") == stage2
+  # Stage 1's touch sites, when known, go before the extra arguments, which come
+  # last (and so win).
+  for touch in ("original", "heel_extended"):
+    assert two_stage.stage2_command(cfg, out, "mimic", "py", touch_sites=touch) == [
+      *stage2[:-2],
+      "--env.osl-touch-sites",
+      touch,
+      "--agent.logger",
+      "tensorboard",
+    ]
   assert two_stage.stage2_reward(cfg, "mimic") == "mimic"
   switched = replace(cfg, stage2=Stage2Cfg(reward="clf"))
   assert two_stage.stage2_reward(switched, "mimic") == "clf"
@@ -638,6 +696,17 @@ def test_train_cli_accepts_the_commands(tmp_path: Path, library: Path) -> None:
   assert agent.freeze.human_actor_iterations == 200
   assert agent.run_name == "p_stage2"
   assert stage2.log_root == str(tmp_path / "logs")
+  assert isinstance(stage2.env, mimic_touch_sites.OslEnvCfg)
+  assert stage2.env.osl_touch_sites == "heel_extended"  # Not forwarded: the default.
+
+  # The touch-site flag the driver forwards reaches the env and its robot entity.
+  forwarded = two_stage.stage2_command(cfg, out, "clf", touch_sites="original")
+  env = parse(forwarded, default2).env
+  assert isinstance(env, mimic_touch_sites.OslEnvCfg)
+  assert env.osl_touch_sites == "original"
+  robot = env.scene.entities["robot"]
+  assert isinstance(robot, osl_constants.OslEntityCfg)
+  assert robot.touch_sites == "original"
 
 
 def test_cli_flags() -> None:
@@ -695,6 +764,31 @@ def test_parse_run_dir_reads_trains_announcement() -> None:
   assert parse("[INFO] Logging experiment in directory: /a/run \r\n") == Path("/a/run")
   assert parse("[INFO] Training with: device=cuda:0, seed=42, rank=0\n") is None
   assert parse("Logging experiment in directory: /a\n") is None
+
+
+def test_warm_start_touch_sites_reads_the_splits_lineage(tmp_path: Path) -> None:
+  """Stage 1's OSL touch sites, from the lineage YAML ``WarmStart.save`` writes
+  beside the warm start, read without a YAML parser: what mjlab reads too."""
+  for value in ("original", "heel_extended", None):
+    path = tmp_path / str(value) / "ws.pt"
+    save_warm_start(path, split_lineage(value))
+    read = two_stage.warm_start_touch_sites(path)
+    # None: a file converted before the setting, which trained with the original.
+    assert read == (value or "original")
+    assert read == lineage_touch_sites(WarmStart.load(path).lineage)
+  # No lineage beside the file: nothing to forward.
+  bare = tmp_path / "bare.pt"
+  bare.write_bytes(b"warm start")
+  assert two_stage.warm_start_touch_sites(bare) is None
+  assert two_stage.warm_start_touch_sites(tmp_path / "missing.pt") is None
+  # An unknown version is an error, not a guess.
+  unknown = tmp_path / "unknown" / "ws.pt"
+  save_warm_start(unknown, split_lineage("toes"))
+  with pytest.raises(two_stage.PipelineError, match="unknown osl_touch_sites: 'toes'"):
+    two_stage.warm_start_touch_sites(unknown)
+  # Only the top-level key counts.
+  lineage_yaml_path(bare).write_text("stage1_env:\n  osl_touch_sites: heel_extended\n")
+  assert two_stage.warm_start_touch_sites(bare) == "original"
 
 
 def test_parse_gpu_processes() -> None:
@@ -882,6 +976,79 @@ def test_pipeline_runs_the_steps_in_order(
       (run2, "events.out.tfevents.2000.host.2.0"),
     )
   )
+
+
+@pytest.mark.parametrize("touch_sites", ["original", "heel_extended"])
+def test_stage2_builds_the_touch_sites_stage1_trained_with(
+  tmp_path: Path, library: Path, monkeypatch: pytest.MonkeyPatch, touch_sites: str
+) -> None:
+  """The driver reads stage 1's OSL touch sites from the lineage the split wrote
+  and passes them to stage 2, whose runner refuses a switch, before the extra
+  arguments."""
+  fake_smi(monkeypatch, [""])
+  launches = fake_steps(monkeypatch, tmp_path, lineage=split_lineage(touch_sites))
+  cfg = make_cfg(tmp_path, stage2=Stage2Cfg(extra_args="--agent.logger tensorboard"))
+  assert two_stage.run_pipeline(cfg, python="py") == 0
+  assert [step_name(launch.args) for launch in launches] == [
+    "stage1",
+    "split",
+    "stage2",
+  ]
+  paths = PipelinePaths.of(cfg)
+  assert launches[-1].args == two_stage.stage2_command(
+    cfg, paths.warm_start, "clf", "py", touch_sites=touch_sites
+  )
+  assert launches[-1].args[-4:] == [
+    two_stage.TOUCH_SITES_FLAG,
+    touch_sites,
+    "--agent.logger",
+    "tensorboard",
+  ]
+
+
+def test_touch_sites_in_printed_stage2_commands(
+  tmp_path: Path,
+  library: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+) -> None:
+  """A skipped stage 2's command for later carries stage 1's touch sites. A dry
+  run splits nothing, so it never reads a lineage left at the warm-start path (an
+  earlier run's), and its stage-2 command carries none."""
+  run1 = make_stage1_run(tmp_path / "given")
+  fake_smi(monkeypatch, [""])
+  launches = fake_steps(monkeypatch, tmp_path, lineage=split_lineage("original"))
+  cfg = make_cfg(
+    tmp_path, stage1=Stage1Cfg(run_dir=str(run1)), stage2=Stage2Cfg(skip=True)
+  )
+  assert two_stage.run_pipeline(cfg, python="py") == 0
+  assert [step_name(launch.args) for launch in launches] == ["split"]
+  paths = PipelinePaths.of(cfg)
+  later = two_stage.stage2_command(
+    cfg, paths.warm_start, "clf", "py", touch_sites="original"
+  )
+  assert shlex.join(later) in capsys.readouterr().out
+
+  assert two_stage.warm_start_touch_sites(paths.warm_start) == "original"
+  dry = replace(cfg, stage2=Stage2Cfg(), dry_run=True)
+  assert two_stage.run_pipeline(dry, python="py") == 0
+  assert [step_name(launch.args) for launch in launches] == ["split"]
+  out = capsys.readouterr().out
+  assert shlex.join(two_stage.stage2_command(dry, paths.warm_start, "clf", "py")) in out
+  assert two_stage.TOUCH_SITES_FLAG not in out
+
+
+def test_an_unknown_touch_site_version_stops_the_pipeline(
+  tmp_path: Path,
+  library: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+) -> None:
+  fake_smi(monkeypatch, [""])
+  launches = fake_steps(monkeypatch, tmp_path, lineage=split_lineage("toes"))
+  assert two_stage.run_pipeline(make_cfg(tmp_path), python="py") == 1
+  assert [step_name(launch.args) for launch in launches] == ["stage1", "split"]
+  assert "unknown osl_touch_sites: 'toes'" in capsys.readouterr().err
 
 
 def test_an_existing_stage1_run_keeps_its_reward_and_socket(

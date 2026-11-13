@@ -76,6 +76,22 @@ Added
   channels, sensors, tare, saturation, history, latency and reset), action blocks
   and training delays. Its ``parity.npz`` includes an OSL observation conformance
   sequence that mjlab's own terms build from CPU MuJoCo states.
+- ``Mjlab-FSM-Unicycle-OSL-Fullbody`` tasks ("stage 1.5", ``tasks/osl_fsm``; the
+  same ``-ROBOT``/``-MSK``, ``-CLF`` and ``-Compliant`` variants as the split tasks):
+  stage 2 with the learned OSL actor replaced by the classical finite-state impedance
+  controller of the opensourceleg SDK and MyoSuite (``--env.osl-fsm.rules sdk`` or
+  ``myosuite``, ported from osl_deploy's ``osl_fsm``), which runs in the env's
+  ``osl_motors`` action term from the prosthesis's own encoders and ankle load cell,
+  once per control step with zero sensor lag and motor delay. Only the human learns
+  (``HumanOnlyPPO``, stage 2's human path), from the first iteration, on stage 2's
+  human reward channel; checkpoints record the controller they trained beside.
+  ``python -m mjlab.tasks.osl_fsm.export <checkpoint>`` writes a schema-2
+  ``osl_split_dual`` bundle with the human actor and no OSL network: its
+  ``controllers.osl`` keeps stage 2's sensor contract (at zero lag), motor block and
+  training delays, adds an ``fsm`` block with the recorded controller and the
+  osl_deploy command line, and ``parity.npz`` adds an FSM conformance that
+  osl_deploy's state machine reproduces. Run it with ``python -m osl_deploy.osl_fsm
+  BUNDLE --rules <rules>``.
 - The stage-2 OSL actor's ankle load cell can be switched off like its socket cell
   (``OslObsCfg.ankle_load_cell``, or on the train CLI
   ``--env.observations.osl.terms.loadcell.params.ankle False``), for training on
@@ -209,6 +225,18 @@ Changed
   gait-library and split runners default to the raw mean for musculoskeletal
   policies whose median muscle std is at most 0.3 (the stage-1 recipe ends at
   0.07), and keep the noise-averaged action above it.
+- Every OSL task's prosthetic foot now senses its heel: the ``r_foot`` touch zone
+  extends back to x = -0.055 in the foot frame (``--env.osl-touch-sites
+  heel_extended``, the default). The model XML's zone ended 5 mm short of where the
+  foot's collision capsules touch down, so ``r_foot`` never fired although the heel
+  carries about 73% of the foot's load. ``original`` keeps the XML's zone, which every
+  earlier run trained with. The setting is recorded in ``params/env.yaml``, in every
+  OSL checkpoint (``osl_touch_sites``), in the stage-2 warm start's lineage and in
+  deployment bundles (an optional ``touch_sites`` manifest key, read from the
+  bundle's model). Whatever records none means ``original``. Resuming a checkpoint
+  in a run built with other zones, or warm-starting stage 2 from one, is refused
+  with the flag that fixes it; play, evaluation and export build the checkpoint's
+  own zones.
 
 - Bumped ``rsl-rl-lib`` from 5.5.0 to 5.5.1. This removes the need for capping
   ``wandb`` below 0.29.

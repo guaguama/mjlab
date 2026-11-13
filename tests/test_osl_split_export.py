@@ -4,16 +4,19 @@ A four-clip library is generated from the real model by forward kinematics, and 
 fake stage-2 run directory holds the task's own saved configs and two small
 actors, so ``export_bundle`` runs end to end on both models. The OSL observation
 conformance sequence is checked against a NumPy rebuild from the bundle's own
-files, the way a deployment consumer builds it.
+files, the way a deployment consumer builds it. A robot run from before the OSL
+touch-site setting exports too.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import mujoco
 import numpy as np
@@ -23,7 +26,7 @@ import torch
 import yaml
 from tensordict import TensorDict
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import get_spec
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import OSL_XMLS, get_spec
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_split import export as split_export
 from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
@@ -37,6 +40,52 @@ OSL_OBS = 600
 CASES = {
   ("robot", "rigid", "mimic"): (635, [["servos", 27], ["osl_motors", 2]]),
   ("msk", "compliant", "clf"): (2338, [["osl_motors", 2], ["muscles", 339]]),
+}
+ROBOT = ("robot", "rigid", "mimic")
+R_FOOT = "robot/OSL_KA_L1_r_foot_touch"
+# The manifest's ``touch_sites`` of a heel_extended model: the contract shared with
+# osl_deploy (logs/handover/touch_fix/brief_mjlab.md), verbatim.
+TOUCH_SITES_CONTRACT: dict[str, Any] = {
+  "version": "heel_extended",
+  "edited_from_xml": [R_FOOT],
+  "frame": (
+    "site pos/quat/size in the parent body's frame (MuJoCo site_pos, site_quat, "
+    "site_size; box half-sizes)"
+  ),
+  "sites": {
+    R_FOOT: {
+      "sensor": "robot/r_foot",
+      "body": "robot/OSL_KA_L1_osl_foot_assembly",
+      "type": "box",
+      "pos": [0.01, -0.04, 0.0],
+      "quat": [1.0, 0.0, 0.0, 0.0],
+      "size": [0.065, 0.03, 0.05],
+    },
+    "robot/OSL_KA_L1_r_toes_touch": {
+      "sensor": "robot/r_toes",
+      "body": "robot/OSL_KA_L1_osl_foot_assembly",
+      "type": "box",
+      "pos": [0.215, -0.04, -0.005],
+      "quat": [1.0, 0.0, 0.0, 0.0],
+      "size": [0.075, 0.03, 0.06],
+    },
+    "robot/foot_touch_l": {
+      "sensor": "robot/l_foot",
+      "body": "robot/calcn_l",
+      "type": "box",
+      "pos": [0.09, -0.01, 0.0],
+      "quat": [1.0, 0.0, 0.0, 0.0],
+      "size": [0.1, 0.01, 0.055],
+    },
+    "robot/toes_touch_l": {
+      "sensor": "robot/l_toes",
+      "body": "robot/toes_l",
+      "type": "box",
+      "pos": [0.0275, -0.01, 0.0],
+      "quat": [0.9393726845901743, 0.0, 0.3428978848663966, 0.0],
+      "size": [0.04, 0.01, 0.0675],
+    },
+  },
 }
 
 
@@ -108,7 +157,10 @@ def _actor(group: str, obs_dim: int, action_dim: int, distribution: dict):
   return actor
 
 
-def _make_run(root: Path, case, library: Path) -> Path:
+def _make_run(root: Path, case, library: Path, legacy: bool = False) -> Path:
+  """A run on the default touch sites, recorded in its env.yaml, its checkpoint
+  and its warm start's lineage; a ``legacy`` run predates the setting, so none of
+  them records any (``original``)."""
   model, socket, reward = case
   obs_dim, terms = CASES[case]
   run = root / f"{model}_{socket}" / "run"
@@ -117,7 +169,10 @@ def _make_run(root: Path, case, library: Path) -> Path:
   agent = osl_split_runner_cfg(model, socket, reward, "exp")
   agent.actor.hidden_dims = HIDDEN
   agent.osl_actor.hidden_dims = HIDDEN
-  dump_yaml(run / "params" / "env.yaml", asdict(env_cfg))
+  env = asdict(env_cfg)
+  if legacy:
+    del env["osl_touch_sites"], env["scene"]["entities"]["robot"]["touch_sites"]
+  dump_yaml(run / "params" / "env.yaml", env)
   dump_yaml(run / "params" / "agent.yaml", asdict(agent))
   torch.manual_seed(0)
   human_dim = sum(int(dim) for name, dim in terms if name != "osl_motors")
@@ -129,16 +184,16 @@ def _make_run(root: Path, case, library: Path) -> Path:
     "action_terms": terms,
     "stage1_checkpoint": "/stage1/run/model_4.pt",
   }
-  torch.save(
-    {
-      "human_actor_state_dict": human.state_dict(),
-      "osl_actor_state_dict": osl.state_dict(),
-      "iter": 7,
-      "stage_iteration": 2,
-      "infos": {"split": {"stage_start": 5, "lineage": lineage}},
-    },
-    run / "model_7.pt",
-  )
+  payload = {
+    "human_actor_state_dict": human.state_dict(),
+    "osl_actor_state_dict": osl.state_dict(),
+    "iter": 7,
+    "stage_iteration": 2,
+    "infos": {"split": {"stage_start": 5, "lineage": lineage}},
+  }
+  if not legacy:  # Stage 1 and stage 2 trained on the same touch sites.
+    lineage["osl_touch_sites"] = payload["osl_touch_sites"] = env_cfg.osl_touch_sites
+  torch.save(payload, run / "model_7.pt")
   return run / "model_7.pt"
 
 
@@ -148,6 +203,29 @@ def exported(request, tmp_path_factory, library):
   bundle = split_export.export_bundle(checkpoint)
   manifest = json.loads((bundle / "manifest.json").read_text())
   return request.param, checkpoint, bundle, manifest
+
+
+@pytest.fixture(scope="module")
+def legacy(tmp_path_factory, library):
+  """The bundle and manifest of a robot run from before the touch-site setting."""
+  checkpoint = _make_run(tmp_path_factory.mktemp("legacy"), ROBOT, library, True)
+  bundle = split_export.export_bundle(checkpoint)
+  return bundle, json.loads((bundle / "manifest.json").read_text())
+
+
+def _check_model_touch_sites(bundle: Path, touch_sites: dict) -> mujoco.MjModel:
+  """The bundle's model.mjb carries each touch site exactly as the manifest says."""
+  model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
+  for name, entry in touch_sites["sites"].items():
+    site = model.site(name)
+    assert model.body(int(site.bodyid[0])).name == entry["body"]
+    assert site.type[0] == mujoco.mjtGeom.mjGEOM_BOX and entry["type"] == "box"
+    for key in ("pos", "quat", "size"):
+      assert getattr(site, key).tolist() == entry[key], (name, key)
+    sensor = model.sensor(entry["sensor"])
+    assert sensor.type[0] == mujoco.mjtSensor.mjSENS_TOUCH
+    assert (sensor.objtype[0], sensor.objid[0]) == (mujoco.mjtObj.mjOBJ_SITE, site.id)
+  return model
 
 
 def test_bundle_contract(exported) -> None:
@@ -306,3 +384,60 @@ def test_refuses_stage1_runs_and_osl_drift(exported, tmp_path) -> None:
   saved["terms"]["loadcell"]["func"] = "somewhere.else"
   with pytest.raises(ValueError, match="loadcell.func"):
     split_export.apply_osl_group(cfg.observations["osl"], saved)
+
+
+def test_bundle_declares_its_touch_sites(exported) -> None:
+  """A run on the default zones: the schema-2 manifest's ``touch_sites`` is the
+  contract shared with osl_deploy, model.mjb carries exactly those sites, and the
+  README says which zones the bundle has."""
+  _, _, bundle, m = exported
+  assert m["schema_version"] == 2
+  assert m["touch_sites"] == TOUCH_SITES_CONTRACT
+  _check_model_touch_sites(bundle, m["touch_sites"])
+  readme = (bundle / "README.md").read_text()
+  assert "\n- Touch zones: **heel_extended**, " in readme
+  assert "(foot x -0.055 to 0.075 m; manifest `touch_sites`)" in readme
+
+
+def test_legacy_run_exports_the_xml_touch_sites(legacy) -> None:
+  """A run from before the setting records no touch sites (nor does its
+  lineage), so it trained with the model XML's: its bundle says ``original``,
+  edits nothing, and both the manifest and model.mjb carry the XML's ``r_foot``
+  box; the other zones never change."""
+  bundle, m = legacy
+  assert m["schema_version"] == 2
+  xml_model = mujoco.MjModel.from_xml_path(str(OSL_XMLS[("robot", "rigid")]))
+  xml = xml_model.site(R_FOOT.removeprefix("robot/"))
+  expected = copy.deepcopy(TOUCH_SITES_CONTRACT)
+  expected.update(version="original", edited_from_xml=[])
+  expected["sites"][R_FOOT].update(
+    pos=xml.pos.tolist(), quat=xml.quat.tolist(), size=xml.size.tolist()
+  )
+  assert m["touch_sites"] == expected
+  model = _check_model_touch_sites(bundle, m["touch_sites"])
+  for key in ("pos", "quat", "size"):
+    np.testing.assert_array_equal(getattr(model.site(R_FOOT), key), getattr(xml, key))
+  readme = (bundle / "README.md").read_text()
+  assert "\n- Touch zones: **original**, " in readme
+  assert "(foot x -0.025 to 0.075 m; manifest `touch_sites`)" in readme
+
+
+def test_refuses_a_lineage_on_other_touch_sites(library, tmp_path) -> None:
+  """Stage 2 trains the human on stage 1's touch sites: a run whose warm-start
+  lineage records others, or none (a stage 1 from before the setting, so
+  ``original``), is refused."""
+  checkpoint = _make_run(tmp_path, ROBOT, library)
+  payload = torch.load(checkpoint, weights_only=False)
+  lineage = payload["infos"]["split"]["lineage"]
+  mismatch = (
+    "trained with the OSL touch sites 'heel_extended', but its warm start's stage "
+    "1 with 'original'"
+  )
+  recorded, unrecorded = (checkpoint.with_name(f"model_{i}.pt") for i in (8, 9))
+  lineage["osl_touch_sites"] = "original"
+  torch.save(payload, recorded)
+  del lineage["osl_touch_sites"]
+  torch.save(payload, unrecorded)
+  for path in (recorded, unrecorded):
+    with pytest.raises(ValueError, match=mismatch):
+      split_export.export_bundle(path)

@@ -74,9 +74,6 @@ def run_evaluate(task_id: str, cfg: EvaluateConfig) -> dict[str, float]:
   env_cfg.events.pop("push_robot", None)
   env_cfg.scene.num_envs = cfg.num_envs
 
-  env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
-  env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-
   log_root_path = (Path(cfg.log_root) / agent_cfg.experiment_name).resolve()
   resume_path, _ = get_wandb_checkpoint_path(
     log_root_path, Path(cfg.wandb_run_path), cfg.wandb_checkpoint_name
@@ -84,6 +81,15 @@ def run_evaluate(task_id: str, cfg: EvaluateConfig) -> dict[str, float]:
   print(f"[INFO] Loading checkpoint: {resume_path}")
 
   runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
+  # As in play.py: a runner may make the env build what the checkpoint was trained
+  # with (the OSL tasks' touch sites).
+  configure = getattr(runner_cls, "configure_env_for_checkpoint", None)
+  if configure is not None:
+    configure(env_cfg, resume_path)
+
+  env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+  env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
   runner = runner_cls(env, asdict(agent_cfg), device=device)
   runner.load(str(resume_path), map_location=device)
   policy = runner.get_inference_policy(device=device)

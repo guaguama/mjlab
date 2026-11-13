@@ -9,8 +9,9 @@
 (mjlab's command line takes collections as quoted Python literals.)
 
 The run's ``params/agent.yaml`` names its model, socket, reward and variant; the
-task is rebuilt from code (as the exporter does), the checkpoint is loaded into the
-task's runner, and the runner's passes run once per inference mode:
+task is rebuilt from code (as the exporter does), with the OSL foot touch sites the
+checkpoint was trained with (``touch_sites.run_touch_sites``), the checkpoint is
+loaded into the task's runner, and the runner's passes run once per inference mode:
 
 * validation (``Validation*/``): every library clip in its own env from phase 0 at
   its own twist, on the nominal plant with mid-range actuator delays, for one
@@ -37,6 +38,8 @@ from typing import Any
 
 import torch
 import tyro
+
+from mjlab.tasks.osl_mimic.touch_sites import run_touch_sites, set_touch_sites
 
 from .export import config_mismatches, read_config, run_spec
 
@@ -107,6 +110,7 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
   checkpoint = cfg.checkpoint.resolve()
   params = checkpoint.parent / "params"
   agent = read_config(params / "agent.yaml")
+  saved = read_config(params / "env.yaml")
   spec = run_spec(checkpoint, agent)
   task_id = spec.task_id
   if task_id is None:
@@ -114,7 +118,6 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
 
   library = cfg.library
   if library is None:
-    saved = read_config(params / "env.yaml")
     saved_dir = saved.get("commands", {}).get("motion", {}).get("library_dir", "")
     env_var = (
       UNICYCLE_LIBRARY_ENV_VAR if spec.variant == "unicycle" else LIBRARY_ENV_VAR
@@ -131,6 +134,9 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
   # The runner's evaluation envs take their simulation settings from this training
   # config (and stress validation plays a copy of it), so every override goes here.
   env_cfg = load_env_cfg(task_id)
+  touch = run_touch_sites(checkpoint, saved_env=saved)
+  set_touch_sites(env_cfg, touch.value)
+  print(f"[INFO] OSL touch sites: {touch.value} (from {touch.source}).")
   if cfg.legacy_contacts:
     use_legacy_contacts(env_cfg)
   if cfg.solver_iterations is not None:
@@ -140,7 +146,7 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
   motion = env_cfg.commands["motion"]
   assert isinstance(motion, GaitLibraryCommandCfg)
   motion.library_dir = str(library)
-  for issue in config_mismatches(env_cfg, read_config(params / "env.yaml")):
+  for issue in config_mismatches(env_cfg, saved):
     print(f"[WARN] Differs from the run's env.yaml: {issue}", file=sys.stderr)
   env_cfg.scene.num_envs = 2  # The runner needs a training env; the evals own theirs.
 

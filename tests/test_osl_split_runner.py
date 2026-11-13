@@ -11,6 +11,8 @@ CPU only and without an mjlab env:
   stage-local schedules, the logged scalars, both validation families,
   checkpoints with their exports, resuming (on the checkpoint's curriculum),
   play's load of the actors alone, and the refusals;
+* the OSL foot touch sites: recorded in every checkpoint, and required to match
+  the env's by the warm start, a resume and play;
 * the validation env's config, taken from the training env's where it matters
   (the env itself is never built).
 
@@ -24,6 +26,7 @@ import copy
 import json
 import math
 import os
+import re
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +42,9 @@ from tensordict import TensorDict
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   OSL_TORQUE_JOINTS,
   Model,
+  OslEntityCfg,
   Socket,
+  TouchSites,
 )
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.envs.mdp.actions import TendonEffortAction
@@ -51,6 +56,7 @@ from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.mdp.rewards import mimic_reward
 from mjlab.tasks.osl_mimic.rl import runner as mimic_runner
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel, RunningMeanStd
+from mjlab.tasks.osl_mimic.touch_sites import set_touch_sites
 from mjlab.tasks.osl_split.config import (
   SPLIT_TASKS,
   TASK_PREFIX,
@@ -110,6 +116,7 @@ from mjlab.tasks.osl_split.rl.warmstart import (
   WARM_START_FORMAT,
   WarmStart,
   library_release,
+  lineage_touch_sites,
   load_warm_start,
 )
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
@@ -256,9 +263,15 @@ class _FakeEnv:
   """A vec env and its unwrapped env in one object: what the runner, the algorithm
   and the export read. Episodes time out after ``EPISODE_STEPS`` steps or end at
   random; every step's channel and twist rewards are random, and the agents'
-  expected rewards are recorded."""
+  expected rewards are recorded. Its config builds the OSL foot's ``touch_sites``
+  (a freshly configured run's ``heel_extended`` by default)."""
 
-  def __init__(self, num_envs: int = NUM_ENVS, seed: int = 0) -> None:
+  def __init__(
+    self,
+    num_envs: int = NUM_ENVS,
+    seed: int = 0,
+    touch_sites: TouchSites = "heel_extended",
+  ) -> None:
     self.num_envs = num_envs
     self.num_actions = HUMAN_DIM + 2
     self.device = "cpu"
@@ -267,7 +280,9 @@ class _FakeEnv:
     self.physics_dt = 0.002
     self.common_step_counter = 0
     self.episode_length_buf = torch.zeros(num_envs, dtype=torch.long)
-    self.cfg: Any = SimpleNamespace(scale_rewards_by_dt=False, commands={})
+    self.cfg: Any = SimpleNamespace(
+      scale_rewards_by_dt=False, commands={}, osl_touch_sites=touch_sites
+    )
     self.action_manager = _action_manager()
     self.reward_manager = _FakeRewardManager(num_envs)
     self.observation_manager = _observation_manager()
@@ -370,6 +385,7 @@ def _lineage(reward: str = "clf") -> dict[str, Any]:
     "env_steps": STAGE1_ENV_STEPS,
     "model": "msk",
     "socket": "compliant",
+    "osl_touch_sites": "heel_extended",  # As the fake env builds by default.
     "reward": reward,
     "variant": "unicycle",
     "experiment_name": "stage1",
@@ -1056,6 +1072,106 @@ def test_play_loads_only_the_actors(tmp_path: Path) -> None:
     played.learn(1)
 
 
+OTHER_TOUCH_SITES: dict[TouchSites, TouchSites] = {
+  "heel_extended": "original",
+  "original": "heel_extended",
+}
+
+
+def _touch_runner(touch_sites: TouchSites) -> _Runner:
+  """A runner without a warm start, on an env that builds ``touch_sites``."""
+  env = _FakeEnv(touch_sites=touch_sites)
+  return _Runner(cast(Any, env), _quick_cfg(None), None, "cpu")
+
+
+def test_checkpoints_record_and_require_the_touch_sites(tmp_path: Path) -> None:
+  """Every checkpoint records the OSL foot touch sites its env simulates, under the
+  top-level ``osl_touch_sites``. One loaded into an env that builds the other
+  zones is refused, by a resume and by play's load of the actors alone, naming the
+  flag that builds the trained zones: the human actor's ``r_foot`` input would read
+  what it never saw. A checkpoint that records none was saved before the setting
+  and trained with ``original``. Play builds the checkpoint's zones itself, and a
+  matching checkpoint loads and records its value again."""
+  ws = _write_warm_start(tmp_path / "ws.pt")
+  checkpoints: dict[Path, TouchSites] = {}
+  for touch_sites in OTHER_TOUCH_SITES:
+    runner = _touch_runner(touch_sites)
+    runner.warm_start(
+      replace(ws, lineage={**ws.lineage, "osl_touch_sites": touch_sites})
+    )
+    path = tmp_path / f"model_{touch_sites}.pt"
+    runner.save(str(path))
+    assert torch.load(path, weights_only=False)["osl_touch_sites"] == touch_sites
+    checkpoints[path] = touch_sites
+  # The env's zones, also from a runner that holds no lineage to copy them from.
+  _touch_runner("heel_extended").save(str(tmp_path / "bare.pt"))
+  bare = torch.load(tmp_path / "bare.pt", weights_only=False)
+  assert bare["osl_touch_sites"] == "heel_extended"
+  legacy = torch.load(tmp_path / "model_original.pt", weights_only=False)
+  del legacy["osl_touch_sites"]
+  torch.save(legacy, tmp_path / "model_legacy.pt")
+  checkpoints[tmp_path / "model_legacy.pt"] = "original"
+
+  for path, trained in checkpoints.items():
+    flag = re.escape(f"--env.osl-touch-sites {trained}")
+    for load_cfg in (None, {"actor": True}):  # A resume, then play's load.
+      refusing = _touch_runner(OTHER_TOUCH_SITES[trained])
+      with pytest.raises(ValueError, match=flag):
+        refusing.load(str(path), load_cfg=load_cfg)
+
+    # play.py makes the task's config build the checkpoint's zones, then loads.
+    cfg = osl_split_env_cfg("msk", "compliant", "clf", "play")
+    SplitOnPolicyRunner.configure_env_for_checkpoint(cfg, path)
+    assert cfg.osl_touch_sites == trained
+    played = _touch_runner(cfg.osl_touch_sites)
+    played.load(str(path), load_cfg={"actor": True}, strict=True, map_location="cpu")
+    assert played.stage_start == STAGE_START
+
+    resumed = _touch_runner(trained)
+    resumed.load(str(path))
+    assert resumed.stage_start == STAGE_START
+    resumed.save(str(tmp_path / "again.pt"))
+    again = torch.load(tmp_path / "again.pt", weights_only=False)
+    assert again["osl_touch_sites"] == trained
+
+
+def test_warm_start_needs_the_stage1_touch_sites(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """Stage 2 builds the OSL foot touch sites stage 1 trained with: the human actor
+  reads the touch sensors, and its normalizer's single count would never adapt to
+  another ``r_foot`` reading. A lineage that records none (converted before the
+  setting) trained with ``original``: refused by the default ``heel_extended``
+  env, naming the flag, and accepted by an ``original`` one. The runner reports
+  the zones stage 1 trained with."""
+  ws = _write_warm_start(tmp_path / "ws.pt")
+  assert ws.lineage["osl_touch_sites"] == "heel_extended"
+  legacy = replace(
+    ws, lineage={k: v for k, v in ws.lineage.items() if k != "osl_touch_sites"}
+  )
+  # (the warm start, stage 2's zones, stage 1's zones)
+  mismatches: tuple[tuple[WarmStart, TouchSites, TouchSites], ...] = (
+    (legacy, "heel_extended", "original"),
+    (ws, "original", "heel_extended"),
+  )
+  for stage1, stage2, trained in mismatches:
+    refused = _touch_runner(stage2)
+    with pytest.raises(ValueError, match=re.escape(f"--env.osl-touch-sites {trained}")):
+      refused.warm_start(stage1)
+    assert not refused._ready
+
+  capsys.readouterr()
+  started = _touch_runner("original")
+  started.warm_start(legacy)
+  assert started._ready and started.stage_start == STAGE_START
+  out = capsys.readouterr().out
+  assert "[INFO] OSL touch sites: original (not recorded" in out
+  started = _touch_runner("heel_extended")
+  started.warm_start(ws)
+  assert started._ready and started.stage_start == STAGE_START
+  assert "[INFO] OSL touch sites: heel_extended\n" in capsys.readouterr().out
+
+
 def test_resume_keeps_the_checkpoint_curriculum(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
@@ -1226,16 +1342,20 @@ def test_validation_env_follows_the_training_env(
   # The training env's config is left as it was.
   assert train.observations["osl"] == osl_observation_group("train", osl_obs)
 
-  # Every command-line setting of the run reaches validation: the simulation,
-  # every shared reward term's weight and params, and the OSL lag (the middle of
-  # the training range).
+  # Every command-line setting of the run reaches validation: the OSL foot's touch
+  # sites (built by the robot entity), the simulation, every shared reward term's
+  # weight and params, and the OSL lag (the middle of the training range).
   train = osl_split_env_cfg("msk", "compliant", "clf", "train")
+  set_touch_sites(train, "original")  # --env.osl-touch-sites original
   train.sim.mujoco.iterations = 7
   train.rewards["twist"].weight = 0.35
   train.rewards["twist"].params["std"] = 0.2
   for name in ("actpack", "loadcell"):
     train.observations["osl"].terms[name].delay_max_lag = 4
   cfg = validation_cfg(train)
+  assert cfg.osl_touch_sites == "original"
+  robot = cfg.scene.entities["robot"]
+  assert isinstance(robot, OslEntityCfg) and robot.touch_sites == "original"
   assert cfg.sim.mujoco.iterations == 7
   assert cfg.rewards["twist"].weight == 0.35
   assert cfg.rewards["twist"].params["std"] == 0.2
@@ -1253,6 +1373,8 @@ def test_validation_env_follows_the_training_env(
   train.seed = 7
   stress = runner._eval_env_cfg("stress")
   assert stress.seed is None and train.seed == 7
+  robot = stress.scene.entities["robot"]
+  assert isinstance(robot, OslEntityCfg) and robot.touch_sites == "original"
   assert replace(stress, seed=7) == train and stress is not train
   assert stress.observations["osl"].terms["actpack"].params["randomize"]
   assert stress.observations["osl"].terms["actpack"].delay_max_lag == 4
@@ -1680,6 +1802,8 @@ def test_stage2_smoke_on_gpu(tmp_path: Path) -> None:
 
   def make_env(play: bool, num_envs: int) -> RslRlVecEnvWrapper:
     env_cfg = load_env_cfg(task, play=play)
+    # Stage 1's touch sites, as the pipeline passes --env.osl-touch-sites.
+    set_touch_sites(env_cfg, lineage_touch_sites(lineage))
     env_cfg.scene.num_envs = num_envs
     motion = env_cfg.commands["motion"]
     assert isinstance(motion, GaitLibraryCommandCfg)

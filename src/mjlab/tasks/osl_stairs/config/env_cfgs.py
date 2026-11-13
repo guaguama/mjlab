@@ -32,6 +32,7 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.tasks.osl_gait_library.config.dr import OslDrCfg, apply_osl_dr
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward, osl_mimic_env_cfg
+from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
 from mjlab.tasks.osl_stairs import mdp
 from mjlab.tasks.osl_stairs.terrain import TerrainBoxes
 
@@ -52,10 +53,12 @@ def sync_terrain(cfg: ManagerBasedRlEnvCfg) -> None:
 
 
 @dataclass(kw_only=True)
-class OslStairsEnvCfg(ManagerBasedRlEnvCfg):
-  """An env config whose scene terrain follows its motion command."""
+class OslStairsEnvCfg(OslEnvCfg):
+  """An env config whose scene terrain follows its motion command (and whose robot
+  builds the touch sites ``osl_touch_sites`` names, as every OSL task's)."""
 
   def __post_init__(self) -> None:
+    super().__post_init__()
     sync_terrain(self)
 
 

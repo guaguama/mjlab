@@ -5,16 +5,20 @@ A bundle is the self-contained folder osl_deploy runs in plain CPU MuJoCo:
 * ``actor.onnx``: the raw action mean behind the frozen observation statistics;
 * ``manifest.json``: the policy contract (:mod:`mjlab.tasks.osl_mimic.rl.export`),
   the reference settings, provenance and checksums of every file;
-* ``model.mjb``: the compiled scene with the task's simulation options;
+* ``model.mjb``: the compiled scene with the task's simulation options and the OSL
+  foot touch sites the run trained with (the manifest's ``touch_sites`` declares
+  them, read from this file);
 * ``reference.npz``: the library as the training command preprocessed it;
 * ``parity.npz``: observations and their ONNX means, for a consumer's own check;
 * ``README.md``: a summary for people (not checksummed).
 
 Robot and MSK checkpoints of every gait-library task (forward and unicycle, either
 reward and socket) export alike. The run's ``params/agent.yaml`` names its model,
-socket, reward and variant; the task's config is rebuilt from code and checked
-against the run's ``params/env.yaml`` (simulation, decimation, observation terms,
-action maps, actuator delays), and the reference settings are taken from the run.
+socket, reward and variant; the task's config is rebuilt from code, with the OSL
+touch sites the checkpoint was trained with (its ``osl_touch_sites`` key, else its
+run's ``params/env.yaml`` field, else ``original``), and checked against the run's
+``params/env.yaml`` (touch sites, simulation, decimation, observation terms, action
+maps, actuator delays), and the reference settings are taken from the run.
 No Warp simulation or GPU is involved::
 
   uv run --no-sync python -m mjlab.tasks.osl_gait_library.export \\
@@ -47,7 +51,11 @@ import numpy as np
 import torch
 import tyro
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  LEGACY_TOUCH_SITES,
+  Model,
+  Socket,
+)
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.rl.export import (
   Inference,
@@ -59,6 +67,14 @@ from mjlab.tasks.osl_mimic.rl.export import (
   onnx_parity,
   policy_metadata,
   unsupported_processing,
+)
+from mjlab.tasks.osl_mimic.touch_sites import (
+  ENV_FIELD,
+  run_touch_sites,
+  saved_env_touch_sites,
+  set_touch_sites,
+  touch_sites_manifest,
+  touch_sites_readme_line,
 )
 
 from .config.env_cfgs import Variant, osl_gait_library_env_cfg
@@ -195,12 +211,20 @@ def run_spec(checkpoint: Path, agent: dict[str, Any]) -> RunSpec:
 
 def config_mismatches(cfg: Any, saved: dict[str, Any]) -> list[str]:
   """Every setting the deployed policy depends on where the config rebuilt from
-  this checkout differs from the run's ``env.yaml``."""
+  this checkout differs from the run's ``env.yaml``: the OSL touch sites (a run
+  without the field trained with ``original``), the simulation, decimation, actor
+  terms, actions and actuator delays."""
   issues: list[str] = []
 
   def check(label: str, current: Any, original: Any) -> None:
     if plain(current) != original:
       issues.append(label)
+
+  # A run's env.yaml without the field trained with the model XML's touch sites.
+  touch_now = getattr(cfg, ENV_FIELD, LEGACY_TOUCH_SITES)
+  touch_then = saved_env_touch_sites(saved) or LEGACY_TOUCH_SITES
+  if touch_now != touch_then:
+    issues.append(f"{ENV_FIELD} ({touch_then} -> {touch_now})")
 
   mujoco_now = plain(dataclasses.asdict(cfg.sim.mujoco))
   mujoco_then = saved["sim"]["mujoco"]
@@ -272,9 +296,13 @@ def build_components(
       default the run's own, raised to ``DEPLOY_SOLVER_ITERATIONS`` and
       ``DEPLOY_LS_ITERATIONS`` (see there).
 
+  The model builds the OSL touch sites the checkpoint was trained with
+  (``touch_sites.run_touch_sites``).
+
   Raises:
     ValueError: If the run is not a gait-library run, the config rebuilt from this
-      checkout differs from the run's in a setting the policy depends on, or the
+      checkout differs from the run's in a setting the policy depends on, the
+      checkpoint and its run's env.yaml record different touch sites, or the
       library folder is missing.
   """
   checkpoint = Path(checkpoint).resolve()
@@ -284,6 +312,9 @@ def build_components(
   cfg = osl_gait_library_env_cfg(
     spec.model, spec.socket, spec.reward, "train", spec.variant
   )
+  touch = run_touch_sites(checkpoint, saved_env=saved)
+  set_touch_sites(cfg, touch.value)
+  print(f"[INFO] OSL touch sites: {touch.value} (from {touch.source}).")
   check_actor_config(cfg, saved)
   env, command, actions, solver = compile_task(
     cfg, saved, library, solver_iterations, ls_solver_iterations
@@ -540,6 +571,7 @@ osl_deploy (plain CPU MuJoCo {manifest["mujoco_version"]}).
 
 - Model: {run["model"]}, socket: {run["socket"]}, reward: {run["reward"]}, library:
   {run["variant"]} ({len(manifest["reference"]["clip_names"])} clips)
+{touch_sites_readme_line(manifest["touch_sites"])}
 - Checkpoint: `{run["checkpoint"]}` (iteration {manifest["provenance"]["iteration"]})
 - Control: {1.0 / manifest["policy_dt"]:g} Hz, {manifest["decimation"]} physics steps
   per action
@@ -615,6 +647,12 @@ def export_bundle(
     obs_dim = export_actor_onnx(actor, tmp / "actor.onnx")
     manifest: dict[str, Any] = policy_metadata(parts, std, obs_dim, inference)
     manifest["socket"] = c.spec.socket
+    manifest["touch_sites"] = touch_sites_manifest(parts.model)
+    if manifest["touch_sites"]["version"] != c.cfg.osl_touch_sites:
+      raise RuntimeError(
+        f"model.mjb carries the {manifest['touch_sites']['version']!r} touch sites, "
+        f"but the run trained with {c.cfg.osl_touch_sites!r}."
+      )
     manifest["run"] = {
       "task": c.spec.task_id,
       "model": c.spec.model,

@@ -281,11 +281,35 @@ def test_normalized_tilt() -> None:
   assert result.tolist() == [False, True]
 
 
-def test_native_checkpoint_save() -> None:
-  runner = object.__new__(OslTrackingOnPolicyRunner)
-  with patch.object(MjlabOnPolicyRunner, "save") as save:
-    runner.save("test.pt", {"test": True})
-    save.assert_called_once_with(runner, "test.pt", {"test": True})
+def test_native_checkpoint_save(tmp_path: Path) -> None:
+  """mjlab's native checkpoint plus the OSL touch sites the env simulates, and no
+  ONNX export (deferred for the mixed actuators)."""
+
+  def fake_runner() -> OslTrackingOnPolicyRunner:
+    runner = object.__new__(OslTrackingOnPolicyRunner)
+    env = SimpleNamespace(
+      cfg=SimpleNamespace(osl_touch_sites="original"), common_step_counter=12
+    )
+    runner.env = cast(Any, SimpleNamespace(unwrapped=env))
+    runner.alg = cast(Any, SimpleNamespace(save=lambda: {"actor_state_dict": {}}))
+    runner.current_learning_iteration = 3
+    runner.cfg = {"upload_model": False}
+    return runner
+
+  path, native = tmp_path / "model_3.pt", tmp_path / "native" / "model_3.pt"
+  native.parent.mkdir()
+  with patch.object(OslTrackingOnPolicyRunner, "export_policy_to_onnx") as export:
+    fake_runner().save(str(path), {"test": True})
+  export.assert_not_called()
+  MjlabOnPolicyRunner.save(fake_runner(), str(native), {"test": True})
+  saved = torch.load(path, weights_only=False)
+  assert saved["osl_touch_sites"] == "original"
+  assert saved == {
+    **torch.load(native, weights_only=False),
+    "osl_touch_sites": "original",
+  }
+  assert saved["infos"] == {"test": True, "env_state": {"common_step_counter": 12}}
+  assert list(tmp_path.rglob("*.onnx")) == []
 
 
 def test_real_clip_schema_and_fk(reference_model: mujoco.MjModel) -> None:

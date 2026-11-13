@@ -1,7 +1,10 @@
 """Tests for the four vendored OSL full-body variants (v3)."""
 
 import filecmp
+import inspect
+from dataclasses import replace
 from pathlib import Path
+from typing import Any, cast
 
 import mujoco
 import numpy as np
@@ -257,9 +260,9 @@ def test_xml_contacts_drop_the_shell_and_socket_pelvis(variant: Variant) -> None
 
 
 def test_every_osl_task_uses_the_contact_solver_settings() -> None:
-  """mj-nlp's elliptic cone and impratio, in training and play, for all 38 tasks."""
+  """mj-nlp's elliptic cone and impratio, in training and play, for all 46 tasks."""
   tasks = [task for task in list_tasks() if "OSL" in task]
-  assert len(tasks) == 38
+  assert len(tasks) == 46
   for task in tasks:
     for play in (False, True):
       sim = load_env_cfg(task, play=play).sim.mujoco
@@ -333,3 +336,320 @@ def test_msk_fingers_opt_in(socket: osl_constants.Socket) -> None:
 def test_robot_has_no_fingers_to_keep() -> None:
   with pytest.raises(ValueError, match="fingers"):
     osl_constants.get_spec("robot", "rigid", fingers=True)
+
+
+##
+# The OSL foot's touch sites.
+##
+
+# The r_foot box of each version as the brief tabulates it: centre and box
+# half-sizes in the OSL foot frame (x forward, y up, z lateral). "original" is the
+# XML's; the user approved "heel_extended" in a viewer.
+R_FOOT_BOXES = {
+  "original": ((0.025, -0.04, 0.0), (0.05, 0.03, 0.05)),
+  "heel_extended": ((0.01, -0.04, 0.0), (0.065, 0.03, 0.05)),
+}
+OSL_FOOT_BODY = "OSL_KA_L1_osl_foot_assembly"
+OSL_FOOT_CAPSULES = tuple(f"OSL_KA_L1_osl_foot_col{i}" for i in (1, 2, 3))
+# Everything get_spec builds: the four variants, and the musculoskeletal ones with
+# their fingers kept.
+SpecVariant = tuple[osl_constants.Model, osl_constants.Socket, bool]
+SPEC_VARIANTS: list[SpecVariant] = [
+  ("robot", "rigid", False),
+  ("robot", "compliant", False),
+  ("msk", "rigid", False),
+  ("msk", "compliant", False),
+  ("msk", "rigid", True),
+  ("msk", "compliant", True),
+]
+
+
+def _spec_id(variant: SpecVariant) -> str:
+  return "-".join(variant[:2]) + ("-fingers" if variant[2] else "")
+
+
+def _model_fields(obj: object, prefix: str = "") -> dict[str, Any]:
+  """Every data attribute of a compiled model: its arrays, sizes, names and
+  signature, with the option, statistic and visual structs flattened."""
+  fields: dict[str, Any] = {}
+  for name in dir(obj):
+    if name.startswith("_"):
+      continue
+    value = getattr(obj, name)
+    if callable(value):
+      continue
+    if type(value).__module__.startswith("mujoco"):
+      fields.update(_model_fields(value, f"{prefix}{name}."))
+    else:
+      fields[prefix + name] = value
+  return fields
+
+
+def _same(a: Any, b: Any) -> bool:
+  if isinstance(a, np.ndarray):
+    return np.array_equal(a, b, equal_nan=True)
+  return a == b
+
+
+def _differences(a: dict[str, Any], b: dict[str, Any]) -> list[str]:
+  assert a.keys() == b.keys()
+  return sorted(name for name in a if not _same(a[name], b[name]))
+
+
+def _box_bounds(model: mujoco.MjModel, name: str) -> tuple[np.ndarray, np.ndarray]:
+  site = model.site(name)
+  return site.pos - site.size, site.pos + site.size
+
+
+def _cap_centres(model: mujoco.MjModel, name: str) -> tuple[np.ndarray, np.ndarray]:
+  """A capsule's two end-cap centres in its body's frame, the back (heel) one
+  first."""
+  geom = model.geom(name)
+  rotation = np.zeros(9)
+  mujoco.mju_quat2Mat(rotation, geom.quat)
+  half = rotation.reshape(3, 3)[:, 2] * geom.size[1]
+  back, front = sorted((geom.pos - half, geom.pos + half), key=lambda p: p[0])
+  return back, front
+
+
+@pytest.fixture(scope="module", params=SPEC_VARIANTS, ids=_spec_id)
+def spec_variant(request) -> SpecVariant:
+  return request.param
+
+
+@pytest.fixture(scope="module")
+def touch_specs(spec_variant: SpecVariant) -> dict[str, mujoco.MjSpec]:
+  """The variant from get_spec with each touch-site version."""
+  model, socket, fingers = spec_variant
+  return {
+    version: osl_constants.get_spec(model, socket, fingers, touch_sites=version)
+    for version in osl_constants.TOUCH_SITES
+  }
+
+
+@pytest.fixture(scope="module")
+def touch_models(touch_specs: dict[str, mujoco.MjSpec]) -> dict[str, mujoco.MjModel]:
+  return {version: spec.compile() for version, spec in touch_specs.items()}
+
+
+@pytest.fixture(scope="module")
+def xml_model(spec_variant: SpecVariant) -> mujoco.MjModel:
+  model, socket, _ = spec_variant
+  return mujoco.MjModel.from_xml_path(str(osl_constants.OSL_XMLS[(model, socket)]))
+
+
+def test_touch_site_versions_and_defaults() -> None:
+  """Two versions. Every newly configured model or entity builds the extended heel;
+  anything that records no version trained with the XML's box."""
+  assert osl_constants.TOUCH_SITES == ("original", "heel_extended")
+  assert osl_constants.DEFAULT_TOUCH_SITES == "heel_extended"
+  assert osl_constants.LEGACY_TOUCH_SITES == "original"
+  assert {v[:2] for v in SPEC_VARIANTS} == set(VARIANTS)
+  boxes = osl_constants.R_FOOT_TOUCH_BOXES
+  assert {v: (box.pos, box.size) for v, box in boxes.items()} == R_FOOT_BOXES
+  # Only the back edge moves, from x = -0.025 to -0.055.
+  edges = {v: (p[0] - s[0], p[0] + s[0]) for v, (p, s) in R_FOOT_BOXES.items()}
+  assert edges["original"] == pytest.approx((-0.025, 0.075))
+  assert edges["heel_extended"] == pytest.approx((-0.055, 0.075))
+  for fn in (
+    osl_constants.get_spec,
+    osl_constants.get_osl_robot_cfg,
+    osl_constants.get_osl_msk_cfg,
+  ):
+    assert inspect.signature(fn).parameters["touch_sites"].default == "heel_extended"
+  robot = osl_constants.get_osl_robot_cfg()
+  assert isinstance(robot, osl_constants.OslEntityCfg)
+  assert robot.touch_sites == "heel_extended"
+  msk = osl_constants.get_osl_msk_cfg("compliant", fingers=True, touch_sites="original")
+  assert isinstance(msk, osl_constants.OslEntityCfg)
+  assert msk.touch_sites == "original"
+
+
+def test_touch_sites_build_their_r_foot_box(
+  touch_models: dict[str, mujoco.MjModel],
+) -> None:
+  for version, model in touch_models.items():
+    site = model.site(osl_constants.R_FOOT_TOUCH_SITE)
+    pos, size = R_FOOT_BOXES[version]
+    np.testing.assert_array_equal(site.pos, pos)
+    np.testing.assert_array_equal(site.size, size)
+    np.testing.assert_array_equal(site.quat, (1.0, 0.0, 0.0, 0.0))
+    assert site.type[0] == mujoco.mjtGeom.mjGEOM_BOX
+    assert model.body(int(site.bodyid[0])).name == OSL_FOOT_BODY
+    assert osl_constants.touch_sites_of_model(model) == version
+
+
+def test_touch_sites_change_only_the_r_foot_box(
+  touch_models: dict[str, mujoco.MjModel],
+) -> None:
+  """Every array, size, name and option of the two compiled models is identical,
+  the other three touch sites, every geom and all physics included, except the
+  r_foot row of site_pos and site_size."""
+  original = _model_fields(touch_models["original"])
+  extended = _model_fields(touch_models["heel_extended"])
+  sample = {"site_pos", "geom_size", "body_mass", "opt.timestep", "stat.extent"}
+  assert sample <= original.keys()
+  differ = _differences(original, extended)
+  assert differ == ["site_pos", "site_size"]
+  r_foot = touch_models["original"].site(osl_constants.R_FOOT_TOUCH_SITE).id
+  for name in differ:
+    rows = np.flatnonzero((original[name] != extended[name]).any(axis=1))
+    assert rows.tolist() == [r_foot], name
+
+
+def test_original_touch_sites_are_the_xml(
+  touch_models: dict[str, mujoco.MjModel], xml_model: mujoco.MjModel
+) -> None:
+  """``original`` keeps the four touch sites exactly as the vendored XML writes
+  them, each carrying its touch sensor. heel_extended keeps the other three
+  (``test_touch_sites_change_only_the_r_foot_box``)."""
+  model = touch_models["original"]
+  for site_name, sensor_name in osl_constants.TOUCH_SITE_SENSORS.items():
+    ours, xml = model.site(site_name), xml_model.site(site_name)
+    for attr in ("pos", "quat", "size", "type"):
+      np.testing.assert_array_equal(
+        getattr(ours, attr), getattr(xml, attr), err_msg=f"{site_name} {attr}"
+      )
+    body = xml_model.body(int(xml.bodyid[0])).name
+    assert model.body(int(ours.bodyid[0])).name == body
+    sensor = model.sensor(sensor_name)
+    assert sensor.type[0] == mujoco.mjtSensor.mjSENS_TOUCH
+    assert sensor.objtype[0] == mujoco.mjtObj.mjOBJ_SITE
+    assert sensor.objid[0] == ours.id
+
+
+def test_r_foot_box_covers_the_heel_caps(
+  touch_models: dict[str, mujoco.MjModel],
+) -> None:
+  """The OSL foot meets the floor only at its three capsules' end caps. The XML's
+  r_foot box ends in front of the heel caps' centres, so it never fires; the
+  extended one holds each whole heel cap, at least 1.3 cm clear of its back edge,
+  and still stops short of the toe caps, which r_toes holds."""
+  for version, model in touch_models.items():
+    foot_lo, foot_hi = _box_bounds(model, osl_constants.R_FOOT_TOUCH_SITE)
+    toes_lo, toes_hi = _box_bounds(model, osl_constants.R_TOES_TOUCH_SITE)
+    for name in OSL_FOOT_CAPSULES:
+      # The capsules and the touch sites share the foot body's frame.
+      assert model.body(int(model.geom(name).bodyid[0])).name == OSL_FOOT_BODY
+      radius = float(model.geom(name).size[0])
+      heel, toe = _cap_centres(model, name)
+      assert np.all(toe - radius >= toes_lo) and np.all(toe + radius <= toes_hi)
+      assert toe[0] - radius > foot_hi[0]
+      if version == "original":
+        assert heel[0] < foot_lo[0], name
+      else:
+        assert np.all(heel - radius >= foot_lo), name
+        assert np.all(heel + radius <= foot_hi), name
+        assert heel[0] - radius - foot_lo[0] >= 0.013 - 1e-9, name
+
+
+def test_touch_sites_leave_the_dynamics_bit_identical(
+  touch_specs: dict[str, mujoco.MjSpec],
+) -> None:
+  """200 CPU steps from qpos0 at zero ctrl, over a floor so that the feet land (the
+  entity has none: mjlab owns the terrain). qpos and every sensor reading but
+  r_foot's are bit-identical. r_foot is the fix itself: with the XML's box it
+  never fires although the OSL foot is loaded; the extended box catches the heel."""
+  models: dict[str, mujoco.MjModel] = {}
+  for version, spec in touch_specs.items():
+    floored = spec.copy()
+    floored.worldbody.add_geom(
+      type=mujoco.mjtGeom.mjGEOM_PLANE, size=(0, 0, 0.05), contype=1, conaffinity=1
+    )
+    models[version] = floored.compile()
+  r_foot, r_toes = (
+    int(models["original"].sensor_adr[models["original"].sensor(name).id])
+    for name in ("r_foot", "r_toes")
+  )
+  qpos: dict[str, np.ndarray] = {}
+  readings: dict[str, np.ndarray] = {}
+  for version, model in models.items():
+    data = mujoco.MjData(model)
+    assert not data.ctrl.any()
+    steps = []
+    for _ in range(200):
+      mujoco.mj_step(model, data)
+      steps.append(data.sensordata.copy())
+    qpos[version], readings[version] = data.qpos.copy(), np.stack(steps)
+  assert np.isfinite(qpos["original"]).all()
+  assert np.array_equal(qpos["original"], qpos["heel_extended"])
+  others = np.arange(readings["original"].shape[1]) != r_foot
+  np.testing.assert_array_equal(
+    readings["original"][:, others], readings["heel_extended"][:, others]
+  )
+  assert readings["original"][:, r_toes].max() > 0.0
+  assert readings["original"][:, r_foot].max() == 0.0
+  assert readings["heel_extended"][:, r_foot].max() > 0.0
+
+
+def test_apply_touch_sites_either_way_and_idempotently() -> None:
+  """Either version applies over either and the last call wins; a second call
+  changes nothing. Each result compiles to get_spec's own model of that version."""
+  specs = {
+    v: osl_constants.get_spec("robot", "rigid", touch_sites=v)
+    for v in osl_constants.TOUCH_SITES
+  }
+  expected = {v: _model_fields(spec.compile()) for v, spec in specs.items()}
+  for start in osl_constants.TOUCH_SITES:
+    for target in osl_constants.TOUCH_SITES:
+      spec = specs[start].copy()
+      for _ in range(2):
+        assert osl_constants.apply_touch_sites(spec, target) is spec
+      built = _model_fields(spec.compile())
+      assert _differences(built, expected[target]) == [], (start, target)
+
+
+def test_apply_touch_sites_refuses_an_unknown_box() -> None:
+  """A box that is neither version's (a regenerated model) is refused, untouched;
+  so are unknown versions and a model without the OSL foot."""
+  spec = osl_constants.get_spec("robot", "rigid")
+  (site,) = [s for s in spec.sites if s.name == osl_constants.R_FOOT_TOUCH_SITE]
+  # Half of each: the XML's centre with the extended size.
+  site.pos = R_FOOT_BOXES["original"][0]
+  site.size = R_FOOT_BOXES["heel_extended"][1]
+  for version in osl_constants.TOUCH_SITES:
+    with pytest.raises(ValueError, match="neither OSL touch-site version's box"):
+      osl_constants.apply_touch_sites(spec, version)
+  assert tuple(site.pos) == R_FOOT_BOXES["original"][0]
+  assert tuple(site.size) == R_FOOT_BOXES["heel_extended"][1]
+  with pytest.raises(ValueError, match="neither OSL touch-site version's box"):
+    osl_constants.touch_sites_of_model(spec.compile())
+
+  unknown = cast(Any, "heel")
+  with pytest.raises(ValueError, match="expected one of"):
+    osl_constants.apply_touch_sites(spec, unknown)
+  with pytest.raises(ValueError, match="expected one of"):
+    osl_constants.get_spec("robot", "rigid", touch_sites=unknown)
+  with pytest.raises(ValueError, match="expected one of"):
+    osl_constants.get_osl_robot_cfg(touch_sites=unknown)
+  with pytest.raises(ValueError, match="expected one of"):
+    replace(osl_constants.get_osl_robot_cfg(), touch_sites=unknown).build()
+  with pytest.raises(ValueError, match="Expected one site"):
+    osl_constants.apply_touch_sites(mujoco.MjSpec(), "original")
+  assert osl_constants.touch_sites_of_model(mujoco.MjSpec().compile()) is None
+
+
+@pytest.mark.parametrize("version", osl_constants.TOUCH_SITES)
+def test_entity_cfg_applies_its_touch_sites_last(
+  version: osl_constants.TouchSites,
+) -> None:
+  """A task may wrap spec_fn around a get_spec that builds some version (the
+  stage-2 OSL sensors and the tracking IMU do); the entity's own setting still wins
+  when it builds, as a scene builds it, and the config is left as it was."""
+  other: osl_constants.TouchSites = (
+    "original" if version == "heel_extended" else "heel_extended"
+  )
+  cfg = osl_constants.get_osl_robot_cfg("rigid", touch_sites=version)
+  assert isinstance(cfg, osl_constants.OslEntityCfg)
+  inner = cfg.spec_fn
+  assert inner is not None
+
+  def chain() -> mujoco.MjSpec:
+    return osl_constants.apply_touch_sites(inner(), other)
+
+  cfg = replace(cfg, spec_fn=chain)
+  built = cfg.build().spec.compile()
+  assert osl_constants.touch_sites_of_model(built) == version
+  assert cfg.spec_fn is chain and cfg.touch_sites == version
+  # Entity(cfg) skips build(), so it keeps the chain's version.
+  assert osl_constants.touch_sites_of_model(Entity(cfg).spec.compile()) == other

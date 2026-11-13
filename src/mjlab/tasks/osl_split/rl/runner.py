@@ -8,14 +8,15 @@ wherever one agent did not become two:
 * **Start.** Stage 2 always starts from stage 1: ``--agent.warm-start.path`` (a
   stage-1 run, checkpoint or converted file, see :mod:`.warmstart`) gives the human
   actor, both critics, the return statistics and the iteration axis. Only the
-  reward type may differ from stage 1's (the reward switch). A model or socket
-  change would change the human actor's inputs or outputs, so it is refused, as is
-  a network built otherwise than the stage-1 one whose weights it takes (another
-  activation loads strictly and computes something else). Stage 1's recorded end
-  state is compared with stage 2's settings: another CLF penalty weight is refused
-  (``--agent.warm-start.allow-pen-w-mismatch`` overrides), and another twist
-  weight, root-deviation limit or library release, a large human std, an
-  unfinished stage-1 run or a human rate above stage 1's last one are reported.
+  reward type may differ from stage 1's (the reward switch). A model, socket or OSL
+  touch-site change would change the human actor's inputs or outputs, so it is
+  refused, as is a network built otherwise than the stage-1 one whose weights it
+  takes (another activation loads strictly and computes something else). Stage 1's
+  recorded end state is compared with stage 2's settings: another CLF penalty
+  weight is refused (``--agent.warm-start.allow-pen-w-mismatch`` overrides), and
+  another twist weight, root-deviation limit or library release, a large human
+  std, an unfinished stage-1 run or a human rate above stage 1's last one are
+  reported.
 * **Iterations.** Stage 2 continues stage 1's numbering: its first iteration is
   stage 1's last plus one, so W&B and TensorBoard steps run on from stage 1's, and
   ``Train/mean_reward`` (the team reward, which the split reward term keeps equal
@@ -98,6 +99,11 @@ from mjlab.tasks.osl_gait_library.mdp import TIGHT_ARC_WZ, GaitLibraryCommandCfg
 from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
 from mjlab.tasks.osl_mimic.rl.expected import auto_inference
 from mjlab.tasks.osl_mimic.rl.runner import EvalPurpose, eval_mode
+from mjlab.tasks.osl_mimic.touch_sites import (
+  CHECKPOINT_KEY,
+  check_checkpoint_touch_sites,
+  env_touch_sites,
+)
 from mjlab.tasks.osl_split.config.env_cfgs import REWARD_NAME, osl_split_env_cfg
 from mjlab.tasks.osl_split.mdp import osl_validation_group, split_mimic_reward
 
@@ -375,16 +381,22 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     (:meth:`_report_provenance`).
 
     Raises:
-      ValueError: On a model or socket change, a warm start whose action layout
-        or observation does not match this env, a network that takes stage-1
-        weights but is configured otherwise than stage 1's (the message names
-        the overrides that build stage 1's), or another CLF penalty weight than
-        stage 1's without ``warm_start.allow_pen_w_mismatch``.
+      ValueError: On a model, socket or OSL touch-site change, a warm start whose
+        action layout or observation does not match this env, a network that takes
+        stage-1 weights but is configured otherwise than stage 1's (the message
+        names the overrides that build stage 1's), or another CLF penalty weight
+        than stage 1's without ``warm_start.allow_pen_w_mismatch``.
     """
     v = self.validation_cfg
     model, socket, reward = v["model"], v["socket"], v["reward"]
-    reward_switch = check_compatible(ws, model=model, socket=socket, reward=reward)
     env = self.env.unwrapped
+    reward_switch = check_compatible(
+      ws,
+      model=model,
+      socket=socket,
+      reward=reward,
+      touch_sites=env_touch_sites(env),
+    )
     layout = ActionLayout.from_action_manager(env.action_manager)
     if layout != ws.layout:
       raise ValueError(
@@ -1270,8 +1282,8 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
 
   def save(self, path: str, infos: dict | None = None) -> None:
     """Checkpoint everything (the four networks, optimizers, return statistics and
-    split state, the curriculum included), then export the OSL actor next to it
-    if ``export_osl_onnx``."""
+    split state, the curriculum included, and the OSL touch sites the env
+    simulates), then export the OSL actor next to it if ``export_osl_onnx``."""
     env = self.env.unwrapped
     infos = {
       **(infos or {}),
@@ -1287,6 +1299,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     saved = self.alg.save()
     saved["iter"] = self.current_learning_iteration
     saved["infos"] = infos
+    saved[CHECKPOINT_KEY] = env_touch_sites(env)
     torch.save(saved, path)
     upload = bool(self.cfg.get("upload_model", False))
     if upload:
@@ -1330,10 +1343,12 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
 
     Raises:
       ValueError: For a stage-1 checkpoint, a warm-start file or anything else
-        that is not a stage-2 checkpoint.
+        that is not a stage-2 checkpoint, or one trained with other OSL touch sites
+        than the env simulates (one that records none trained with ``original``).
     """
     loaded = torch.load(path, map_location=map_location, weights_only=False)
     _check_stage2_checkpoint(loaded, path)
+    check_checkpoint_touch_sites(loaded, path, self.env.unwrapped)
     actors_only = _actors_only(load_cfg)
     self.alg.load(loaded, strict, actors_only=actors_only)
     infos = dict(loaded.get("infos") or {})

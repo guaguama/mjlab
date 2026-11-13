@@ -35,11 +35,11 @@ MuonAdam over actor and critic on its own schedule (the recipe decays to 10% of 
 rate and holds); stage 2 gives every module its own optimizer and schedule.
 
 Between the stages the reward type may switch (CLF to MimicReward or back; stage 2
-then retrains its critics from scratch), but the model and the socket may not:
-either changes the human actor's inputs or outputs (:func:`check_compatible`). Nor
-may the architecture of a module that takes stage-1 weights: another activation or
-layer-norm epsilon loads strictly but computes something else
-(:func:`architecture_mismatches`).
+then retrains its critics from scratch), but the model, the socket and the OSL
+foot's touch sites may not: each changes the human actor's inputs or outputs
+(:func:`check_compatible`). Nor may the architecture of a module that takes
+stage-1 weights: another activation or layer-norm epsilon loads strictly but
+computes something else (:func:`architecture_mismatches`).
 
 Everything here runs on CPU and never touches CUDA. A stage-1 checkpoint (about
 0.4 GB, half of it optimizer state) is loaded memory-mapped, and the verification
@@ -65,11 +65,24 @@ import torch.nn.functional as F
 import yaml
 from tensordict import TensorDict
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  LEGACY_TOUCH_SITES,
+  Model,
+  Socket,
+  TouchSites,
+  check_touch_sites,
+)
 from mjlab.tasks.osl_gait_library.export import read_config
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward, _actions
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_mimic.rl.ppo import geometric_schedule
+from mjlab.tasks.osl_mimic.touch_sites import (
+  CLI_FLAG,
+  ENV_FIELD,
+  ResolvedTouchSites,
+  load_checkpoint,
+  run_touch_sites,
+)
 from mjlab.tasks.osl_split.scripts.two_stage import planned_last_iteration
 
 from .layout import ActionLayout
@@ -109,6 +122,7 @@ OPTIONAL_LINEAGE_KEYS: tuple[str, ...] = (
   "stage1_std_cap",
   "stage1_env",
   "stage1_planned_last_iteration",
+  ENV_FIELD,
 )
 """Keys converted files record beyond :data:`LINEAGE_KEYS` (older files lack some,
 and they load all the same):
@@ -121,7 +135,11 @@ and they load all the same):
 * ``stage1_env``: the env settings of stage 1's last update
   (:func:`stage1_env_settings`), None without ``params/env.yaml``;
 * ``stage1_planned_last_iteration``: the iteration the run was set to end at (None
-  when its settings do not say)."""
+  when its settings do not say);
+* ``osl_touch_sites``: the OSL foot touch sites stage 1 trained with
+  (``touch_sites.run_touch_sites`` of the stage-1 checkpoint). A file converted
+  before 2026-11-13 lacks it; :func:`lineage_touch_sites` then asks the stage-1
+  checkpoint the lineage names."""
 HUMAN_STD_WARNING = 0.15
 """A median human std above this draws a warning: stage 2 holds it fixed, and a
 policy trained at a large std leans on its noise (the recipe ends at 0.07)."""
@@ -410,6 +428,7 @@ def build_warm_start(
     "env_steps": round(float(state["return_count"])),
     "model": model,
     "socket": socket,
+    ENV_FIELD: run_touch_sites(ckpt, data).value,
     "reward": reward,
     "variant": variant,
     "experiment_name": agent.get("experiment_name"),
@@ -541,19 +560,68 @@ def load_warm_start(path: str | Path, checkpoint: str = "") -> WarmStart:
   return build_warm_start(source, checkpoint)
 
 
-def check_compatible(ws: WarmStart, *, model: str, socket: str, reward: str) -> bool:
-  """Whether stage 2 (``model``, ``socket``, ``reward``) may start from ``ws``.
+def resolve_lineage_touch_sites(lineage: Mapping[str, Any]) -> ResolvedTouchSites:
+  """The OSL foot touch sites stage 1 trained with, and where they were read.
+
+  A lineage records them since 2026-11-13. One without them was converted by
+  earlier code, which may have read a stage-1 run that did record them, so the
+  stage-1 checkpoint it names decides when it is readable here
+  (``touch_sites.run_touch_sites``: its key, else ``"original"``); ``"original"``
+  otherwise.
+
+  Raises:
+    ValueError: For an unknown value, or a stage-1 checkpoint that contradicts its
+      run's env.yaml.
+  """
+  value = lineage.get(ENV_FIELD)
+  if value is not None:
+    return ResolvedTouchSites(
+      check_touch_sites(value, f"the warm start's {ENV_FIELD}"), "its lineage"
+    )
+  stage1 = lineage.get("stage1_checkpoint")
+  if stage1 and Path(stage1).is_file():
+    try:
+      payload = load_checkpoint(stage1)
+    except Exception:  # noqa: BLE001 - unreadable here: fall back to "original".
+      payload = None
+    if payload is not None:
+      resolved = run_touch_sites(stage1, payload)
+      return ResolvedTouchSites(
+        resolved.value,
+        f"not in its lineage, so from its stage-1 checkpoint {stage1}: "
+        f"{resolved.source}",
+      )
+  return ResolvedTouchSites(
+    LEGACY_TOUCH_SITES,
+    "not recorded: the warm start was converted before the setting, and its "
+    "stage-1 checkpoint is not readable here",
+  )
+
+
+def lineage_touch_sites(lineage: Mapping[str, Any]) -> TouchSites:
+  """The OSL foot touch sites stage 1 trained with
+  (:func:`resolve_lineage_touch_sites`)."""
+  return resolve_lineage_touch_sites(lineage).value
+
+
+def check_compatible(
+  ws: WarmStart, *, model: str, socket: str, reward: str, touch_sites: str
+) -> bool:
+  """Whether stage 2 (``model``, ``socket``, ``reward``, OSL ``touch_sites``) may
+  start from ``ws``.
 
   Returns True when the reward type differs from stage 1's (the reward switch: the
   copied critics would value the wrong reward, so stage 2 starts them fresh), False
-  when it is the same. Raises ``ValueError`` on a model or socket change: the human
-  actor is the unified actor transplanted exactly, and either change would alter
-  its inputs (for the socket, joints the stage-1 normalizer has never seen; its
-  single count would never give them statistics) or its outputs.
+  when it is the same. Raises ``ValueError`` on a model, socket or touch-site
+  change: the human actor is the unified actor transplanted exactly, and each change
+  would alter its inputs (for the socket, joints the stage-1 normalizer has never
+  seen; for the touch sites, an ``r_foot`` reading it never saw; its single count
+  would never give either statistics) or its outputs.
   """
   _check_choice("model", model, get_args(Model))
   _check_choice("socket", socket, get_args(Socket))
   _check_choice("reward", reward, get_args(Reward))
+  check_touch_sites(touch_sites, "stage 2's OSL touch sites")
   lineage = ws.lineage
   source = lineage.get("stage1_run_dir", "the stage-1 run")
   if lineage["model"] != model:
@@ -572,6 +640,16 @@ def check_compatible(ws: WarmStart, *, model: str, socket: str, reward: str) -> 
       "observations, so its inputs would change (and the stage-1 normalizer's "
       "single count would never give new inputs statistics): the socket cannot "
       "switch between stages. Only the reward may."
+    )
+  stage1_touch = resolve_lineage_touch_sites(lineage)
+  if stage1_touch.value != touch_sites:
+    raise ValueError(
+      f"The warm start ({source}) was trained with the OSL touch sites "
+      f"{stage1_touch.value!r} ({stage1_touch.source}), but this stage-2 task "
+      f"builds {touch_sites!r}. The human actor reads the foot touch sensors, so "
+      "its r_foot input would read what stage 1 never saw (and the stage-1 "
+      "normalizer's single count would never adapt to it): the touch sites cannot "
+      f"switch between stages. Train stage 2 with {CLI_FLAG} {stage1_touch.value}."
     )
   return lineage["reward"] != reward
 
@@ -847,7 +925,11 @@ def lineage_warnings(lineage: Mapping[str, Any]) -> list[str]:
 
 def provenance_lines(lineage: Mapping[str, Any]) -> list[str]:
   """Stage 1's recorded end state, for summaries."""
-  lines: list[str] = []
+  touch = resolve_lineage_touch_sites(lineage)
+  lines: list[str] = [
+    f"  OSL touch sites: {touch.value}"
+    + ("" if ENV_FIELD in lineage else f" ({touch.source})")
+  ]
   if "stage1_lr" in lineage or "stage1_std_cap" in lineage:
     lr, cap = lineage.get("stage1_lr"), lineage.get("stage1_std_cap")
     shown_cap = "none" if cap is None and "stage1_std_cap" in lineage else _shown(cap)

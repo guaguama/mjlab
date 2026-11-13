@@ -57,6 +57,13 @@ from mjlab.envs.mdp.actions import TendonEffortAction
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.osl_mimic.mdp import MimicMotionCommandCfg, mimic_reward
+from mjlab.tasks.osl_mimic.touch_sites import (
+  CHECKPOINT_KEY,
+  check_checkpoint_file,
+  configure_for_checkpoint,
+  env_touch_sites,
+  set_touch_sites,
+)
 
 from .expected import (
   action_bounds,
@@ -261,6 +268,52 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     return current
 
   ##
+  # Checkpoints: they record the OSL touch sites the run trained with.
+  ##
+
+  def save(self, path: str, infos: dict | None = None) -> None:
+    """mjlab's checkpoint (``MjlabOnPolicyRunner.save``) plus the OSL touch-site
+    version the env simulates, under :data:`~..touch_sites.CHECKPOINT_KEY`."""
+    env = self.env.unwrapped
+    infos = {
+      **(infos or {}),
+      "env_state": {"common_step_counter": env.common_step_counter},
+    }
+    saved = self.alg.save()
+    saved["iter"] = self.current_learning_iteration
+    saved["infos"] = infos
+    saved[CHECKPOINT_KEY] = env_touch_sites(env)
+    torch.save(saved, path)
+    if self.cfg["upload_model"]:
+      self.logger.save_model(path, self.current_learning_iteration)
+
+  def load(
+    self,
+    path: str,
+    load_cfg: dict | None = None,
+    strict: bool = True,
+    map_location: str | None = None,
+  ) -> dict:
+    """mjlab's load, after refusing a checkpoint trained with other OSL touch sites
+    than the env simulates (one that records none trained with ``original``).
+
+    Raises:
+      ValueError: On that mismatch, naming the ``--env.osl-touch-sites`` value that
+        fixes it.
+    """
+    check_checkpoint_file(path, self.env.unwrapped)
+    return super().load(path, load_cfg, strict, map_location)
+
+  @classmethod
+  def configure_env_for_checkpoint(
+    cls, env_cfg: ManagerBasedRlEnvCfg, checkpoint: str | Path
+  ) -> None:
+    """Make ``env_cfg`` build what ``checkpoint`` was trained with, before the env
+    exists: its OSL touch sites (``play`` calls this; it takes no ``--env``
+    overrides)."""
+    configure_for_checkpoint(env_cfg, checkpoint)
+
+  ##
   # Validation.
   ##
 
@@ -284,11 +337,13 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
 
   def _inherit_training_settings(self, cfg: ManagerBasedRlEnvCfg) -> None:
     """Give an evaluation config, rebuilt from the task, the settings a run may have
-    overridden on the command line: the simulation (solver, contact model), the
-    observation groups (the policy's input; their noise off) and every shared reward
-    term's weight and parameters. Everything mode-specific (commands, terminations,
-    randomization) stays the evaluation mode's own."""
+    overridden on the command line: the OSL foot's touch sites, the simulation
+    (solver, contact model), the observation groups (the policy's input; their noise
+    off) and every shared reward term's weight and parameters. Everything
+    mode-specific (commands, terminations, randomization) stays the evaluation mode's
+    own."""
     train = self.env.unwrapped.cfg
+    set_touch_sites(cfg, env_touch_sites(self.env.unwrapped))
     cfg.sim = deepcopy(train.sim)
     cfg.observations = deepcopy(train.observations)
     for group in cfg.observations.values():
