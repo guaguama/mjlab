@@ -10,7 +10,9 @@ to rebuild its input exactly, so every export carries, next to the network:
   c`` is channel ``c`` of frame ``t``. The network normalizes its input itself
   (the frozen running statistics are part of the graph), so it takes raw values;
 * ``sensors``: what each channel reads, where (site or joint), in which frame and
-  unit, and the load cells' tare, which the observation subtracts;
+  unit, and the load cells' tare, which the observation subtracts. The twelve added
+  OSL sensors are always listed (``observed`` says which the actor reads); the
+  foot's contact sensors, the model's own touch sensors, only when observed;
 * ``action``: how the two outputs become torque: clipped to [-1, 1], times the
   2.88 ctrl scale, times each motor's gain (N m per ctrl unit, read from the
   model), at the control period ``dt``;
@@ -54,15 +56,10 @@ from mjlab.tasks.osl_gait_library.export import (
 )
 from mjlab.tasks.osl_split.config.sensors import (
   ACC_RANGE,
-  ANKLE_POS,
-  ANKLE_TORQUE,
-  ANKLE_VEL,
   GYRO_RANGE,
   IMU_ACC,
   IMU_GYRO,
-  KNEE_POS,
-  KNEE_TORQUE,
-  KNEE_VEL,
+  OSL_CONTACT_SPECS,
   OSL_IMU_BODY,
   OSL_IMU_POS,
   OSL_IMU_SITE,
@@ -70,8 +67,15 @@ from mjlab.tasks.osl_split.config.sensors import (
   scene_sensor_name,
 )
 from mjlab.tasks.osl_split.mdp.observations import (
+  Channel as Channel,
+)
+from mjlab.tasks.osl_split.mdp.observations import (
   load_cell_sensor_names,
   osl_noise_std,
+  osl_sensor_set,
+)
+from mjlab.tasks.osl_split.mdp.observations import (
+  term_channels as term_channels,
 )
 
 from .layout import OSL_ACTION_TERM
@@ -113,20 +117,13 @@ FRAMES = (
 ENTITY = "robot"
 """The entity the OSL belongs to in mjlab's scene (names are prefixed with it)."""
 
-Channel = tuple[str, str, str | None]
-"""``(name, unit, sensor)``: one observation channel and the sensor it reads (None
-for derived channels)."""
-
-_XYZ = ("x", "y", "z")
-_UNITS = {spec.name: spec.unit for spec in OSL_SENSOR_SPECS}
 _SATURATION = {IMU_GYRO: GYRO_RANGE, IMU_ACC: ACC_RANGE}
 """Per component: the ActPack's ranges, which the ``actpack`` term clamps the IMU to
 after its mount rotation and bias (the MuJoCo sensors have no cutoff)."""
-_JOINT_LABELS = ("knee", "ankle")
-"""``OSL_TORQUE_JOINTS`` in order; the action term preserves it."""
 _BIAS_PARAMS = {
   "actpack": ("encoder_bias_rad", "gyro_bias", "acc_bias", "imu_mount_deg"),
   "loadcell": ("force_bias", "torque_bias"),
+  "contact": ("contact_bias",),
 }
 """The class terms' per-episode error bounds (``mdp.observations``)."""
 _OSL_MOTOR_STRENGTH_EVENT = "osl_motor_strength"
@@ -261,6 +258,14 @@ def _obs_metadata(env: ManagerBasedRlEnv, alg: TwoAgentPPO) -> dict[str, Any]:
       f"The OSL actor reads {list(actor.obs_groups)} ({actor.obs_dim} values), not "
       f"the {offset}-value {OSL_OBS_GROUP!r} group."
     )
+  sensor_set = osl_sensor_set(
+    {
+      "terms": {
+        name: {"params": manager.get_term_cfg(OSL_OBS_GROUP, name).params}
+        for name in names
+      }
+    }
+  )
   return {
     "group": OSL_OBS_GROUP,
     "dim": offset,
@@ -268,44 +273,20 @@ def _obs_metadata(env: ManagerBasedRlEnv, alg: TwoAgentPPO) -> dict[str, Any]:
     "index": "obs[offset + t * frame_dim + c] is channel c of frame t (t = 0 oldest)",
     "normalization": "inside the network (frozen running mean and variance)",
     "terms": terms,
+    "sensor_set": sensor_set,
   }
-
-
-def term_channels(name: str, params: Mapping[str, Any]) -> list[Channel]:
-  """One frame of an ``osl`` observation term, channel by channel, following the
-  term's own params (``mdp.observations``)."""
-  if name == "actpack":
-    channels = [_scalar(s) for s in (KNEE_POS, ANKLE_POS, KNEE_VEL, ANKLE_VEL)]
-    channels += _vector(IMU_GYRO) + _vector(IMU_ACC)
-    if params.get("projected_gravity", False):
-      # The IMU's orientation estimate, not a raw channel.
-      channels += [(f"projected_gravity_{axis}", "1", None) for axis in _XYZ]
-    if params.get("applied_torque", False):
-      channels += [_scalar(KNEE_TORQUE), _scalar(ANKLE_TORQUE)]
-    return channels
-  if name == "loadcell":
-    return [c for sensor in load_cell_sensor_names(params) for c in _vector(sensor)]
-  if name == "last_action":
-    # The previous command, in normalized units: what the controller sent.
-    return [(f"osl_{joint}_command", "1", None) for joint in _JOINT_LABELS]
-  raise ValueError(f"Unknown OSL observation term {name!r}.")
-
-
-def _scalar(sensor: str) -> Channel:
-  return sensor, _UNITS[sensor], sensor
-
-
-def _vector(sensor: str) -> list[Channel]:
-  return [(f"{sensor}_{axis}", _UNITS[sensor], sensor) for axis in _XYZ]
 
 
 def _sensor_metadata(env: ManagerBasedRlEnv, used: set[str]) -> dict[str, Any]:
   tare = _load_cell_tare(env)
   sensors = []
-  for spec in OSL_SENSOR_SPECS:
+  # The added sensors always (observed or not); the model's own touch sensors only
+  # when observed, so a re-export of a run without contacts keeps its section.
+  observed = [spec for spec in OSL_CONTACT_SPECS if spec.name in used]
+  for spec in (*OSL_SENSOR_SPECS, *observed):
     entry: dict[str, Any] = {
       "name": spec.name,
-      "scene_name": scene_sensor_name(spec.name, ENTITY),
+      "scene_name": scene_sensor_name(spec.sensor, ENTITY),
       "type": spec.type.name,
       "object_type": spec.objtype.name,
       "object": spec.objname,

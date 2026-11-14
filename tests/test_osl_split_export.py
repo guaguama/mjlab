@@ -5,7 +5,8 @@ fake stage-2 run directory holds the task's own saved configs and two small
 actors, so ``export_bundle`` runs end to end on both models. The OSL observation
 conformance sequence is checked against a NumPy rebuild from the bundle's own
 files, the way a deployment consumer builds it. A robot run from before the OSL
-touch-site setting exports too.
+touch-site setting and the foot contacts (both load cells, recorded without the
+``ankle`` switch) exports too, as trained.
 """
 
 from __future__ import annotations
@@ -34,13 +35,74 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_mimic.touch_sites import set_touch_sites
 from mjlab.tasks.osl_split import export as split_export
+from mjlab.tasks.osl_split import mdp
 from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
 from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
 from mjlab.utils.os import dump_yaml
 
 DT = 0.01
 HIDDEN = (16, 16)
-OSL_OBS = 600
+OSL_OBS = 500
+"""The default set: actpack 250, the ankle cell 150, the contacts 50, the command
+50."""
+LEGACY_OSL_OBS = 600
+"""Both load cells, no contacts."""
+# The contact term and sensors of the default set's manifest: the contract shared
+# with osl_deploy (logs/handover/round6/briefs/brief_mjlab_stage2_sensing.md),
+# verbatim.
+CONTACT_TERM = {
+  "name": "contact",
+  "offset": 400,
+  "dim": 50,
+  "frame_dim": 2,
+  "history_length": 25,
+  "channels": ["osl_heel_contact", "osl_toe_contact"],
+  "units": ["N", "N"],
+  "sensors": ["osl_heel_contact", "osl_toe_contact"],
+}
+CONTACT_SENSORS = [
+  {
+    "name": "osl_heel_contact",
+    "scene_name": "robot/r_foot",
+    "type": "mjSENS_TOUCH",
+    "object_type": "mjOBJ_SITE",
+    "object": "OSL_KA_L1_r_foot_touch",
+    "dim": 1,
+    "unit": "N",
+    "saturation": None,
+    "observed": True,
+  },
+  {
+    "name": "osl_toe_contact",
+    "scene_name": "robot/r_toes",
+    "type": "mjSENS_TOUCH",
+    "object_type": "mjOBJ_SITE",
+    "object": "OSL_KA_L1_r_toes_touch",
+    "dim": 1,
+    "unit": "N",
+    "saturation": None,
+    "observed": True,
+  },
+]
+CONTACT_BUS = {
+  "training_steps": [0, 2],
+  "held_per_episode": True,
+  "validation_steps": 1,
+}
+CONTACT_RANDOMIZATION = {
+  "delay_steps": [0, 2],
+  "delay_held_per_episode": True,
+  "noise_std": [1.0, 1.0],
+  "per_episode_bias": {"contact_bias": 2.0},
+}
+DEFAULT_SENSOR_SET = {
+  "encoders": True,
+  "imu": True,
+  "ankle_load_cell": True,
+  "socket_load_cell": False,
+  "heel_contact": True,
+  "toe_contact": True,
+}
 # (model, socket, reward) -> (human obs width, env action terms).
 CASES = {
   ("robot", "rigid", "mimic"): (635, [["servos", 27], ["osl_motors", 2]]),
@@ -198,28 +260,35 @@ def _make_run(
   legacy: bool = False,
   touch_sites: TouchSites | None = None,
 ) -> Path:
-  """A run on the default touch sites, recorded in its env.yaml, its checkpoint
-  and its warm start's lineage; a ``legacy`` run predates the setting, so none of
-  them records any (``original``)."""
+  """A run on the default touch sites and OSL sensor set, recorded in its env.yaml,
+  its checkpoint and its warm start's lineage; a ``legacy`` run predates both
+  settings, so none of them records any touch sites (``original``), its checkpoint
+  records no OSL group, and its env.yaml records both load cells without the
+  ``ankle`` switch and no contacts, as R2 did."""
   model, socket, reward = case
   obs_dim, terms = CASES[case]
   run = root / f"{model}_{socket}" / "run"
-  env_cfg = osl_split_env_cfg(model, socket, reward, "train")
+  osl_obs = mdp.OslObsCfg(**mdp.LEGACY_OSL_SENSORS) if legacy else None
+  env_cfg = osl_split_env_cfg(model, socket, reward, "train", osl_obs=osl_obs)
   env_cfg.commands["motion"].library_dir = str(library)  # type: ignore[attr-defined]
   agent = osl_split_runner_cfg(model, socket, reward, "exp")
   agent.actor.hidden_dims = HIDDEN
   agent.osl_actor.hidden_dims = HIDDEN
   if touch_sites is not None:
     set_touch_sites(env_cfg, touch_sites)
+  if legacy:
+    set_touch_sites(env_cfg, "original")
   env = asdict(env_cfg)
   if legacy:
     del env["osl_touch_sites"], env["scene"]["entities"]["robot"]["touch_sites"]
+    del env["observations"]["osl"]["terms"]["loadcell"]["params"]["ankle"]
   dump_yaml(run / "params" / "env.yaml", env)
   dump_yaml(run / "params" / "agent.yaml", asdict(agent))
   torch.manual_seed(0)
   human_dim = sum(int(dim) for name, dim in terms if name != "osl_motors")
   human = _actor("actor", obs_dim, human_dim, dict(agent.actor.distribution_cfg or {}))
-  osl = _actor("osl", OSL_OBS, 2, dict(agent.osl_actor.distribution_cfg or {}))
+  osl_dim = LEGACY_OSL_OBS if legacy else OSL_OBS
+  osl = _actor("osl", osl_dim, 2, dict(agent.osl_actor.distribution_cfg or {}))
   lineage = {
     "model": model,
     "socket": socket,
@@ -235,6 +304,7 @@ def _make_run(
   }
   if not legacy:  # Stage 1 and stage 2 trained on the same touch sites.
     lineage["osl_touch_sites"] = payload["osl_touch_sites"] = env_cfg.osl_touch_sites
+    payload["osl_observation"] = mdp.osl_observation_entry(env_cfg.observations["osl"])
   torch.save(payload, run / "model_7.pt")
   return run / "model_7.pt"
 
@@ -282,7 +352,12 @@ def test_bundle_contract(exported) -> None:
   assert human["io"]["input_shape"] == [1, obs_dim]
   assert osl["observation"]["schema"] == "osl_split_sensors_v1"
   assert osl["io"]["input_shape"] == [1, OSL_OBS]
-  assert osl["observation"]["terms"] == ["actpack", "loadcell", "last_action"]
+  assert osl["observation"]["terms"] == [
+    "actpack",
+    "loadcell",
+    "contact",
+    "last_action",
+  ]
   # Each controller's blocks start at 0 in its own output, and together they
   # drive every actuator exactly once.
   model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
@@ -302,12 +377,8 @@ def test_bundle_contract(exported) -> None:
   )
   assert osl["training"]["actuator_delay"]["osl_motors"]["seconds"] == [0.0, 0.02]
   buses = osl["observation"]["latency"]["buses"]
-  assert set(buses) == {"actpack", "loadcell"}
-  assert buses["actpack"] == {
-    "training_steps": [0, 2],
-    "held_per_episode": True,
-    "validation_steps": 1,
-  }
+  assert set(buses) == {"actpack", "loadcell", "contact"}
+  assert buses["actpack"] == CONTACT_BUS == buses["contact"]
   # The OSL sensors are compiled into the bundle's model.
   for sensor in osl["observation"]["sensors"]["sensors"]:
     assert model.sensor(sensor["scene_name"]).dim[0] == sensor["dim"]
@@ -336,10 +407,19 @@ def test_onnx_parity_and_metadata(exported) -> None:
     assert meta["controller"] == name and meta["kind"] == "osl_split_dual"
 
 
-def test_osl_conformance_matches_a_numpy_rebuild(exported) -> None:
+@pytest.fixture(params=["default", "legacy"])
+def any_bundle(request, exported, legacy) -> tuple[Path, dict[str, Any]]:
+  """A default-set bundle (both models) and the legacy run's."""
+  if request.param == "legacy":
+    return legacy
+  return exported[2], exported[3]
+
+
+def test_osl_conformance_matches_a_numpy_rebuild(any_bundle) -> None:
   """A consumer's OSL observation, from model.mjb and the manifest alone,
-  reproduces mjlab's own terms and buffers at every training latency."""
-  _, _, bundle, m = exported
+  reproduces mjlab's own terms and buffers at every training latency, foot
+  contacts (raw touch sensors, on their own bus) included."""
+  bundle, m = any_bundle
   model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
   obs = m["controllers"]["osl"]["observation"]
   sensors = {s["name"]: s for s in obs["sensors"]["sensors"]}
@@ -426,6 +506,76 @@ def test_refuses_stage1_runs_and_osl_drift(exported, tmp_path) -> None:
   saved["terms"]["loadcell"]["func"] = "somewhere.else"
   with pytest.raises(ValueError, match="loadcell.func"):
     split_export.apply_osl_group(cfg.observations["osl"], saved)
+
+
+def test_bundle_declares_the_contact_sensors(exported) -> None:
+  """The default set's manifest: the contract shared with osl_deploy for the
+  contact term (layout, sensors, bus, randomization) and the ``sensor_set``
+  summary, which the README names."""
+  _, _, bundle, m = exported
+  obs = m["controllers"]["osl"]["observation"]
+  layout = {t["name"]: t for t in obs["term_layout"]}
+  assert [(t["name"], t["offset"], t["dim"]) for t in obs["term_layout"]] == [
+    ("actpack", 0, 250),
+    ("loadcell", 250, 150),
+    ("contact", 400, 50),
+    ("last_action", 450, 50),
+  ]
+  assert layout["contact"] == CONTACT_TERM
+  assert layout["loadcell"]["sensors"] == [
+    "osl_ankle_load_force",
+    "osl_ankle_load_torque",
+  ]
+  sensors = obs["sensors"]["sensors"]
+  assert sensors[-2:] == CONTACT_SENSORS
+  assert not {s["name"]: s for s in sensors}["osl_socket_load_force"]["observed"]
+  assert set(obs["sensors"]["load_cell_tare"]["values"]) == {
+    "osl_ankle_load_force",
+    "osl_ankle_load_torque",
+  }
+  randomization = m["controllers"]["osl"]["training"]["observation_randomization"]
+  assert randomization["observation"]["contact"] == CONTACT_RANDOMIZATION
+  assert obs["sensor_set"] == DEFAULT_SENSOR_SET
+  # Channel names are unique across terms; the FSM's stays.
+  channels = [c for t in obs["term_layout"] for c in t["channels"]]
+  assert len(channels) == len(set(channels)) and "osl_ankle_load_force_y" in channels
+  readme = (bundle / "README.md").read_text()
+  assert (
+    "- Sensors: encoders, shank IMU, ankle load cell, heel contact, toe contact "
+    "(manifest `sensor_set`)"
+  ) in readme
+  # The ONNX metadata keeps the section without the summary (old runs re-export
+  # byte-identically); the model keeps every OSL sensor.
+  session = ort.InferenceSession(
+    str(bundle / "osl_actor.onnx"), providers=["CPUExecutionProvider"]
+  )
+  meta = json.loads(session.get_modelmeta().custom_metadata_map["osl_policy"])
+  embedded = meta["observation"]
+  assert "sensor_set" not in embedded
+  assert embedded["term_layout"] == obs["term_layout"]
+  model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
+  for name in ("osl_socket_load_force", "osl_knee_torque", "r_foot", "r_toes"):
+    assert model.sensor(f"robot/{name}").id >= 0
+
+
+def test_legacy_run_exports_its_own_sensor_set(legacy) -> None:
+  """A run from before the foot contacts exports at this checkout as it trained,
+  from its env.yaml: both load cells (its record has no ``ankle`` key), no contact
+  term, and no touch sensor in its sensor list."""
+  _, m = legacy
+  obs = m["controllers"]["osl"]["observation"]
+  assert obs["size"] == LEGACY_OSL_OBS
+  assert obs["terms"] == ["actpack", "loadcell", "last_action"]
+  assert set(obs["latency"]["buses"]) == {"actpack", "loadcell"}
+  names = [s["name"] for s in obs["sensors"]["sensors"]]
+  assert "osl_heel_contact" not in names and len(names) == 12
+  assert obs["sensor_set"] == {
+    **DEFAULT_SENSOR_SET,
+    "socket_load_cell": True,
+    "heel_contact": False,
+    "toe_contact": False,
+  }
+  assert {t["name"]: t["dim"] for t in obs["term_layout"]}["loadcell"] == 300
 
 
 def test_bundle_declares_its_touch_sites(exported) -> None:

@@ -41,9 +41,14 @@ The run's ``params/`` decide the model, socket and reward. The task is rebuilt
 from this checkout with the OSL foot touch sites the checkpoint was trained with
 (its ``osl_touch_sites`` key, else ``original``), which its warm start's stage 1
 must share; its env.yaml must match the rebuilt task (touch sites, simulation,
-decimation, the human's observation, actions, actuator delays), and its ``osl``
-observation settings (switches, error bounds, history, latency) are taken from the
-run.
+decimation, the human's observation, actions, actuator delays). Its ``osl`` group
+(sensor set, error bounds, history, latency) is rebuilt from the run's record: the
+checkpoint's ``osl_observation`` key, else its env.yaml
+(:func:`~.rl.osl_observation.run_osl_observation`), so runs of any sensor set
+export as trained: two cells (R2), the socket cell alone (s2_D), 50 frames (s2_B,
+s2_E), or the real leg's ankle cell and foot contacts (the default since
+2026-11-14). The manifest's ``controllers.osl.observation.sensor_set`` summarizes
+the set (informational: a consumer builds from ``term_layout``).
 """
 
 from __future__ import annotations
@@ -86,11 +91,18 @@ from mjlab.tasks.osl_mimic.touch_sites import (
   touch_sites_readme_line,
 )
 
-from .config.env_cfgs import osl_split_env_cfg
-from .mdp.observations import osl_validation_group
+from .config.env_cfgs import osl_split_env_cfg, sync_osl_group
+from .mdp.observations import (
+  OSL_BUS_TERMS,
+  describe_osl_sensors,
+  osl_group_from_record,
+  osl_sensor_set,
+  osl_validation_group,
+)
 from .rl.export import DEFAULT_INFERENCE as OSL_INFERENCE
 from .rl.export import osl_policy_metadata
 from .rl.layout import OSL_ACTION_TERM, ActionLayout, Agent
+from .rl.osl_observation import run_osl_observation
 from .rl.ppo import OSL_OBS_GROUP
 from .rl.warmstart import lineage_touch_sites
 
@@ -121,17 +133,15 @@ OBS_GROUPS = {HUMAN: "actor", OSL: OSL_OBS_GROUP}
 SOURCE_FOLDERS = (*gl.SOURCE_FOLDERS, "tasks/osl_split")
 OSL_SPEC_FN = "mjlab.tasks.osl_split.config.sensors.spec_with_osl_sensors"
 """The run's robot spec_fn: the OSL sensors on top of stage 1's edits."""
-_OSL_TERM_SETTINGS = (
-  "history_length",
-  "flatten_history_dim",
-  "delay_min_lag",
-  "delay_max_lag",
-  "delay_per_env",
-  "delay_hold_prob",
-  "delay_update_period",
-  "delay_per_env_phase",
-)
-"""The ``osl`` term settings taken from the run, with its params."""
+SENSOR_NAMES = {
+  "encoders": "encoders",
+  "imu": "shank IMU",
+  "ankle_load_cell": "ankle load cell",
+  "socket_load_cell": "socket load cell",
+  "heel_contact": "heel contact",
+  "toe_contact": "toe contact",
+}
+"""The README's names for the manifest's ``sensor_set`` keys."""
 CONFORMANCE_STEPS = 40
 CONFORMANCE_TWIST = (1.0, 0.0, 0.5)
 """The conformance sequence plays the clip nearest this (vx, vy, wz): a turning
@@ -227,19 +237,26 @@ def load_payload(checkpoint: Path) -> dict[str, Any]:
 
 
 def split_config(
-  spec: SplitRunSpec, saved: dict[str, Any], *, touch_sites: TouchSites
+  spec: SplitRunSpec,
+  saved: dict[str, Any],
+  *,
+  touch_sites: TouchSites,
+  osl_record: Mapping[str, Any] | None = None,
 ) -> Any:
   """The run's stage-2 env config, rebuilt from this checkout in train mode, with
-  the OSL foot ``touch_sites`` the run trained with.
+  the OSL foot ``touch_sites`` the run trained with and its ``osl`` group.
 
   The touch sites, the human's observation, the actions, the simulation and the
   actuator delays must match the run's (:func:`~mjlab.tasks.osl_gait_library.
-  export.check_actor_config`); the ``osl`` group's terms must be the run's, and
-  their params, history and latency are taken from it, so a run trained with OSL
-  observation switches flipped on the command line exports as trained.
+  export.check_actor_config`). The ``osl`` group is rebuilt from ``osl_record``
+  (default: the env.yaml's ``observations.osl``) by :func:`~.mdp.observations.
+  osl_group_from_record`, terms, params, history and latency, so a run of any
+  sensor set, or with OSL observation switches flipped on the command line,
+  exports as trained.
 
   Raises:
-    ValueError: On drift, or ``osl`` processing outside the schema.
+    ValueError: On drift, an ``osl`` group outside the schema, or one
+      :func:`~.config.env_cfgs.sync_osl_group` refuses.
   """
   cfg = osl_split_env_cfg(spec.model, spec.socket, spec.reward, "train")
   set_touch_sites(cfg, touch_sites)
@@ -247,38 +264,26 @@ def split_config(
   spec_fn = str(saved["scene"]["entities"]["robot"].get("spec_fn"))
   if spec_fn != OSL_SPEC_FN:
     raise ValueError(f"The run's robot spec_fn is {spec_fn!r}, not {OSL_SPEC_FN!r}.")
-  apply_osl_group(cfg.observations[OSL_OBS_GROUP], saved["observations"][OSL_OBS_GROUP])
+  record = saved["observations"][OSL_OBS_GROUP] if osl_record is None else osl_record
+  cfg.observations[OSL_OBS_GROUP] = osl_group_from_record(record, train=True)
+  sync_osl_group(cfg)
   return cfg
 
 
 def apply_osl_group(group: ObservationGroupCfg, saved: Mapping[str, Any]) -> None:
-  """Give ``group`` (the rebuilt ``osl`` group) the run's term params, history and
-  latency, in place, after checking it has the run's terms.
+  """Make ``group`` the ``osl`` group a record describes, in place
+  (:func:`~.mdp.observations.osl_group_from_record` in train mode): its terms in
+  order, their params, history and latency, and the group's settings.
 
   Raises:
-    ValueError: For other terms or functions, a clip or scale on a term, or a
-      group that is not concatenated and flattened.
+    ValueError: For a record :func:`~.mdp.observations.osl_group_from_record`
+      refuses.
   """
-  names, saved_names = list(group.terms), list(saved["terms"])
-  if names != saved_names:
-    raise ValueError(f"observations.osl.terms {saved_names} -> {names}")
-  for name, term in group.terms.items():
-    original = saved["terms"][name]
-    func = f"{term.func.__module__}.{term.func.__name__}"
-    if original["func"] != func:
-      raise ValueError(f"observations.osl.{name}.func {original['func']} -> {func}")
-    processed = [k for k in ("clip", "scale") if original.get(k) is not None]
-    if processed:
-      raise ValueError(f"observations.osl.{name} sets {processed}, outside the schema.")
-    term.params = dict(original["params"])
-    for key in _OSL_TERM_SETTINGS:
-      setattr(term, key, original[key])
-    if term.history_length and not term.flatten_history_dim:
-      raise ValueError(f"observations.osl.{name} keeps an unflattened history.")
-  for key in ("concatenate_terms", "history_length", "flatten_history_dim"):
-    setattr(group, key, saved[key])
-  if not group.concatenate_terms or not group.flatten_history_dim:
-    raise ValueError("The osl group must be concatenated and flattened.")
+  rebuilt = osl_group_from_record(saved, train=True)
+  group.terms = rebuilt.terms
+  for key in ("concatenate_terms", "enable_corruption", "history_length"):
+    setattr(group, key, getattr(rebuilt, key))
+  group.flatten_history_dim = rebuilt.flatten_history_dim
 
 
 ##
@@ -462,7 +467,11 @@ def osl_conformance(
   )
   last_action[0] = 0.0
   train = cfg.observations[OSL_OBS_GROUP]
-  bus = [t for t in train.terms.values() if t is not None and t.delay_max_lag > 0]
+  bus = [
+    term
+    for name in OSL_BUS_TERMS
+    if (term := train.terms.get(name)) is not None and term.delay_max_lag > 0
+  ]
   low_lag = min((int(t.delay_min_lag) for t in bus), default=0)
   high_lag = max((int(t.delay_max_lag) for t in bus), default=0)
   lags = list(range(low_lag, high_lag + 1))
@@ -699,6 +708,8 @@ def _readme(manifest: dict[str, Any]) -> str:
     f"(validation {b['validation_steps']})"
     for name, b in buses.items()
   )
+  sensor_set = osl["observation"].get("sensor_set") or {}
+  sensors = ", ".join(SENSOR_NAMES[k] for k, on in sensor_set.items() if on)
   stage1 = lineage.get("stage1_checkpoint")
   return f"""# {run["task"]}: {run["run"]} / {run["checkpoint"]}
 
@@ -734,6 +745,7 @@ osl_deploy (plain CPU MuJoCo {manifest["mujoco_version"]}).
   `{osl["observation"]["schema"]}`: the prosthesis's own sensors, terms
   {", ".join(osl["observation"]["terms"])}, each with
   {osl["memory"]["frames"]} frames of history (term-major, oldest first)
+- Sensors: {sensors} (manifest `sensor_set`)
 - Sensor latency in training: {latency}
 - Action: {osl["action"]["size"]} outputs, blocks
   {", ".join(f"{b['name']} ({b['size']})" for b in osl["action"]["blocks"])};
@@ -799,8 +811,13 @@ def export_bundle(
       f"start's stage 1 with {lineage_touch_sites(lineage)!r}."
     )
   print(f"[INFO] OSL touch sites: {touch.value} (from {touch.source}).")
+  osl_obs = run_osl_observation(checkpoint, payload, saved)
+  print(
+    f"[INFO] OSL sensors: {describe_osl_sensors(osl_obs.record)} (from "
+    f"{osl_obs.source})."
+  )
 
-  cfg = split_config(spec, saved, touch_sites=touch.value)
+  cfg = split_config(spec, saved, touch_sites=touch.value, osl_record=osl_obs.record)
   env, command, actions, solver = gl.compile_task(
     cfg, saved, library, solver_iterations, ls_solver_iterations
   )
@@ -977,6 +994,11 @@ def export_bundle(
         tmp / ONNX_FILES[name], _plain({**header, "controller": name, **sections[name]})
       )
       manifest["files"][ONNX_FILES[name]] = gl.sha256(tmp / ONNX_FILES[name])
+    # After the ONNX metadata (the OSL section as before 2026-11-14, so a re-export
+    # of an older run keeps its ONNX bytes): the set, for people and logs.
+    sections[OSL]["observation"]["sensor_set"] = osl_sensor_set(
+      cfg.observations[OSL_OBS_GROUP]
+    )
     (tmp / "manifest.json").write_text(json.dumps(_plain(manifest), indent=2) + "\n")
     (tmp / "README.md").write_text(_readme(_plain(manifest)))
     if output.exists():

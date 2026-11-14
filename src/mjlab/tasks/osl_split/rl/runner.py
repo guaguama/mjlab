@@ -43,9 +43,9 @@ wherever one agent did not become two:
   checkpoint's own ``Validation/`` and ``ValidationExpected/``. The validation env
   is the task's validation config with the training run's settings (simulation,
   observation groups, every shared reward term's weight and params) and the
-  training OSL observation read exactly, at the middle of its training lag. Per
-  clip family (stage 1's, its ``slow`` group included) it also reports the left
-  and right tight arcs and pivots. Episodes last 20 s (stage 1's validation
+  training OSL observation read exactly, each bus at the middle of its training
+  lag. Per clip family (stage 1's, its ``slow`` group included) it also reports
+  the left and right tight arcs and pivots. Episodes last 20 s (stage 1's validation
   config), and every family is seeded alike by ``validation.seed``.
 * **Stress validation** (every ``stress_interval`` stage-local iterations, and at
   zero-shot with the teacher alone) plays a copy of the training config, the OSL
@@ -66,11 +66,16 @@ wherever one agent did not become two:
   explained variance (``Critic/``), the learning rates, the freeze and blend state
   and the channels' weights and shares.
 * **Checkpoints** hold the four networks, their optimizers, both return
-  normalizers and the split state (the stage's place and its curriculum), every
-  ``save_interval`` stage-local iterations except the first iteration of a launch,
-  and at its end. Each comes with the OSL actor alone, as ONNX plus its metadata
-  (:mod:`.export`), in ``exported/`` next to it. ``play.py``'s load restores only
-  the actors.
+  normalizers and the split state (the stage's place and its curriculum), the OSL
+  touch sites and the ``osl`` group the OSL actor reads (its sensor set, history,
+  lags and noise, :data:`~..mdp.OSL_OBSERVATION_KEY`), every ``save_interval``
+  stage-local iterations except the first iteration of a launch, and at its end.
+  Each comes with the OSL actor alone, as ONNX plus its metadata (:mod:`.export`),
+  in ``exported/`` next to it. ``play.py``'s load restores only the actors, into
+  an env built with the checkpoint's own touch sites and OSL sensor set
+  (:meth:`SplitOnPolicyRunner.configure_env_for_checkpoint`); a resume or play
+  whose env builds another OSL input layout is refused
+  (:func:`.osl_observation.check_osl_observation`).
 """
 
 from __future__ import annotations
@@ -97,7 +102,6 @@ from tensordict import TensorDict
 
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import TendonEffortAction
-from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.osl_gait_library.config.dr import nominal_plant
 from mjlab.tasks.osl_gait_library.mdp import TIGHT_ARC_WZ, GaitLibraryCommandCfg
@@ -113,11 +117,24 @@ from mjlab.tasks.osl_mimic.touch_sites import (
   check_checkpoint_touch_sites,
   env_touch_sites,
 )
-from mjlab.tasks.osl_split.config.env_cfgs import REWARD_NAME, osl_split_env_cfg
-from mjlab.tasks.osl_split.mdp import osl_validation_group, split_mimic_reward
+from mjlab.tasks.osl_split.config.env_cfgs import (
+  REWARD_NAME,
+  osl_split_env_cfg,
+  sync_osl_group,
+)
+from mjlab.tasks.osl_split.mdp import (
+  OSL_OBSERVATION_KEY,
+  describe_osl_sensors,
+  osl_group_from_record,
+  osl_observation_entry,
+  osl_validation_group,
+  osl_validation_lags,
+  split_mimic_reward,
+)
 
 from .export import EXPORT_DIR, export_osl_policy
 from .layout import AGENTS, ActionLayout
+from .osl_observation import check_osl_observation, env_osl_group, run_osl_observation
 from .policy import HumanMode, OslMode, SplitInferencePolicy
 from .ppo import OSL_OBS_GROUP, TwoAgentPPO
 from .schedules import MODULES, ChannelSchedule, SplitSchedule
@@ -929,9 +946,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     its settings (:meth:`_inherit_training_settings`: the simulation, the
     observation groups with their corruption off, and every shared reward term's
     weight and params, the channels' settings included), then the training OSL
-    observation read exactly (:func:`~..mdp.osl_validation_group`) at the middle
-    of its training lag, so a changed history, sensor switch or lag reaches the
-    OSL actor in evaluation too.
+    observation read exactly (:func:`~..mdp.osl_validation_group`), each bus at the
+    middle of its training lag (:func:`~..mdp.osl_validation_lags`), so a changed
+    history, sensor set or lag reaches the OSL actor in evaluation too.
     """
     train = self.env.unwrapped.cfg
     if purpose == "stress":
@@ -950,7 +967,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     self._inherit_training_settings(cfg)
     train_osl = train.observations[OSL_OBS_GROUP]
     cfg.observations[OSL_OBS_GROUP] = osl_validation_group(
-      train_osl, _middle_lag(train_osl)
+      train_osl, osl_validation_lags(train_osl)
     )
     return cfg
 
@@ -1298,8 +1315,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
 
   def save(self, path: str, infos: dict | None = None) -> None:
     """Checkpoint everything (the four networks, optimizers, return statistics and
-    split state, the curriculum included, and the OSL touch sites the env
-    simulates), then export the OSL actor next to it if ``export_osl_onnx``."""
+    split state, the curriculum included, the OSL touch sites the env simulates and
+    its training ``osl`` group), then export the OSL actor next to it if
+    ``export_osl_onnx``."""
     env = self.env.unwrapped
     infos = {
       **(infos or {}),
@@ -1316,6 +1334,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     saved["iter"] = self.current_learning_iteration
     saved["infos"] = infos
     saved[CHECKPOINT_KEY] = env_touch_sites(env)
+    saved[OSL_OBSERVATION_KEY] = osl_observation_entry(env_osl_group(env))
     torch.save(saved, path)
     upload = bool(self.cfg.get("upload_model", False))
     if upload:
@@ -1357,14 +1376,22 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     trained with ``osl_critic_obs="full+osl"`` has a wider OSL critic). Without
     the run's critics, optimizers and statistics the runner cannot train.
 
+    Either way the env must build the checkpoint's OSL input layout (sensor set and
+    history; :func:`.osl_observation.check_osl_observation`), since two sets of the
+    same width load alike and feed the actor other signals; lags, error bounds or
+    noise that differ only draw a warning.
+
     Raises:
       ValueError: For a stage-1 checkpoint, a warm-start file or anything else
-        that is not a stage-2 checkpoint, or one trained with other OSL touch sites
-        than the env simulates (one that records none trained with ``original``).
+        that is not a stage-2 checkpoint, one trained with other OSL touch sites
+        than the env simulates (one that records none trained with ``original``),
+        or one trained on another OSL input layout (the message names the flags
+        that build it).
     """
     loaded = torch.load(path, map_location=map_location, weights_only=False)
     _check_stage2_checkpoint(loaded, path)
     check_checkpoint_touch_sites(loaded, path, self.env.unwrapped)
+    check_osl_observation(loaded, path, self.env.unwrapped)
     actors_only = _actors_only(load_cfg)
     self.alg.load(loaded, strict, actors_only=actors_only)
     infos = dict(loaded.get("infos") or {})
@@ -1383,6 +1410,34 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     self.current_learning_iteration = int(loaded["iter"]) + 1
     self._ready = True
     return infos
+
+  @classmethod
+  def configure_env_for_checkpoint(
+    cls, env_cfg: ManagerBasedRlEnvCfg, checkpoint: str | Path
+  ) -> None:
+    """Make ``env_cfg`` build what ``checkpoint`` was trained with, before the env
+    exists (``play`` calls this; it takes no ``--env`` overrides): its OSL touch
+    sites (stage 1's), then its ``osl`` group (:func:`.osl_observation.
+    run_osl_observation`: the checkpoint's record, else its run's env.yaml, else
+    the legacy set), with the run's sensors, history and lags, and its
+    randomization only if ``env_cfg``'s group corrupts (play's does not, so play
+    reads the sensors exactly at training's lags). It prints the set and where it
+    came from.
+
+    Raises:
+      ValueError: For the touch-site refusals, a record this checkout cannot
+        rebuild, or a set :func:`~..config.env_cfgs.sync_osl_group` refuses.
+    """
+    super().configure_env_for_checkpoint(env_cfg, checkpoint)
+    resolved = run_osl_observation(checkpoint)
+    current = env_cfg.observations.get(OSL_OBS_GROUP)
+    train = bool(current is not None and current.enable_corruption)
+    group = osl_group_from_record(resolved.record, train=train)
+    env_cfg.observations = {**env_cfg.observations, OSL_OBS_GROUP: group}
+    sync_osl_group(env_cfg)
+    print(
+      f"[INFO] OSL sensors: {describe_osl_sensors(group)} (from {resolved.source})."
+    )
 
   def get_inference_policy(  # type: ignore[override]
     self, device: str | None = None
@@ -1462,16 +1517,6 @@ def _seeded(seed: int | None, *devices: str | torch.device) -> Iterator[None]:
   with torch.random.fork_rng(devices=cuda):
     torch.manual_seed(seed)
     yield
-
-
-def _middle_lag(group: ObservationGroupCfg) -> int:
-  """The middle of the OSL buses' training lag range: validation's fixed lag
-  (``OslObsCfg.validation_delay_steps``'s rule)."""
-  for name in ("actpack", "loadcell"):
-    term = group.terms.get(name)
-    if term is not None:
-      return (int(term.delay_min_lag) + int(term.delay_max_lag)) // 2
-  return 0
 
 
 def _strip_optional(model_cfg: dict | None) -> None:

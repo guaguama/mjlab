@@ -8,9 +8,13 @@ Stage 2 splits it:
   transplant), with the unified critic as its critic. It starts frozen for a number of
   iterations and keeps the stage-1 action std;
 * the **OSL actor** is a fresh, small network that sees only the prosthesis's own
-  sensors (knee/ankle encoders, a shank IMU, load cells and its own previous command),
-  with an observation history. It never sees the reference, the commanded twist or
-  the stride clock, and learns to follow them only through its reward;
+  sensors, with an observation history. By default these are the real leg's: the
+  knee and ankle encoders, a shank IMU, the six-axis load cell above the ankle and
+  the foot's heel and toe contact forces, plus its own previous command (500
+  inputs). Each sensor has a switch (``mdp.OslObsCfg``, or the term params on the
+  train command line), and every run records its set, which play, export and
+  resume rebuild. It never sees the reference, the commanded twist or the stride
+  clock, and learns to follow them only through its reward;
 * each agent has its own critic (both full-state), PPO ratio and clip, optimizer and
   reward channel. The channels re-weight the stage-1 imitation reward's coordinates,
   so at the stage-1 weights both equal the stage-1 reward;

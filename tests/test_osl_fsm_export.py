@@ -27,7 +27,12 @@ import torch
 import yaml
 from tensordict import TensorDict
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket, get_spec
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  Model,
+  Socket,
+  TouchSites,
+  get_spec,
+)
 from mjlab.tasks.osl_fsm import export as fsm_export
 from mjlab.tasks.osl_fsm.config import fsm_task_id
 from mjlab.tasks.osl_fsm.config.env_cfgs import OslFsmCfg, osl_fsm_env_cfg
@@ -37,6 +42,7 @@ from mjlab.tasks.osl_fsm.mdp import OslFsmAction
 from mjlab.tasks.osl_gait_library import export as gl
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
+from mjlab.tasks.osl_mimic.touch_sites import set_touch_sites
 from mjlab.tasks.osl_split import export as split_export
 from mjlab.utils.os import dump_yaml
 
@@ -149,15 +155,21 @@ def _actor(group: str, obs_dim: int, action_dim: int, distribution: dict):
   return actor
 
 
-def _make_run(root: Path, case: Case, library: Path) -> Path:
-  """A stage-1.5 run on the default touch sites with ``CASES``' controller: its
-  env.yaml, agent.yaml, and a checkpoint whose controller settings are the ones the
-  env's action term resolves (``OslFsmAction.settings``, as the runner records
-  them), with a warm-start lineage on the same touch sites."""
+def _make_run(
+  root: Path, case: Case, library: Path, touch_sites: TouchSites | None = None
+) -> Path:
+  """A stage-1.5 run on the default touch sites (or ``touch_sites``) with
+  ``CASES``' controller: its env.yaml, agent.yaml, and a checkpoint whose
+  controller settings are the ones the env's action term resolves
+  (``OslFsmAction.settings``, as the runner records them), with a warm-start
+  lineage on the same touch sites. Like S15-1's, the checkpoint records no
+  ``osl`` group: its env.yaml does."""
   model, socket, reward = case
   obs_dim, terms, controller = CASES[case]
   run = root / f"{model}_{socket}" / "run"
   env_cfg = osl_fsm_env_cfg(model, socket, reward, "train", fsm=controller)
+  if touch_sites is not None:
+    set_touch_sites(env_cfg, touch_sites)
   env_cfg.commands["motion"].library_dir = str(library)  # type: ignore[attr-defined]
   agent = osl_fsm_runner_cfg(model, socket, reward, "exp")
   agent.actor.hidden_dims = HIDDEN
@@ -283,9 +295,18 @@ def test_osl_section_is_stage2s_without_its_network(exported, rebuilt) -> None:
   def without(section: dict, *keys: str) -> dict:
     return {k: v for k, v in section.items() if k not in keys}
 
-  assert without(ours["observation"], "normalization") == without(
+  # The bundle adds the set's summary after the controllers' ONNX metadata.
+  assert without(ours["observation"], "normalization", "sensor_set") == without(
     stage2["observation"], "normalization"
   )
+  assert ours["observation"]["sensor_set"] == {
+    "encoders": True,
+    "imu": True,
+    "ankle_load_cell": True,
+    "socket_load_cell": True,
+    "heel_contact": False,
+    "toe_contact": False,
+  }
   assert without(ours["action"], "std") == without(stage2["action"], "std")
   assert stage2["memory"]["kind"] == "observation_history"
 
@@ -489,3 +510,22 @@ def test_refuses_a_lineage_on_other_touch_sites(exported) -> None:
   torch.save(payload, other)
   with pytest.raises(ValueError, match="but its warm start's stage 1 with 'original'"):
     fsm_export.export_bundle(other)
+
+
+def test_s15_style_run_on_the_original_touch_sites_exports(library, tmp_path) -> None:
+  """A stage-1.5 run like S15-1 and S15-2: the original touch sites, no
+  ``osl_observation`` key, its two-cell clean group in its env.yaml. It exports at
+  this checkout with its 600-input contract and no contact sensor."""
+  case = next(iter(CASES))
+  checkpoint = _make_run(tmp_path, case, library, touch_sites="original")
+  bundle = fsm_export.export_bundle(checkpoint)
+  m = json.loads((bundle / "manifest.json").read_text())
+  assert m["touch_sites"]["version"] == "original"
+  obs = m["controllers"]["osl"]["observation"]
+  assert obs["size"] == OSL_OBS and obs["terms"] == [
+    "actpack",
+    "loadcell",
+    "last_action",
+  ]
+  assert len(obs["sensors"]["sensors"]) == 12
+  assert not obs["sensor_set"]["heel_contact"] and obs["sensor_set"]["socket_load_cell"]

@@ -259,17 +259,37 @@ def test_cli_sets_the_touch_sites(
     _cli_env(task, FLAG, "heel")
 
 
+HEEL_OFF = ("--env.observations.osl.terms.contact.params.heel", "False")
+"""A stage-2 run on the original touch sites turns the OSL heel contact off: its
+r_foot zone never fires there, and the default set is refused."""
+
+
 @pytest.fixture(scope="module")
 def scene_models() -> dict[tuple[str, str], mujoco.MjModel]:
   """The scenes of a stage-2 task (a spec_fn chain adds the OSL sensors) and of a
   tracking task (its own spec_fn), compiled from train.py's command line: the
-  default (feet_extended), and ``--env.osl-touch-sites`` with the other two."""
+  default (feet_extended), and ``--env.osl-touch-sites`` with the other two (with
+  the heel contact off for a stage-2 task on ``original``)."""
   models = {}
   for task in (SPLIT, TRACKING):
     for version in TOUCH_SITES:
-      args = () if version == DEFAULT_TOUCH_SITES else (FLAG, version)
+      args: tuple[str, ...] = () if version == DEFAULT_TOUCH_SITES else (FLAG, version)
+      if task == SPLIT and version == "original":
+        args += HEEL_OFF
       models[task, version] = Scene(_cli_env(task, *args).scene, "cpu").compile()
   return models
+
+
+def test_split_task_refuses_heel_contact_on_the_original_touch_sites(
+  capsys: pytest.CaptureFixture[str],
+) -> None:
+  """The stage-2 default set reads the OSL heel's r_foot zone, which never fires
+  on the original touch sites: the command line refuses it, naming both flags."""
+  with pytest.raises(SystemExit):
+    _cli_env(SPLIT, FLAG, "original")
+  err = capsys.readouterr().err
+  assert "--env.osl-touch-sites" in err and HEEL_OFF[0] in err
+  assert _cli_env(SPLIT, FLAG, "original", *HEEL_OFF).osl_touch_sites == "original"
 
 
 def test_scene_builds_the_configured_touch_sites(
@@ -491,6 +511,9 @@ def test_play_builds_what_the_checkpoint_trained_with(
       del saved["osl_touch_sites"]
     else:
       saved["osl_touch_sites"] = env_yaml
+    contact = saved["observations"].get("osl", {}).get("terms", {}).get("contact")
+    if contact is not None:  # The original zones need the heel contact off.
+      contact["params"]["heel"] = False
     dump_yaml(run / "params" / "env.yaml", saved)
     torch.save(payload, run / "model_10.pt")
     return run / "model_10.pt"

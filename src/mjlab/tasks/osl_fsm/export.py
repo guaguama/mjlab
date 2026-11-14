@@ -88,14 +88,26 @@ from mjlab.tasks.osl_mimic.touch_sites import (
   touch_sites_readme_line,
 )
 from mjlab.tasks.osl_split import export as split
+from mjlab.tasks.osl_split.config.env_cfgs import sync_osl_group
+from mjlab.tasks.osl_split.mdp import (
+  describe_osl_sensors,
+  osl_group_from_record,
+  osl_sensor_set,
+)
 from mjlab.tasks.osl_split.rl.export import osl_policy_metadata
 from mjlab.tasks.osl_split.rl.layout import OSL_ACTION_TERM, ActionLayout
+from mjlab.tasks.osl_split.rl.osl_observation import run_osl_observation
 from mjlab.tasks.osl_split.rl.ppo import OSL_OBS_GROUP
 from mjlab.tasks.osl_split.rl.warmstart import lineage_touch_sites
 from mjlab.utils.lab_api.math import quat_mul
 
 from .config import fsm_task_id
-from .config.env_cfgs import OslFsmEnvCfg, configure_fsm, osl_fsm_env_cfg
+from .config.env_cfgs import (
+  OslFsmEnvCfg,
+  configure_fsm,
+  osl_fsm_env_cfg,
+  sync_osl_fsm,
+)
 from .fsm import (
   JOINTS,
   RULES,
@@ -355,6 +367,7 @@ def fsm_config(
   settings: Mapping[str, Any],
   *,
   touch_sites: TouchSites,
+  osl_record: Mapping[str, Any] | None = None,
 ) -> OslFsmEnvCfg:
   """The run's stage-1.5 env config, rebuilt from this checkout in train mode with
   its controller ``settings`` and OSL foot ``touch_sites``, ready to compile on CPU.
@@ -362,8 +375,10 @@ def fsm_config(
   The touch sites, the human's observation, the actions, the simulation and the
   actuator delays must match the run's (:func:`~mjlab.tasks.osl_gait_library.
   export.check_actor_config`), and so must its env.yaml's controller
-  (:func:`check_saved_controller`). The ``osl`` group takes the run's term settings
-  (:func:`~mjlab.tasks.osl_split.export.apply_osl_group`) and must be clean
+  (:func:`check_saved_controller`). The ``osl`` group is rebuilt from ``osl_record``
+  (default: the env.yaml's ``observations.osl``; :func:`~mjlab.tasks.osl_split.
+  mdp.osl_group_from_record`), must carry the ankle cell
+  (:func:`~..config.env_cfgs.sync_osl_fsm`) and must be clean
   (:func:`check_clean_group`).
 
   The ``osl_motors`` term is then switched to ``controller="policy"``: the CPU
@@ -385,9 +400,12 @@ def fsm_config(
     raise ValueError(
       f"The run's robot spec_fn is {spec_fn!r}, not {split.OSL_SPEC_FN!r}."
     )
-  group = cfg.observations[OSL_OBS_GROUP]
-  split.apply_osl_group(group, saved["observations"][OSL_OBS_GROUP])
-  check_clean_group(group)
+  record = saved["observations"][OSL_OBS_GROUP] if osl_record is None else osl_record
+  group = osl_group_from_record(record, train=True)
+  cfg.observations[OSL_OBS_GROUP] = group
+  sync_osl_group(cfg)
+  sync_osl_fsm(cfg)
+  check_clean_group(cfg.observations[OSL_OBS_GROUP])
   term = cfg.actions[OSL_ACTION_TERM]
   if not isinstance(term, OslFsmActionCfg):
     raise TypeError(f"The rebuilt {OSL_ACTION_TERM!r} is a {type(term).__name__}.")
@@ -481,8 +499,15 @@ def build_run(
       f"start's stage 1 with {lineage_touch_sites(lineage)!r}."
     )
   print(f"[INFO] OSL touch sites: {touch.value} (from {touch.source}).")
+  osl_obs = run_osl_observation(checkpoint, payload, saved)
+  print(
+    f"[INFO] OSL sensors: {describe_osl_sensors(osl_obs.record)} (from "
+    f"{osl_obs.source})."
+  )
 
-  cfg = fsm_config(spec, saved, settings, touch_sites=touch.value)
+  cfg = fsm_config(
+    spec, saved, settings, touch_sites=touch.value, osl_record=osl_obs.record
+  )
   env, command, actions, solver = gl.compile_task(
     cfg, saved, library, solver_iterations, ls_solver_iterations
   )
@@ -1127,6 +1152,9 @@ def export_bundle(
       tmp / ONNX_FILE, split._plain({**header, "controller": HUMAN, **sections[HUMAN]})
     )
     manifest["files"][ONNX_FILE] = gl.sha256(tmp / ONNX_FILE)
+    sections[OSL]["observation"]["sensor_set"] = osl_sensor_set(
+      c.cfg.observations[OSL_OBS_GROUP]
+    )
     (tmp / "manifest.json").write_text(
       json.dumps(split._plain(manifest), indent=2) + "\n"
     )

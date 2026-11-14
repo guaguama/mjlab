@@ -263,6 +263,31 @@ Changed
   follows (``--validation-steps`` defaults to the task's, ``--validation-seed``).
   Validation numbers of earlier runs (10 s) are not comparable with later ones, and
   a validation pass takes about twice as long.
+- The stage-2 OSL actor reads the real leg's sensors by default: the knee and ankle
+  encoders, the shank IMU, the ankle load cell (the socket cell is now off) and a
+  new ``contact`` term, the OSL foot's heel and toe contact forces (the model's own
+  ``r_foot`` and ``r_toes`` touch sensors, raw in N, with a per-episode bias of
+  +-2 N, 1 N white noise and their own 0-2 step lag bus), 500 inputs instead of
+  600. Each sensor is a term param (``loadcell``'s ``ankle`` and ``socket``,
+  ``contact``'s ``heel`` and ``toe``), and a sensor term whose sensors are all off
+  is left out of the group, so both load cells may now be off. The old two-cell set
+  is ``--env.observations.osl.terms.loadcell.params.socket True
+  --env.observations.osl.terms.contact.params.heel False
+  --env.observations.osl.terms.contact.params.toe False``; the history is
+  ``--env.observations.osl.history-length N``. Heel contact is refused under
+  ``--env.osl-touch-sites original``, whose ``r_foot`` zone never fires, so a
+  contact-on stage 2 needs a stage-1 teacher on the extended touch sites.
+  Validation fixes every bus's lag, contact's included, at the middle of its
+  training range. Every stage-2 and stage-1.5 checkpoint records its ``osl`` group
+  (top-level key ``osl_observation``); play, the bundle exporters and resume
+  rebuild or check the run's own set from that key, else the run's
+  ``params/env.yaml``, else the legacy two-cell set with a warning, so old runs
+  (two cells, the socket cell alone, 50 frames, stage 1.5) still play and export
+  as trained. A resume or play whose env builds another input layout is refused
+  with the flags that build the checkpoint's, which also catches two sets of the
+  same width. Bundles add ``controllers.osl.observation.sensor_set`` and list the
+  contact sensors (``mjSENS_TOUCH``) only when observed. Stage 1.5 keeps the
+  two-cell set for its clean group.
 
 - Bumped ``rsl-rl-lib`` from 5.5.0 to 5.5.1. This removes the need for capping
   ``wandb`` below 0.29.

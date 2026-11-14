@@ -14,6 +14,8 @@ import math
 import os
 import re
 from collections.abc import Callable
+from dataclasses import asdict, replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -21,7 +23,9 @@ import mujoco
 import numpy as np
 import pytest
 import torch
+import tyro
 
+import mjlab
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   OSL_TORQUE_JOINTS,
   Model,
@@ -29,16 +33,27 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   get_spec,
 )
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
-from mjlab.managers.observation_manager import ObservationManager, ObservationTermCfg
+from mjlab.managers.observation_manager import (
+  ObservationGroupCfg,
+  ObservationManager,
+  ObservationTermCfg,
+)
+from mjlab.scripts.train import TrainConfig
 from mjlab.tasks.osl_gait_library.config.dr import FOOT_GEOMS, OslDrCfg
 from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
+from mjlab.tasks.osl_gait_library.export import read_config
 from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward
 from mjlab.tasks.osl_mimic.mdp import mimic_component
 from mjlab.tasks.osl_split import mdp
 from mjlab.tasks.osl_split.config import sensors
-from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
+from mjlab.tasks.osl_split.config.env_cfgs import (
+  OslSplitEnvCfg,
+  osl_split_env_cfg,
+  sync_osl_group,
+)
 from mjlab.utils.buffers import DelayBuffer
+from mjlab.utils.os import dump_yaml
 
 MODELS: tuple[Model, ...] = ("robot", "msk")
 SOCKETS: tuple[Socket, ...] = ("rigid", "compliant")
@@ -54,6 +69,13 @@ CELLS = (  # Site, force, torque, and the hanging reading along +y (N).
 """2.03 kg hang below the ankle cell and 4.54 kg below the socket cell."""
 ACTPACK_STDS = (0.002,) * 2 + (0.05,) * 2 + (0.02,) * 3 + (0.1,) * 3
 LOADCELL_STDS = ((1.0,) * 3 + (0.1,) * 3) * 2
+"""Both cells'; the default set has the ankle cell's, the first six."""
+CONTACT_STDS = (1.0, 1.0)
+ALL_SPECS = (*sensors.OSL_SENSOR_SPECS, *sensors.OSL_CONTACT_SPECS)
+"""Every sensor an ``osl`` term can read: the added ones and the foot contacts."""
+SCENE_NAMES = {spec.name: sensors.scene_sensor_name(spec.sensor) for spec in ALL_SPECS}
+"""Each sensor's scene name: ``robot/<name>``, and the contacts' ``robot/r_foot``
+and ``robot/r_toes``."""
 EXTRA_STDS = (0.01,) * 3 + (1.0,) * 2
 """Projected gravity's, then the applied torque's."""
 QUIET_ACTPACK = dict.fromkeys(
@@ -207,10 +229,8 @@ def _fake_env(model: mujoco.MjModel, num_envs: int = 4) -> Any:
   """Every OSL sensor as a ``.data`` tensor, the site rotations and the OSL action
   term's raw command; the real compiled model for name lookups and the tare."""
   scene = {
-    sensors.scene_sensor_name(spec.name): SimpleNamespace(
-      data=torch.zeros(num_envs, spec.dim)
-    )
-    for spec in sensors.OSL_SENSOR_SPECS
+    SCENE_NAMES[spec.name]: SimpleNamespace(data=torch.zeros(num_envs, spec.dim))
+    for spec in ALL_SPECS
   }
   site_xmat = torch.eye(3).expand(num_envs, model.nsite, 3, 3).clone()
   action = SimpleNamespace(raw_action=torch.zeros(num_envs, 2))
@@ -226,7 +246,7 @@ def _fake_env(model: mujoco.MjModel, num_envs: int = 4) -> Any:
 
 def _set(env: Any, name: str, value: torch.Tensor | list[float]) -> None:
   data = torch.as_tensor(value, dtype=torch.float32)
-  env.scene[sensors.scene_sensor_name(name)].data = data.expand(env.num_envs, -1)
+  env.scene[SCENE_NAMES[name]].data = data.expand(env.num_envs, -1)
 
 
 def _actpack(env: Any, **params: Any) -> mdp.osl_actpack:
@@ -236,6 +256,11 @@ def _actpack(env: Any, **params: Any) -> mdp.osl_actpack:
 def _load_cells(env: Any, **params: Any) -> mdp.osl_load_cells:
   cfg = ObservationTermCfg(func=mdp.osl_load_cells, params=params)
   return mdp.osl_load_cells(cfg, env)
+
+
+def _contact(env: Any, **params: Any) -> mdp.osl_foot_contact:
+  cfg = ObservationTermCfg(func=mdp.osl_foot_contact, params=params)
+  return mdp.osl_foot_contact(cfg, env)
 
 
 def _changed_rows(now: torch.Tensor, before: torch.Tensor) -> torch.Tensor:
@@ -462,6 +487,63 @@ def test_last_action_is_the_clamped_raw_command(scene_model: mujoco.MjModel) -> 
   torch.testing.assert_close(out, torch.tensor([[1.0, -1.0], [0.5, -0.25]]))
 
 
+def test_contact_sensors_are_the_models_own(scene_model: mujoco.MjModel) -> None:
+  """The foot contacts read the model XML's r_foot and r_toes touch sensors on the
+  OSL foot's touch sites; nothing is added for them."""
+  assert [s.name for s in sensors.OSL_CONTACT_SPECS] == [
+    sensors.HEEL_CONTACT,
+    sensors.TOE_CONTACT,
+  ]
+  for spec in sensors.OSL_CONTACT_SPECS:
+    sensor = scene_model.sensor(sensors.scene_sensor_name(spec.sensor))
+    assert sensor.type[0] == mujoco.mjtSensor.mjSENS_TOUCH == spec.type
+    assert sensor.objtype[0] == mujoco.mjtObj.mjOBJ_SITE and sensor.dim[0] == 1
+    site = mujoco.mj_id2name(scene_model, mujoco.mjtObj.mjOBJ_SITE, sensor.objid[0])
+    assert site == f"robot/{spec.objname}"
+    assert spec.name not in sensors.OSL_SENSORS
+  assert [s.sensor for s in sensors.OSL_CONTACT_SPECS] == ["r_foot", "r_toes"]
+
+
+def test_contact_term_reads_the_touch_sensors_raw(
+  scene_model: mujoco.MjModel,
+) -> None:
+  """Heel then toe, raw (no tare, scale or clamp); a switch leaves its channel out.
+  Randomized: a per-episode bias within +-contact_bias, redrawn only for the envs
+  that reset, then white noise of std contact_noise."""
+  n = 6
+  env = _fake_env(scene_model, num_envs=n)
+  _set(env, sensors.HEEL_CONTACT, [350.0])
+  _set(env, sensors.TOE_CONTACT, [0.0])
+  both = _contact(env, randomize=False)
+  torch.testing.assert_close(both(env), torch.tensor([350.0, 0.0]).expand(n, -1))
+  toe = _contact(env, heel=False, randomize=False)
+  torch.testing.assert_close(toe(env), torch.zeros(n, 1))
+  _set(env, sensors.TOE_CONTACT, [1200.0])  # No saturation.
+  torch.testing.assert_close(toe(env), torch.full((n, 1), 1200.0))
+  with pytest.raises(ValueError, match="at least one foot contact"):
+    _contact(env, heel=False, toe=False)
+  assert mdp.term_channels("contact", {}) == [
+    (sensors.HEEL_CONTACT, "N", sensors.HEEL_CONTACT),
+    (sensors.TOE_CONTACT, "N", sensors.TOE_CONTACT),
+  ]
+
+  torch.manual_seed(7)
+  term = _contact(env, randomize=True, contact_bias=2.0, contact_noise=0.0)
+  assert bool((term.bias.abs() <= 2.0).all()) and bool((term.bias != 0).all())
+  torch.testing.assert_close(term(env), torch.tensor([350.0, 1200.0]) + term.bias)
+  before = term.bias.clone()
+  term.reset(torch.tensor([1, 3]))
+  reset = torch.tensor([False, True, False, True, False, False])
+  torch.testing.assert_close(_changed_rows(term.bias, before), reset)
+
+  many = _fake_env(scene_model, num_envs=4096)
+  noisy = _contact(many, randomize=True, contact_bias=0.0)
+  assert noisy.noise_std.tolist() == pytest.approx(CONTACT_STDS)
+  torch.testing.assert_close(
+    noisy(many).std(dim=0), torch.tensor(CONTACT_STDS), rtol=0.05, atol=0.0
+  )
+
+
 ##
 # The observation group.
 ##
@@ -473,14 +555,17 @@ def test_observation_group_by_mode(mode: Mode) -> None:
   group = mdp.osl_observation_group(mode, cfg)
   train = mode == "train"
   assert (
-    tuple(group.terms) == mdp.OSL_OBS_TERMS == ("actpack", "loadcell", "last_action")
+    tuple(group.terms)
+    == mdp.OSL_OBS_TERMS
+    == ("actpack", "loadcell", "contact", "last_action")
   )
+  assert mdp.OSL_BUS_TERMS == ("actpack", "loadcell", "contact")
   assert group.concatenate_terms and group.history_length is None
   assert group.enable_corruption == train
   for term in group.terms.values():
     assert term.history_length == 25 and term.flatten_history_dim
   lags = (1, 1) if mode == "validation" else (0, 2)
-  for name in ("actpack", "loadcell"):
+  for name in mdp.OSL_BUS_TERMS:
     term = group.terms[name]
     assert (term.delay_min_lag, term.delay_max_lag) == lags
     assert term.delay_per_env and term.delay_hold_prob == 1.0
@@ -492,31 +577,62 @@ def test_observation_group_by_mode(mode: Mode) -> None:
       mdp.osl_noise_std(name, term.params)
       == {
         "actpack": ACTPACK_STDS,
-        "loadcell": LOADCELL_STDS,
+        "loadcell": LOADCELL_STDS[:6],
+        "contact": CONTACT_STDS,
       }[name]
     )
+  # The real leg's set: the ankle cell, not the socket's, and both contacts.
+  loadcell, contact = group.terms["loadcell"].params, group.terms["contact"].params
+  assert loadcell["ankle"] and not loadcell["socket"]
+  assert contact["heel"] and contact["toe"]
+  assert contact["contact_bias"] == 2.0 and contact["contact_noise"] == 1.0
+  assert mdp.osl_sensor_set(group) == {
+    "encoders": True,
+    "imu": True,
+    "ankle_load_cell": True,
+    "socket_load_cell": False,
+    "heel_contact": True,
+    "toe_contact": True,
+  }
   last = group.terms["last_action"]
   assert last.func is mdp.osl_last_action
   assert last.params == {"action_name": "osl_motors"}
   assert last.noise is None and last.delay_max_lag == 0
   assert mdp.osl_noise_std("last_action", last.params) is None
-  assert mdp.osl_actpack_dim(cfg) == 10 and mdp.osl_loadcell_dim(cfg) == 12
-  assert mdp.osl_obs_frame_dim(cfg) == 24 and mdp.osl_obs_dim(cfg) == 600
+  assert mdp.osl_actpack_dim(cfg) == 10 and mdp.osl_loadcell_dim(cfg) == 6
+  assert mdp.osl_contact_dim(cfg) == 2
+  assert mdp.osl_obs_frame_dim(cfg) == 20 and mdp.osl_obs_dim(cfg) == 500
+  legacy = mdp.OslObsCfg(**mdp.LEGACY_OSL_SENSORS)
+  assert mdp.osl_obs_dim(legacy) == 600
 
 
 def test_observation_options() -> None:
   cfg = mdp.OslObsCfg(
-    projected_gravity=True, applied_torque=True, socket_load_cell=False
+    projected_gravity=True,
+    applied_torque=True,
+    socket_load_cell=True,
+    toe_contact=False,
   )
   group = mdp.osl_observation_group("train", cfg)
   actpack, loadcell = group.terms["actpack"], group.terms["loadcell"]
+  contact = group.terms["contact"]
   assert actpack.params["projected_gravity"] and actpack.params["applied_torque"]
-  assert not loadcell.params["socket"]
+  assert loadcell.params["socket"] and not contact.params["toe"]
   stds = mdp.osl_noise_std("actpack", actpack.params)
   assert stds == ACTPACK_STDS + EXTRA_STDS
   assert stds is not None and len(stds) == mdp.osl_actpack_dim(cfg) == 15
-  assert mdp.osl_noise_std("loadcell", loadcell.params) == LOADCELL_STDS[:6]
-  assert mdp.osl_loadcell_dim(cfg) == 6 and mdp.osl_obs_frame_dim(cfg) == 23
+  assert mdp.osl_noise_std("loadcell", loadcell.params) == LOADCELL_STDS
+  assert mdp.osl_noise_std("contact", contact.params) == CONTACT_STDS[:1]
+  assert mdp.osl_loadcell_dim(cfg) == 12 and mdp.osl_contact_dim(cfg) == 1
+  assert mdp.osl_obs_frame_dim(cfg) == 30
+  # A sensor term whose sensors are all off is left out (the drop rule).
+  drops: tuple[tuple[dict[str, Any], str], ...] = (
+    ({"heel_contact": False, "toe_contact": False}, "contact"),
+    ({"ankle_load_cell": False}, "loadcell"),
+  )
+  for off, gone in drops:
+    dropped = mdp.osl_observation_group("train", mdp.OslObsCfg(**off))
+    assert gone not in dropped.terms and len(dropped.terms) == 3
   quiet = mdp.OslObsCfg(gyro_noise=0.0, acc_noise=0.0)
   actpack = mdp.osl_observation_group("train", quiet).terms["actpack"]
   assert mdp.osl_noise_std("actpack", actpack.params) == ACTPACK_STDS[:4] + (0.0,) * 6
@@ -533,7 +649,7 @@ def test_observation_options() -> None:
 def _observe(manager: ObservationManager, env: Any, value: float) -> torch.Tensor:
   """Set every sensor and the OSL command to ``value`` and run one step's
   observation."""
-  for spec in sensors.OSL_SENSOR_SPECS:
+  for spec in ALL_SPECS:
     _set(env, spec.name, torch.full((spec.dim,), value))
   env.action.raw_action = torch.full((env.num_envs, 2), value)
   out = manager.compute(update_history=True)["osl"]
@@ -551,13 +667,14 @@ def test_osl_group_layout_through_the_observation_manager(
   cfg = mdp.OslObsCfg(history_length=4)
   group = mdp.osl_observation_group("validation", cfg)
   manager = ObservationManager({"osl": group}, env)
-  assert manager.group_obs_dim["osl"] == (mdp.osl_obs_dim(cfg),) == (96,)
+  assert manager.group_obs_dim["osl"] == (mdp.osl_obs_dim(cfg),) == (80,)
   for step in range(5):
     _observe(manager, env, 0.01 * step)
   out = _observe(manager, env, 0.05)
   actpack = out[:, :40].reshape(n, 4, 10)
-  loadcell = out[:, 40:88].reshape(n, 4, 12)
-  command = out[:, 88:].reshape(n, 4, 2)
+  loadcell = out[:, 40:64].reshape(n, 4, 6)
+  contact = out[:, 64:72].reshape(n, 4, 2)
+  command = out[:, 72:].reshape(n, 4, 2)
   # Steps 2 to 5 fill the history: the buses show steps 1 to 4, the command 2 to 5.
   bus_steps = 0.01 * torch.arange(1, 5, dtype=torch.float32)
   ankle_fx_tare = float(
@@ -567,6 +684,8 @@ def test_osl_group_layout_through_the_observation_manager(
   torch.testing.assert_close(
     loadcell[:, :, 0], (bus_steps - ankle_fx_tare).expand(n, -1)
   )
+  # The contacts are raw (no tare) and lag on their own bus.
+  torch.testing.assert_close(contact, bus_steps[:, None].expand(n, 4, 2))
   command_steps = 0.01 * torch.arange(2, 6, dtype=torch.float32)
   torch.testing.assert_close(command[:, :, 0], command_steps.expand(n, -1))
 
@@ -582,7 +701,7 @@ def test_osl_group_randomization_through_the_observation_manager(
   env = _fake_env(scene_model, num_envs=n)
   manager = ObservationManager({"osl": mdp.osl_observation_group("train")}, env)
   delay = manager._group_obs_term_delay_buffer["osl"]
-  assert set(delay) == {"actpack", "loadcell"}
+  assert set(delay) == {"actpack", "loadcell", "contact"}
   actpack = manager._group_obs_term_cfgs["osl"][0].func
   assert isinstance(actpack, mdp.osl_actpack)
 
@@ -590,6 +709,7 @@ def test_osl_group_randomization_through_the_observation_manager(
   lags = {name: buffer.current_lags.clone() for name, buffer in delay.items()}
   assert set(lags["actpack"].tolist()) == {0, 1, 2}
   assert not torch.equal(lags["actpack"], lags["loadcell"])
+  assert not torch.equal(lags["contact"], lags["loadcell"])
   for step in range(1, 10):
     _observe(manager, env, 0.01 * step)
     for name, buffer in delay.items():
@@ -613,21 +733,31 @@ def test_osl_group_randomization_through_the_observation_manager(
   torch.testing.assert_close(std, torch.tensor(ACTPACK_STDS), rtol=0.1, atol=0.0)
 
 
-SWITCH_FLIPS: tuple[tuple[str, str, bool, dict[str, Any]], ...] = (
-  ("actpack", "projected_gravity", True, {"projected_gravity": True}),
-  ("actpack", "applied_torque", True, {"applied_torque": True}),
-  ("loadcell", "socket", False, {"socket_load_cell": False}),
-  ("loadcell", "ankle", False, {"ankle_load_cell": False}),
+SWITCH_FLIPS: tuple[tuple[str, str, bool, dict[str, Any], dict[str, Any]], ...] = (
+  ("actpack", "projected_gravity", True, {}, {"projected_gravity": True}),
+  ("actpack", "applied_torque", True, {}, {"applied_torque": True}),
+  ("loadcell", "socket", True, {}, {"socket_load_cell": True}),
+  (
+    "loadcell",
+    "ankle",
+    False,
+    {"socket_load_cell": True},
+    {"socket_load_cell": True, "ankle_load_cell": False},
+  ),
+  ("contact", "heel", False, {}, {"heel_contact": False}),
+  ("contact", "toe", False, {}, {"toe_contact": False}),
 )
-"""A switch the train CLI can flip on a term's params, and its ``OslObsCfg`` field."""
+"""A switch the train CLI can flip on a term's params, the ``OslObsCfg`` fields of
+the group it is flipped on, and those of the group it gives."""
 
 
-@pytest.mark.parametrize("term, switch, value, field", SWITCH_FLIPS)
+@pytest.mark.parametrize("term, switch, value, base, field", SWITCH_FLIPS)
 def test_switch_flipped_on_a_term_param(
   scene_model: mujoco.MjModel,
   term: str,
   switch: str,
   value: bool,
+  base: dict[str, Any],
   field: dict[str, Any],
 ) -> None:
   """A switch flipped on a term's params, as the train CLI flips it
@@ -637,7 +767,9 @@ def test_switch_flipped_on_a_term_param(
   validation group derived from it has the same dims."""
   torch.manual_seed(6)
   n, history = 8, 3
-  group = mdp.osl_observation_group("train", mdp.OslObsCfg(history_length=history))
+  group = mdp.osl_observation_group(
+    "train", mdp.OslObsCfg(history_length=history, **base)
+  )
   group.terms[term].params[switch] = value
   cfg = mdp.OslObsCfg(history_length=history, **field)
   env = _fake_env(scene_model, num_envs=n)
@@ -661,17 +793,19 @@ def test_switch_flipped_on_a_term_param(
   "cfg",
   [
     mdp.OslObsCfg(),
-    mdp.OslObsCfg(projected_gravity=True, applied_torque=True, socket_load_cell=False),
+    mdp.OslObsCfg(projected_gravity=True, applied_torque=True, heel_contact=False),
+    mdp.OslObsCfg(**mdp.LEGACY_OSL_SENSORS),
     mdp.OslObsCfg(
       history_length=4, delay_steps=(1, 3), validation_delay_steps=2, gyro_noise=0.0
     ),
   ],
-  ids=["default", "switches", "lags"],
+  ids=["default", "switches", "legacy", "lags"],
 )
 def test_validation_group_derives_from_the_training_group(cfg: mdp.OslObsCfg) -> None:
   """What the runner builds its validation env from: the training env's group,
-  copied with the randomization off and both buses at the validation lag, which is
-  the validation group the task builds from the same config."""
+  copied with the randomization off and every bus, contact's included, at the
+  validation lag, which is the validation group the task builds from the same
+  config; the per-bus lags (the middle of each bus's range) give the same group."""
   train = mdp.osl_observation_group("train", cfg)
   untouched = copy.deepcopy(train)
   validation = mdp.osl_validation_group(train, cfg.validation_delay_steps)
@@ -685,8 +819,16 @@ def test_validation_group_derives_from_the_training_group(cfg: mdp.OslObsCfg) ->
     assert (term.delay_min_lag, term.delay_max_lag) == lags
   default = mdp.osl_validation_group(mdp.osl_observation_group("train"))
   assert default == mdp.osl_observation_group("validation")
+  lags = mdp.osl_validation_lags(train)
+  assert set(lags) == {n for n in mdp.OSL_BUS_TERMS if n in train.terms}
+  assert set(lags.values()) == {sum(cfg.delay_steps) // 2}
+  assert mdp.osl_validation_group(train, lags) == mdp.osl_validation_group(
+    train, sum(cfg.delay_steps) // 2
+  )
   with pytest.raises(ValueError, match="validation_delay_steps"):
     mdp.osl_validation_group(train, -1)
+  with pytest.raises(ValueError, match="No validation lag"):
+    mdp.osl_validation_group(train, {"actpack": 1})
 
 
 ##
@@ -727,10 +869,11 @@ def test_env_cfg_contract(
   assert not actor.enable_corruption
 
   osl = cfg.observations["osl"]
+  assert isinstance(cfg, OslSplitEnvCfg)
   assert tuple(osl.terms) == mdp.OSL_OBS_TERMS
   assert osl.enable_corruption == (mode == "train")
   lags = (1, 1) if mode == "validation" else (0, 2)
-  for name in ("actpack", "loadcell"):
+  for name in mdp.OSL_BUS_TERMS:
     term = osl.terms[name]
     assert (term.delay_min_lag, term.delay_max_lag) == lags
     assert term.params["randomize"] == (mode == "train")
@@ -856,6 +999,200 @@ def test_env_cfg_options_and_refusals() -> None:
   assert cfg.events["foot_friction"].params["ranges"] == (0.8, 1.0)
   loadcell = cfg.observations["osl"].terms["loadcell"]
   assert loadcell.history_length == 10 and not loadcell.params["socket"]
+
+
+def _dim(cfg: ManagerBasedRlEnvCfg) -> int:
+  return mdp.osl_layout_dim(mdp.osl_obs_layout(cfg.observations["osl"]))
+
+
+def test_drop_rule_and_refusals_on_the_env_cfg() -> None:
+  """A sensor term whose switches are all off leaves the group however they were
+  turned off (the config or its params, as the CLI does); heel contact is refused
+  under the original touch sites, whose r_foot zone never fires, but the toe is
+  not; unknown terms and a group without a sensor are refused."""
+  cfg = osl_split_env_cfg("robot", "rigid", "mimic", "train")
+  assert _dim(cfg) == 500
+  off = mdp.OslObsCfg(heel_contact=False, toe_contact=False)
+  no_contact = osl_split_env_cfg("robot", "rigid", "mimic", "train", osl_obs=off)
+  assert list(no_contact.observations["osl"].terms) == [
+    "actpack",
+    "loadcell",
+    "last_action",
+  ]
+  assert _dim(no_contact) == 450
+  # Switched off on the params, then constructed (as tyro does after the CLI).
+  group = copy.deepcopy(cfg.observations["osl"])
+  group.terms["loadcell"].params["ankle"] = False
+  edited = replace(cfg, observations={**cfg.observations, "osl": group})
+  assert list(edited.observations["osl"].terms) == [
+    "actpack",
+    "contact",
+    "last_action",
+  ]
+  assert "loadcell" in group.terms  # A new dict: the old group is untouched.
+  assert _dim(edited) == 350
+
+  with pytest.raises(ValueError) as error:
+    replace(cfg, osl_touch_sites="original")
+  assert "--env.osl-touch-sites" in str(error.value)
+  assert "--env.observations.osl.terms.contact.params.heel False" in str(error.value)
+  toe_only = osl_split_env_cfg(
+    "robot", "rigid", "mimic", "train", osl_obs=mdp.OslObsCfg(heel_contact=False)
+  )
+  original = replace(toe_only, osl_touch_sites="original")
+  assert mdp.osl_sensor_set(original.observations["osl"])["toe_contact"]
+  replace(no_contact, osl_touch_sites="original")  # No contacts at all: fine.
+
+  unknown = copy.deepcopy(cfg)
+  unknown.observations["osl"].terms["phase"] = ObservationTermCfg(func=lambda: None)
+  with pytest.raises(ValueError, match="Unknown osl observation terms"):
+    sync_osl_group(unknown)
+  bare = copy.deepcopy(cfg)
+  bare.observations["osl"] = ObservationGroupCfg(
+    terms={"last_action": cfg.observations["osl"].terms["last_action"]}
+  )
+  with pytest.raises(ValueError, match="at least one sensor term"):
+    sync_osl_group(bare)
+
+
+SPLIT_TASK = "Mjlab-Split-Unicycle-OSL-Fullbody-MSK-CLF-Compliant"
+FLAG = "--env.observations.osl"
+FLAG_SETS: tuple[tuple[str, int, dict[str, Any]], ...] = (
+  ("", 500, {}),
+  (
+    f"{FLAG}.terms.loadcell.params.socket True "
+    f"{FLAG}.terms.contact.params.heel False {FLAG}.terms.contact.params.toe False",
+    600,
+    {"socket_load_cell": True, "heel_contact": False, "toe_contact": False},
+  ),
+  (
+    f"{FLAG}.terms.contact.params.heel False {FLAG}.terms.contact.params.toe False",
+    450,
+    {"heel_contact": False, "toe_contact": False},
+  ),
+  (f"{FLAG}.terms.loadcell.params.socket True", 650, {"socket_load_cell": True}),
+  (f"{FLAG}.history-length 50", 1000, {}),
+  (
+    f"{FLAG}.terms.loadcell.params.ankle False "
+    f"{FLAG}.terms.loadcell.params.socket True "
+    f"{FLAG}.terms.contact.params.heel False {FLAG}.terms.contact.params.toe False",
+    450,
+    {
+      "ankle_load_cell": False,
+      "socket_load_cell": True,
+      "heel_contact": False,
+      "toe_contact": False,
+    },
+  ),
+)
+"""Train flags, the OSL input size they give, and the set's switches: the
+default, R2's two cells, contacts off, two cells plus contacts, a 50-frame
+history, and s2_D's socket cell alone."""
+
+
+@pytest.mark.parametrize("flags, dim, switches", FLAG_SETS)
+def test_sensor_flags_parse_and_round_trip(
+  flags: str, dim: int, switches: dict[str, Any]
+) -> None:
+  """The flags parse as ``train`` parses them, give the set, and the flags
+  :func:`~mjlab.tasks.osl_split.mdp.osl_sensor_flags` prints for the parsed group
+  are the same."""
+  args = tyro.cli(
+    TrainConfig,
+    args=flags.split(),
+    default=TrainConfig.from_task(SPLIT_TASK),
+    config=mjlab.TYRO_FLAGS,
+  )
+  group = args.env.observations["osl"]
+  assert _dim(args.env) == dim
+  expected = {
+    key: value
+    for key, value in asdict(mdp.OslObsCfg(**switches)).items()
+    if key in mdp.SWITCH_FIELDS.values()
+  }
+  sensor_set = mdp.osl_sensor_set(group)
+  for (term, switch), field in mdp.SWITCH_FIELDS.items():
+    assert sensor_set[field] == expected[field], (term, switch)
+  assert mdp.osl_sensor_flags(group) == flags
+
+
+def _legacy_record(**edits: Any) -> dict[str, Any]:
+  """A legacy record (both cells, no contacts) with its params or histories
+  edited: ``ankle=None`` drops the key, as runs before 242de42d8 recorded."""
+  record = mdp.legacy_osl_record()
+  params = record["terms"]["loadcell"]["params"]
+  for key, value in edits.items():
+    if key == "history":
+      for term in record["terms"].values():
+        term["history_length"] = value
+    elif value is None:
+      del params[key]
+    else:
+      params[key] = value
+  return record
+
+
+@pytest.mark.parametrize(
+  "record, dim, flags",
+  [
+    (
+      _legacy_record(ankle=None),
+      600,
+      f"{FLAG}.terms.loadcell.params.socket True "
+      f"{FLAG}.terms.contact.params.heel False {FLAG}.terms.contact.params.toe False",
+    ),
+    (
+      _legacy_record(ankle=False),
+      450,
+      f"{FLAG}.terms.loadcell.params.ankle False "
+      f"{FLAG}.terms.loadcell.params.socket True "
+      f"{FLAG}.terms.contact.params.heel False {FLAG}.terms.contact.params.toe False",
+    ),
+    (_legacy_record(ankle=None, history=50), 1200, None),
+    (mdp.osl_group_record(mdp.osl_observation_group("train")), 500, ""),
+  ],
+  ids=["r2", "s2_d", "history_50", "default"],
+)
+def test_record_round_trips(
+  record: dict[str, Any], dim: int, flags: str | None
+) -> None:
+  """A run's record rebuilds its group at its size: R2's (no ``ankle`` key, so both
+  cells), s2_D's (the socket cell alone), a 50-frame history and the new default;
+  its record is itself, and its flags rebuild it."""
+  group = mdp.osl_group_from_record(record)
+  layout = mdp.osl_obs_layout(group)
+  assert (
+    mdp.osl_layout_dim(layout) == dim == mdp.osl_layout_dim(mdp.osl_obs_layout(record))
+  )
+  assert mdp.osl_group_record(group) == record
+  clean = mdp.osl_group_from_record(record, train=False)
+  assert not clean.enable_corruption
+  assert all(not t.params.get("randomize", False) for t in clean.terms.values())
+  assert mdp.osl_obs_layout(clean) == layout
+  if flags is not None:
+    assert mdp.osl_sensor_flags(record) == flags
+  else:  # Per-term histories, as s2_E's flags set them.
+    printed = mdp.osl_sensor_flags(record)
+    assert f"{FLAG}.history-length 50" in printed
+  with pytest.raises(ValueError, match="unknown term"):
+    mdp.osl_group_from_record({**record, "terms": {"phase": {"func": "x"}}})
+  bad = copy.deepcopy(record)
+  bad["terms"]["actpack"]["scale"] = [2.0]
+  with pytest.raises(ValueError, match="outside the schema"):
+    mdp.osl_group_from_record(bad)
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["default", "legacy"])
+def test_env_yaml_is_a_record(tmp_path: Path, legacy: bool) -> None:
+  """A run's params/env.yaml, read as data as the exporter reads it, is a record of
+  its group: it rebuilds the group exactly."""
+  osl_obs = mdp.OslObsCfg(**mdp.LEGACY_OSL_SENSORS) if legacy else None
+  cfg = osl_split_env_cfg("robot", "rigid", "mimic", "train", osl_obs=osl_obs)
+  dump_yaml(tmp_path / "env.yaml", asdict(cfg))
+  saved = read_config(tmp_path / "env.yaml")["observations"]["osl"]
+  rebuilt = mdp.osl_group_from_record(saved)
+  assert rebuilt == cfg.observations["osl"]
+  assert mdp.osl_obs_layout(saved) == mdp.osl_obs_layout(cfg.observations["osl"])
 
 
 ##

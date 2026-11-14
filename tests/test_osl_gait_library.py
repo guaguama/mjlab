@@ -85,6 +85,7 @@ from mjlab.tasks.osl_mimic.config.rl_cfg import MuscleMimicPpoCfg, OslMimicRunne
 from mjlab.tasks.osl_mimic.rl.runner import stage_accessors
 from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
 from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
+from mjlab.tasks.osl_split.mdp import LEGACY_OSL_SENSORS, OslObsCfg
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.viewer.native.visualizer import MujocoNativeDebugVisualizer
 
@@ -1003,6 +1004,9 @@ def test_the_final_checkpoint_is_validated_once(
     assert (tmp_path / f"model_{iterations - 1}.pt").is_file()
 
 
+LEGACY_FAKE_OSL = OslObsCfg(**LEGACY_OSL_SENSORS, history_length=2)
+
+
 def test_validation_is_seeded_and_leaves_training_rng() -> None:
   """Every validation pass, and the validation env's build, draws from
   ``validation.seed``: the same weights score the same in every mode, and
@@ -1010,7 +1014,9 @@ def test_validation_is_seeded_and_leaves_training_rng() -> None:
 
   class Runner(GaitLibraryOnPolicyRunner):
     def _make_validation_env(self) -> Any:
-      return _GlobalRngEnv(num_envs=4, seed=1)
+      # Stage 1 reads no OSL group; the fake draws one, and its width sets which
+      # episodes end, so it keeps the two-cell set's.
+      return _GlobalRngEnv(num_envs=4, seed=1, osl_obs=LEGACY_FAKE_OSL)
 
   runner = Runner(cast(Any, _FakeEnv()), _stage1_cfg(), None, "cpu")
   assert runner.validation_cfg["inference"] == ("mean", "expected")

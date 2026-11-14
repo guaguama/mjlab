@@ -75,9 +75,11 @@ from mjlab.tasks.osl_split.config.rl_cfg import (
 from mjlab.tasks.osl_split.config.sensors import (
   ACC_RANGE,
   ANKLE_FORCE,
+  ANKLE_LOAD_TORQUE,
   ANKLE_POS,
   ANKLE_VEL,
   GYRO_RANGE,
+  HEEL_CONTACT,
   IMU_ACC,
   IMU_GYRO,
   KNEE_POS,
@@ -85,16 +87,22 @@ from mjlab.tasks.osl_split.config.sensors import (
   KNEE_VEL,
   OSL_SENSORS,
   SOCKET_FORCE,
-  SOCKET_TORQUE,
+  TOE_CONTACT,
 )
 from mjlab.tasks.osl_split.mdp import (
+  LEGACY_OSL_SENSORS,
   OSL_OBS_TERMS,
+  OSL_OBSERVATION_FORMAT,
   OslObsCfg,
   SplitRewardCfg,
+  load_cell_sensor_names,
   osl_actpack_dim,
+  osl_group_record,
   osl_loadcell_dim,
   osl_obs_dim,
+  osl_obs_layout,
   osl_observation_group,
+  osl_sensor_set,
   split_mimic_reward,
 )
 from mjlab.tasks.osl_split.mdp.rewards import stage1_channel_weights
@@ -121,6 +129,7 @@ from mjlab.tasks.osl_split.rl.warmstart import (
   load_warm_start,
 )
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
+from mjlab.utils.os import dump_yaml
 
 NUM_ENVS = 6
 NUM_STEPS = 4
@@ -128,11 +137,15 @@ ACTOR_DIM = 12
 HUMAN_DIM = 5
 HIDDEN = (16, 16)
 OSL_OBS = OslObsCfg(history_length=2)
+"""The default set (ankle cell and foot contacts), two frames."""
 OSL_DIM = osl_obs_dim(OSL_OBS)
+ORIGINAL_OSL_OBS = OslObsCfg(history_length=2, heel_contact=False)
+"""What a fake env on the ``original`` touch sites reads: no heel contact."""
 EPISODE_STEPS = 3
 TWIST_WEIGHT = 0.06
 TWIST_SPLIT = (1.0, 0.5)
-LOAD_TARE = torch.linspace(-3.0, 3.0, 12)
+LOAD_TARE = torch.linspace(-3.0, 3.0, 6)
+"""The default set's tare: the ankle cell's force and torque."""
 STAGE1_ITER = 40
 STAGE1_COUNTER = 3280
 STAGE1_ENV_STEPS = 123_456
@@ -192,21 +205,22 @@ def _action_manager() -> Any:
   return SimpleNamespace(active_terms=list(terms), get_term=terms.__getitem__)
 
 
-def _observation_manager() -> Any:
+def _observation_manager(osl_obs: OslObsCfg = OSL_OBS) -> Any:
   """The real ``osl`` group config (train mode), with a load-cell term instance
   reduced to its tare."""
-  cfgs = dict(osl_observation_group("train", OSL_OBS).terms)
-  cfgs["loadcell"] = replace(cfgs["loadcell"], func=SimpleNamespace(tare=LOAD_TARE))
-  frames = OSL_OBS.history_length
+  cfgs = dict(osl_observation_group("train", osl_obs).terms)
+  if "loadcell" in cfgs:
+    cells = len(load_cell_sensor_names(cfgs["loadcell"].params))
+    tare = torch.linspace(-3.0, 3.0, 3 * cells)
+    cfgs["loadcell"] = replace(cfgs["loadcell"], func=SimpleNamespace(tare=tare))
+  frames = osl_obs.history_length
   dims = [
-    (osl_actpack_dim(OSL_OBS) * frames,),
-    (osl_loadcell_dim(OSL_OBS) * frames,),
-    (2 * frames,),
+    (len(term_channels(name, cfg.params)) * frames,) for name, cfg in cfgs.items()
   ]
   return SimpleNamespace(
     active_terms={"osl": list(cfgs)},
     group_obs_term_dim={"osl": dims},
-    group_obs_dim={"actor": (ACTOR_DIM,), "osl": (OSL_DIM,)},
+    group_obs_dim={"actor": (ACTOR_DIM,), "osl": (osl_obs_dim(osl_obs),)},
     get_term_cfg=lambda group, name: cfgs[name],
   )
 
@@ -265,14 +279,20 @@ class _FakeEnv:
   and the export read. Episodes time out after ``EPISODE_STEPS`` steps or end at
   random; every step's channel and twist rewards are random, and the agents'
   expected rewards are recorded. Its config builds the foot ``touch_sites`` (a
-  freshly configured run's ``feet_extended`` by default)."""
+  freshly configured run's ``feet_extended`` by default) and the ``osl`` group of
+  ``osl_obs`` (the default set, or without the heel contact on the ``original``
+  touch sites, where it is refused)."""
 
   def __init__(
     self,
     num_envs: int = NUM_ENVS,
     seed: int = 0,
     touch_sites: TouchSites = "feet_extended",
+    osl_obs: OslObsCfg | None = None,
   ) -> None:
+    if osl_obs is None:
+      osl_obs = ORIGINAL_OSL_OBS if touch_sites == "original" else OSL_OBS
+    self.osl_dim = osl_obs_dim(osl_obs)
     self.num_envs = num_envs
     self.num_actions = HUMAN_DIM + 2
     self.device = "cpu"
@@ -282,11 +302,14 @@ class _FakeEnv:
     self.common_step_counter = 0
     self.episode_length_buf = torch.zeros(num_envs, dtype=torch.long)
     self.cfg: Any = SimpleNamespace(
-      scale_rewards_by_dt=False, commands={}, osl_touch_sites=touch_sites
+      scale_rewards_by_dt=False,
+      commands={},
+      osl_touch_sites=touch_sites,
+      observations={"osl": osl_observation_group("train", osl_obs)},
     )
     self.action_manager = _action_manager()
     self.reward_manager = _FakeRewardManager(num_envs)
-    self.observation_manager = _observation_manager()
+    self.observation_manager = _observation_manager(osl_obs)
     # A tight left arc and a right pivot (wz > 0 turns left).
     clips = SimpleNamespace(
       clip_groups=["fwd_tight", "turn"],
@@ -310,7 +333,7 @@ class _FakeEnv:
     return TensorDict(
       {
         "actor": torch.randn(n, ACTOR_DIM, generator=g),
-        "osl": 2.0 * torch.randn(n, OSL_DIM, generator=g) + 1.0,
+        "osl": 2.0 * torch.randn(n, self.osl_dim, generator=g) + 1.0,
       },
       batch_size=[n],
     )
@@ -369,7 +392,7 @@ class _GlobalRngEnv(_FakeEnv):
     return TensorDict(
       {
         "actor": torch.randn(n, ACTOR_DIM),
-        "osl": 2.0 * torch.randn(n, OSL_DIM) + 1.0,
+        "osl": 2.0 * torch.randn(n, self.osl_dim) + 1.0,
       },
       batch_size=[n],
     )
@@ -674,12 +697,18 @@ def test_osl_policy_metadata() -> None:
 
   obs = meta["obs"]
   frames = OSL_OBS.history_length
-  assert obs["group"] == "osl" and obs["dim"] == OSL_DIM == 24 * frames
+  assert obs["group"] == "osl" and obs["dim"] == OSL_DIM == 20 * frames
   assert obs["layout"] == "term-major, oldest to newest"
   terms = {t["name"]: t for t in obs["terms"]}
   assert list(terms) == list(OSL_OBS_TERMS)
-  assert [t["offset"] for t in obs["terms"]] == [0, 10 * frames, 22 * frames]
-  assert [t["frame_dim"] for t in obs["terms"]] == [10, 12, 2]
+  assert [t["offset"] for t in obs["terms"]] == [
+    0,
+    10 * frames,
+    16 * frames,
+    18 * frames,
+  ]
+  assert [t["frame_dim"] for t in obs["terms"]] == [10, 6, 2, 2]
+  assert obs["sensor_set"] == osl_sensor_set(env.cfg.observations["osl"])
   assert all(t["history_length"] == frames for t in obs["terms"])
   actpack = terms["actpack"]
   assert actpack["channels"][:4] == [KNEE_POS, ANKLE_POS, KNEE_VEL, ANKLE_VEL]
@@ -687,12 +716,33 @@ def test_osl_policy_metadata() -> None:
   assert actpack["units"] == ["rad"] * 2 + ["rad/s"] * 5 + ["m/s^2"] * 3
   loadcell = terms["loadcell"]
   assert loadcell["channels"][0] == f"{ANKLE_FORCE}_x"
-  assert loadcell["sensors"][-2:] == [SOCKET_FORCE, SOCKET_TORQUE]
+  assert loadcell["sensors"] == [ANKLE_FORCE, ANKLE_LOAD_TORQUE]
+  contact = terms["contact"]
+  assert contact["channels"] == contact["sensors"] == [HEEL_CONTACT, TOE_CONTACT]
+  assert contact["units"] == ["N", "N"] and contact["history_length"] == frames
   assert terms["last_action"]["sensors"] == []
 
-  sensors = {s["name"]: s for s in meta["sensors"]["sensors"]}
+  listed = meta["sensors"]["sensors"]
+  sensors = {s["name"]: s for s in listed}
   np.testing.assert_allclose(sensors[ANKLE_FORCE]["tare"], LOAD_TARE[:3])
-  np.testing.assert_allclose(sensors[SOCKET_TORQUE]["tare"], LOAD_TARE[9:])
+  np.testing.assert_allclose(sensors[ANKLE_LOAD_TORQUE]["tare"], LOAD_TARE[3:])
+  assert not sensors[SOCKET_FORCE]["observed"] and "tare" not in sensors[SOCKET_FORCE]
+  # The added sensors always, then the foot contacts, which are observed: the
+  # model's own touch sensors, raw (no tare, no saturation).
+  assert [s["name"] for s in listed] == [*OSL_SENSORS, HEEL_CONTACT, TOE_CONTACT]
+  assert sensors[HEEL_CONTACT] == {
+    "name": HEEL_CONTACT,
+    "scene_name": "robot/r_foot",
+    "type": "mjSENS_TOUCH",
+    "object_type": "mjOBJ_SITE",
+    "object": "OSL_KA_L1_r_foot_touch",
+    "dim": 1,
+    "unit": "N",
+    "saturation": None,
+    "observed": True,
+  }
+  assert sensors[TOE_CONTACT]["scene_name"] == "robot/r_toes"
+  assert sensors[TOE_CONTACT]["object"] == "OSL_KA_L1_r_toes_touch"
   assert sensors[IMU_GYRO]["observed"] and sensors[IMU_GYRO]["object"] == "osl_imu"
   assert sensors[IMU_GYRO]["scene_name"] == "robot/osl_imu_gyro"
   assert not sensors[KNEE_TORQUE]["observed"]  # Applied torque is off by default.
@@ -721,9 +771,11 @@ def test_osl_policy_metadata() -> None:
   }
 
   observation = meta["randomization"]["observation"]
-  for bus in ("actpack", "loadcell"):
+  for bus in ("actpack", "loadcell", "contact"):
     assert observation[bus]["delay_steps"] == list(OSL_OBS.delay_steps)
     assert observation[bus]["delay_held_per_episode"]
+  assert observation["contact"]["noise_std"] == [1.0, 1.0]
+  assert observation["contact"]["per_episode_bias"] == {"contact_bias": 2.0}
   assert observation["actpack"]["noise_std"][:4] == [0.002, 0.002, 0.05, 0.05]
   assert observation["actpack"]["per_episode_bias"]["imu_mount_deg"] == 3.0
   assert observation["loadcell"]["per_episode_bias"] == {
@@ -760,6 +812,19 @@ def test_osl_policy_metadata() -> None:
   with pytest.raises(ValueError, match="OSL actor reads"):
     osl_policy_metadata(cast(Any, env), cast(Any, alg), None)
 
+  # A run without contacts lists no touch sensor: an old run's re-export keeps its
+  # sensors section.
+  legacy = OslObsCfg(**LEGACY_OSL_SENSORS, history_length=2)
+  env = _FakeEnv(osl_obs=legacy)
+  actor.obs_dim = osl_obs_dim(legacy)
+  meta = osl_policy_metadata(cast(Any, env), cast(Any, alg), None)
+  assert [s["name"] for s in meta["sensors"]["sensors"]] == list(OSL_SENSORS)
+  assert set(meta["randomization"]["observation"]) == {
+    "actpack",
+    "loadcell",
+    "last_action",
+  }
+
 
 def test_term_channels_follow_the_options() -> None:
   extras = term_channels("actpack", {"projected_gravity": True, "applied_torque": True})
@@ -776,12 +841,17 @@ def test_term_channels_follow_the_options() -> None:
   ankle_only = term_channels("loadcell", {"socket": False})
   assert len(ankle_only) == osl_loadcell_dim(OslObsCfg(socket_load_cell=False))
   socket_only = term_channels("loadcell", {"ankle": False})
-  assert len(socket_only) == osl_loadcell_dim(OslObsCfg(ankle_load_cell=False)) == 6
+  assert len(socket_only) == osl_loadcell_dim(
+    OslObsCfg(ankle_load_cell=False, socket_load_cell=True)
+  )
+  assert len(socket_only) == 6
+  # A missing switch reads as the records before it meant: both cells.
   assert [c for c, _, _ in socket_only] == [
     c for c, _, _ in term_channels("loadcell", {})[6:]
   ]
-  with pytest.raises(ValueError, match="At least one load cell"):
-    OslObsCfg(ankle_load_cell=False, socket_load_cell=False)
+  assert [c for c, _, _ in term_channels("contact", {"heel": False})] == [TOE_CONTACT]
+  # Both cells off is a set without the loadcell term, not an error.
+  assert osl_loadcell_dim(OslObsCfg(ankle_load_cell=False)) == 0
   with pytest.raises(ValueError, match="Unknown OSL observation term"):
     term_channels("phase", {})
 
@@ -982,6 +1052,9 @@ def test_runner_trains_validates_saves_and_resumes(
     assert not (log_dir / f"model_{it}.pt").exists()
   meta = json.loads((log_dir / "exported" / f"osl_policy_{steps[2]}.json").read_text())
   assert meta["lineage"] == runner.lineage
+  # The default set's contact term exports (a failure there would only warn).
+  assert [t["name"] for t in meta["obs"]["terms"]] == list(OSL_OBS_TERMS)
+  assert meta["obs"]["sensor_set"]["heel_contact"]
 
   # A resumed run (train.py: construct without a warm start, then load) continues
   # after the checkpoint, with the stage's start, lineage and schedule.
@@ -1153,6 +1226,121 @@ def test_checkpoints_record_and_require_the_touch_sites(tmp_path: Path) -> None:
     resumed.save(str(tmp_path / "again.pt"))
     again = torch.load(tmp_path / "again.pt", weights_only=False)
     assert again["osl_touch_sites"] == trained
+
+
+SOCKET_OBS = OslObsCfg(history_length=2, ankle_load_cell=False, socket_load_cell=True)
+"""The socket cell and the contacts: the default set's width, other inputs."""
+
+
+def _osl_runner(osl_obs: OslObsCfg) -> _Runner:
+  """A runner without a warm start, on an env whose ``osl`` group is ``osl_obs``."""
+  env = _FakeEnv(osl_obs=osl_obs)
+  return _Runner(cast(Any, env), _quick_cfg(None), None, "cpu")
+
+
+def _osl_checkpoint(path: Path, osl_obs: OslObsCfg, ws: WarmStart) -> Path:
+  runner = _osl_runner(osl_obs)
+  runner.warm_start(ws)
+  runner.save(str(path))
+  return path
+
+
+def test_checkpoints_record_and_require_the_osl_sensor_set(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """Every checkpoint records the training ``osl`` group under the top-level
+  ``osl_observation``. A resume, or play's load, into an env that builds another
+  input layout is refused, naming the flags that build the checkpoint's, even at
+  the same width (the socket cell instead of the ankle cell); lags or noise that
+  alone differ only warn."""
+  ws = _write_warm_start(tmp_path / "ws.pt")
+  path = _osl_checkpoint(tmp_path / "model_socket.pt", SOCKET_OBS, ws)
+  entry = torch.load(path, weights_only=False)["osl_observation"]
+  group = osl_observation_group("train", SOCKET_OBS)
+  assert entry == {
+    "format": OSL_OBSERVATION_FORMAT,
+    "group": osl_group_record(group),
+    "sensor_set": osl_sensor_set(group),
+    "dim": osl_obs_dim(SOCKET_OBS),
+  }
+  assert entry["dim"] == OSL_DIM and not entry["sensor_set"]["ankle_load_cell"]
+
+  flags = (
+    "--env.observations.osl.terms.loadcell.params.ankle False "
+    "--env.observations.osl.terms.loadcell.params.socket True"
+  )
+  for load_cfg in (None, {"actor": True}):  # A resume, then play's load.
+    with pytest.raises(ValueError, match=re.escape(flags)) as error:
+      _osl_runner(OSL_OBS).load(str(path), load_cfg=load_cfg)
+    assert "--env.observations.osl.history-length 2" in str(error.value)
+  resumed = _osl_runner(SOCKET_OBS)
+  resumed.load(str(path))
+  assert resumed.stage_start == STAGE_START
+
+  capsys.readouterr()
+  lagged = replace(SOCKET_OBS, delay_steps=(0, 3), contact_noise=0.5)
+  _osl_runner(lagged).load(str(path))
+  warning = capsys.readouterr().out
+  assert "[WARN]" in warning and "contact.delay_max_lag 2 -> 3" in warning
+  assert "contact.params.contact_noise 1.0 -> 0.5" in warning
+
+
+def test_play_builds_the_checkpoint_osl_sensor_set(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """play.py makes the task's config build the checkpoint's own ``osl`` group,
+  clean at training's lags: from the checkpoint's record, else from its run's
+  params/env.yaml, else the legacy set (both cells, no contacts) with a warning.
+  A checkpoint whose record contradicts its run's env.yaml is refused."""
+  ws = _write_warm_start(tmp_path / "ws.pt")
+  run = tmp_path / "run"
+  run.mkdir()
+  path = _osl_checkpoint(run / "model_7.pt", SOCKET_OBS, ws)
+
+  def played(checkpoint: Path) -> Any:
+    cfg = osl_split_env_cfg("msk", "compliant", "clf", "play")
+    SplitOnPolicyRunner.configure_env_for_checkpoint(cfg, checkpoint)
+    return cfg.observations["osl"]
+
+  def clean(group: Any) -> None:
+    assert not group.enable_corruption
+    for name, term in group.terms.items():
+      assert not term.params.get("randomize", False)
+      lags = (0, 0) if name == "last_action" else (0, 2)
+      assert (term.delay_min_lag, term.delay_max_lag) == lags
+
+  capsys.readouterr()
+  group = played(path)
+  assert osl_obs_layout(group) == osl_obs_layout(
+    osl_observation_group("train", SOCKET_OBS)
+  )
+  clean(group)
+  assert (
+    "[INFO] OSL sensors: encoders, IMU, socket load cell" in capsys.readouterr().out
+  )
+
+  # Without the key: the run's env.yaml (here the legacy set's), then nothing.
+  legacy_cfg = osl_split_env_cfg(
+    "msk", "compliant", "clf", "train", osl_obs=OslObsCfg(**LEGACY_OSL_SENSORS)
+  )
+  dump_yaml(run / "params" / "env.yaml", asdict(legacy_cfg))
+  with pytest.raises(ValueError, match="moved into another run"):
+    played(path)
+  payload = torch.load(path, weights_only=False)
+  del payload["osl_observation"]
+  keyless = run / "model_8.pt"
+  torch.save(payload, keyless)
+  group = played(keyless)
+  assert list(group.terms) == ["actpack", "loadcell", "last_action"]
+  assert osl_obs_layout(group) == osl_obs_layout(legacy_cfg.observations["osl"])
+  clean(group)
+  assert "the checkpoint predates the key" in capsys.readouterr().out
+  alone = tmp_path / "model_9.pt"
+  torch.save(payload, alone)
+  group = played(alone)
+  assert osl_sensor_set(group) == osl_sensor_set(legacy_cfg.observations["osl"])
+  out = capsys.readouterr().out
+  assert "[WARN]" in out and "recorded nowhere" in out
 
 
 def test_warm_start_needs_the_stage1_touch_sites(
@@ -1369,7 +1557,9 @@ def test_validation_env_follows_the_training_env(
   # Every command-line setting of the run reaches validation: the OSL foot's touch
   # sites (built by the robot entity), the simulation, every shared reward term's
   # weight and params, and the OSL lag (the middle of the training range).
-  train = osl_split_env_cfg("msk", "compliant", "clf", "train")
+  train = osl_split_env_cfg(
+    "msk", "compliant", "clf", "train", osl_obs=OslObsCfg(heel_contact=False)
+  )
   set_touch_sites(train, "original")  # --env.osl-touch-sites original
   train.sim.mujoco.iterations = 7
   train.rewards["twist"].weight = 0.35
@@ -1377,6 +1567,9 @@ def test_validation_env_follows_the_training_env(
   for name in ("actpack", "loadcell"):
     train.observations["osl"].terms[name].delay_max_lag = 4
   cfg = validation_cfg(train)
+  # Each bus at the middle of its own range: contact's is still 0-2.
+  contact = cfg.observations["osl"].terms["contact"]
+  assert (contact.delay_min_lag, contact.delay_max_lag) == (1, 1)
   assert cfg.osl_touch_sites == "original"
   robot = cfg.scene.entities["robot"]
   assert isinstance(robot, OslEntityCfg) and robot.touch_sites == "original"
@@ -1516,7 +1709,8 @@ def test_validation_is_seeded_and_leaves_training_rng(tmp_path: Path) -> None:
   state = torch.get_rng_state()
   first = runner.validate(STAGE_START + 1)
   assert torch.equal(torch.get_rng_state(), state)
-  assert first["Validation/early_termination_rate"] > 0.0  # The env drew dones.
+  # The env drew dones (in some family: which depends on the draws).
+  assert max(v for k, v in first.items() if k.endswith("early_termination_rate")) > 0
   assert runner.validate(STAGE_START + 1) == first
   assert torch.equal(torch.get_rng_state(), state)
   env = cast(_GlobalRngEnv, runner._validation_env)

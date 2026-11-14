@@ -61,6 +61,7 @@ from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_mimic.rl.muon import MuonAdam
 from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
+from mjlab.tasks.osl_split.mdp import OslObsCfg, osl_observation_group
 from mjlab.tasks.osl_split.mdp.rewards import CHANNELS, GROUPS, stage1_channel_weights
 from mjlab.tasks.osl_split.rl.policy import std_parameter
 from mjlab.tasks.osl_split.rl.ppo import RETURN_COUNT_FRESH
@@ -220,7 +221,9 @@ class _FakeEnv:
   ``EPISODE_STEPS`` steps or end at random. Every step's team reward, the agents'
   rewards it implies (each channel plus the twist times its split) and the dones
   are recorded, to replay the logged episode means from. Its config builds the
-  OSL foot's ``touch_sites``, by default a freshly configured run's.
+  OSL foot's ``touch_sites``, by default a freshly configured run's, and holds the
+  default ``osl`` group, without the heel contact on the ``original`` touch sites
+  (where it is refused); checkpoints record the group.
   """
 
   def __init__(
@@ -233,7 +236,12 @@ class _FakeEnv:
     self.max_episode_length = 1000
     self.common_step_counter = 0
     self.episode_length_buf = torch.zeros(NUM_ENVS, dtype=torch.long)
-    self.cfg = SimpleNamespace(scale_rewards_by_dt=False, osl_touch_sites=touch_sites)
+    osl_obs = OslObsCfg(heel_contact=touch_sites != "original")
+    self.cfg = SimpleNamespace(
+      scale_rewards_by_dt=False,
+      osl_touch_sites=touch_sites,
+      observations={"osl": osl_observation_group("train", osl_obs)},
+    )
     self.action_manager = SimpleNamespace(
       active_terms=list(terms), get_term=terms.__getitem__
     )

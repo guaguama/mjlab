@@ -505,18 +505,23 @@ def test_env_cfg_contract(
   assert osl["osl"] == (0, 0) and osl["human"] == human["human"]
   assert human["human"] == ((15, 15) if mode == "validation" else (10, 20))
 
-  # The osl group: clean and immediate in every mode, 25 frames, 600 dims.
+  # The osl group: clean and immediate in every mode, 25 frames, 600 dims: the
+  # legacy set (both load cells, no foot contacts), whatever stage 2's default.
   group = cfg.observations["osl"]
   assert group == clean_osl_group()
-  validation = split_mdp.OslObsCfg(delay_steps=(0, 0), validation_delay_steps=0)
+  validation = split_mdp.OslObsCfg(
+    **split_mdp.LEGACY_OSL_SENSORS, delay_steps=(0, 0), validation_delay_steps=0
+  )
   assert group == split_mdp.osl_observation_group("validation", validation)
-  assert tuple(group.terms) == split_mdp.OSL_OBS_TERMS and not group.enable_corruption
+  assert tuple(group.terms) == ("actpack", "loadcell", "last_action")
+  assert not group.enable_corruption
   for name, obs_term in group.terms.items():
     assert (obs_term.delay_min_lag, obs_term.delay_max_lag) == (0, 0), name
     assert obs_term.noise is None and not obs_term.params.get("randomize", False)
     assert obs_term.history_length == 25
   assert group.terms["loadcell"].params["ankle"]
-  assert split_mdp.osl_obs_dim(split_mdp.OslObsCfg()) == 600
+  assert group.terms["loadcell"].params["socket"]
+  assert split_mdp.osl_layout_dim(split_mdp.osl_obs_layout(group)) == 600
 
   # One mean metric per diagnostic; everything else is stage 2's.
   extra = {name for name in cfg.metrics if name not in base.metrics}
@@ -634,6 +639,20 @@ def test_post_init_syncs_and_refuses() -> None:
   cfg.observations["osl"].terms["loadcell"].params["ankle"] = False
   with pytest.raises(ValueError, match="ankle load cell"):
     sync_osl_fsm(cfg)
+  # A dropped loadcell term (both cells off) is refused too, as is constructing
+  # the config with it: the drop rule runs first, then the controller's check.
+  cfg = osl_fsm_env_cfg()
+  del cfg.observations["osl"].terms["loadcell"]
+  with pytest.raises(ValueError, match="ankle load cell"):
+    sync_osl_fsm(cfg)
+  cfg = osl_fsm_env_cfg()
+  cfg.observations["osl"].terms["loadcell"].params.update(ankle=False, socket=False)
+  with pytest.raises(ValueError, match="ankle load cell"):
+    replace(cfg)
+  # The pinned set has no heel contact, so the original touch sites build (S15-2).
+  assert replace(osl_fsm_env_cfg(), osl_touch_sites="original").osl_touch_sites == (
+    "original"
+  )
   cfg = osl_fsm_env_cfg()
   cfg.actions["osl_motors"] = osl_split_env_cfg().actions["osl_motors"]
   with pytest.raises(TypeError, match="OslFsmActionCfg"):

@@ -17,9 +17,25 @@ train, e.g.::
 converted in memory. Stage 2 continues stage 1's iteration numbers in its own run
 directory (``osl_fullbody_split_unicycle[_msk][_clf][_compliant]``), with its
 iteration counts (``--agent.max-iterations``, ``--agent.freeze.*``) local to stage 2.
-Resume a stage-2 run with ``--agent.resume`` as usual. Play a stage-2 checkpoint,
-both actors at their mean action, with the library in ``MJLAB_OSL_UNICYCLE_LIBRARY``
-(play takes no env overrides)::
+
+The OSL actor reads the real leg's sensors by default: encoders, shank IMU, the
+ankle load cell and the foot's heel and toe contact forces (500 inputs; the heel
+contact needs the extended touch sites, the default). Other sets are flags on the
+OSL group's term params, a sensor term with every sensor off being left out::
+
+  # Both load cells, no contacts (the runs before 2026-11-14, 600 inputs):
+  --env.observations.osl.terms.loadcell.params.socket True \\
+  --env.observations.osl.terms.contact.params.heel False \\
+  --env.observations.osl.terms.contact.params.toe False
+  # Contacts off (450): the last two flags. Both cells and contacts (650): the
+  # first. Another history for every term: --env.observations.osl.history-length N
+
+Resume a stage-2 run with ``--agent.resume`` as usual; it is refused, with the flags
+that build it, unless the env builds the checkpoint's OSL sensor set and history.
+Play a stage-2 checkpoint, both actors at their mean action, with the library in
+``MJLAB_OSL_UNICYCLE_LIBRARY`` (play takes no env overrides: it builds the
+checkpoint's own touch sites and OSL sensor set, from the checkpoint's record, else
+its run's ``params/env.yaml``, else the legacy set, and says which)::
 
   uv run play Mjlab-Split-Unicycle-OSL-Fullbody-MSK-CLF-Compliant \\
     --checkpoint-file <stage-2 run>/model_<N>.pt

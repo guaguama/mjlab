@@ -12,10 +12,12 @@ human channel the human trains on, and the leg-contact sensor. The changes:
 * the OSL motors' actuator delay is zero (``OslDrCfg(osl_delay_s=(0, 0))`` unless
   ``dr_cfg`` says otherwise): osl_deploy runs the controller at zero delay, and its
   stock gains go unstable with a single 10 ms step of it (the late-stance ankle);
-* the ``osl`` group is clean and immediate in every mode (:func:`clean_osl_group`).
-  No network reads it, but it is the observation contract osl_deploy's controller
-  reads from a bundle, which the exporter writes, and its newest frame is exactly
-  the controller's reading;
+* the ``osl`` group is clean and immediate in every mode (:func:`clean_osl_group`),
+  over the legacy sensor set (both load cells, no foot contacts), whatever stage
+  2's default set: no network reads it, but it is the observation contract
+  osl_deploy's controller reads from a bundle, which the exporter writes, and its
+  newest frame is exactly the controller's reading. Stage-1.5 bundles, and runs
+  under the ``original`` touch sites (whose heel zone never fires), keep it;
 * one metric per controller diagnostic (:data:`~..mdp.FSM_DIAGNOSTICS`).
 
 The controller's settings are the config's ``osl_fsm`` (``--env.osl-fsm.rules``,
@@ -47,13 +49,12 @@ from mjlab.tasks.osl_fsm.mdp import (
 )
 from mjlab.tasks.osl_gait_library.config.dr import OslDrCfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward
-from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
-from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
-from mjlab.tasks.osl_split.config.sensors import ANKLE_FORCE
+from mjlab.tasks.osl_split.config.env_cfgs import OslSplitEnvCfg, osl_split_env_cfg
 from mjlab.tasks.osl_split.mdp import (
+  LEGACY_OSL_SENSORS,
   OslObsCfg,
-  load_cell_sensor_names,
   osl_observation_group,
+  osl_switch,
   osl_validation_group,
 )
 from mjlab.tasks.osl_split.rl.layout import OSL_ACTION_TERM
@@ -92,10 +93,10 @@ class OslFsmCfg:
 
 
 @dataclass(kw_only=True)
-class OslFsmEnvCfg(OslEnvCfg):
+class OslFsmEnvCfg(OslSplitEnvCfg):
   """A stage-1.5 env config: its ``osl_motors`` term runs the controller that
   ``osl_fsm`` configures (and its robot builds the touch sites ``osl_touch_sites``
-  names, as every OSL task's)."""
+  names and its ``osl`` group follows stage 2's rules, as a stage-2 config's)."""
 
   osl_fsm: OslFsmCfg = field(default_factory=OslFsmCfg)
 
@@ -136,8 +137,9 @@ def sync_osl_fsm(cfg: OslFsmEnvCfg) -> None:
 
   Raises:
     ValueError: For settings :func:`check_osl_fsm` refuses, or an ``osl`` group
-      without the ankle load cell, which the controller reads (osl_deploy's refuses
-      a bundle whose observation lacks its axial force).
+      without a ``loadcell`` term carrying the ankle load cell, which the
+      controller reads (osl_deploy's refuses a bundle whose observation lacks its
+      axial force).
     TypeError: If ``osl_motors`` is not an :class:`~..mdp.OslFsmActionCfg`.
   """
   fsm = cfg.osl_fsm
@@ -150,12 +152,10 @@ def sync_osl_fsm(cfg: OslFsmEnvCfg) -> None:
     )
   group = cfg.observations.get(OSL_OBS_GROUP)
   loadcell = None if group is None else group.terms.get("loadcell")
-  if loadcell is not None and ANKLE_FORCE not in load_cell_sensor_names(
-    loadcell.params
-  ):
+  if loadcell is None or not osl_switch(loadcell.params, "ankle"):
     raise ValueError(
-      "The osl group's loadcell term leaves out the ankle load cell, whose axial "
-      "force the OSL controller reads: keep "
+      "The osl group leaves out the ankle load cell, whose axial force the OSL "
+      "controller reads: keep "
       "--env.observations.osl.terms.loadcell.params.ankle True."
     )
   synced = replace(
@@ -169,12 +169,17 @@ def sync_osl_fsm(cfg: OslFsmEnvCfg) -> None:
 
 
 def clean_osl_group() -> ObservationGroupCfg:
-  """The ``osl`` group read exactly and immediately: stage 2's group, 25 frames of
-  every term, with no perception randomization and both buses at zero lag. Its
-  newest frame is the reading the controller takes in the next ``process_actions``
-  (the load cell tared alike), which osl_deploy's controller takes from the same
-  channels."""
-  cfg = OslObsCfg(delay_steps=(0, 0), validation_delay_steps=0)
+  """The ``osl`` group read exactly and immediately: stage 2's group over the legacy
+  sensor set (:data:`~mjlab.tasks.osl_split.mdp.LEGACY_OSL_SENSORS`: both load
+  cells, no foot contacts; 600 inputs), 25 frames of every term, with no perception
+  randomization and both buses at zero lag. Its newest frame is the reading the
+  controller takes in the next ``process_actions`` (the load cell tared alike),
+  which osl_deploy's controller takes from the same channels.
+
+  It stays the legacy set whatever stage 2's default: stage-1.5 bundles keep their
+  contract, and runs under the ``original`` touch sites (S15-2), where the heel
+  contact is refused, keep resuming."""
+  cfg = OslObsCfg(**LEGACY_OSL_SENSORS, delay_steps=(0, 0), validation_delay_steps=0)
   return osl_validation_group(osl_observation_group("train", cfg), 0)
 
 

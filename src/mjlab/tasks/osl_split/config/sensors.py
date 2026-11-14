@@ -20,6 +20,10 @@ human's, and the OSL foot's misses the heel), and the XMLs are never hand-edited
   on both.
 
 Every sensor is always added; the observation config picks which reach the actor.
+The OSL foot's two contact sensors are not added: they are the model XML's own
+touch sensors ``r_foot`` (the heel zone) and ``r_toes`` (:data:`OSL_CONTACT_SPECS`),
+whose zones the run's ``osl_touch_sites`` builds, and the OSL actor reads them under
+its own names, ``osl_heel_contact`` and ``osl_toe_contact``.
 The knee assembly, tibial pylon and ankle assembly are one rigid shank, so the IMU
 and the ankle cell share their axes. All frames are the OSL bodies' OpenSim axes: x
 anterior, y along the limb (up), z to the right. A force or torque sensor reports
@@ -47,7 +51,12 @@ from dataclasses import dataclass
 import mujoco
 import numpy as np
 
-from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import OSL_TORQUE_JOINTS
+from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  OSL_TORQUE_JOINTS,
+  R_FOOT_TOUCH_SITE,
+  R_TOES_TOUCH_SITE,
+  TOUCH_SITE_SENSORS,
+)
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 
 OSL_IMU_SITE = "osl_imu"
@@ -92,6 +101,10 @@ ANKLE_POS = "osl_ankle_pos"
 ANKLE_VEL = "osl_ankle_vel"
 KNEE_TORQUE = "osl_knee_torque"
 ANKLE_TORQUE = "osl_ankle_torque"
+HEEL_CONTACT = "osl_heel_contact"
+"""The OSL foot's heel contact force: the model's ``r_foot`` touch sensor."""
+TOE_CONTACT = "osl_toe_contact"
+"""The OSL foot's toe contact force: the model's ``r_toes`` touch sensor."""
 
 LOAD_CELL_SENSORS: tuple[str, ...] = (
   ANKLE_FORCE,
@@ -113,6 +126,14 @@ class OslSensorSpec:
   """The site or joint, by its entity-level name."""
   dim: int
   unit: str
+  source: str | None = None
+  """The model's own sensor this one reads, by its entity-level name, for a sensor
+  :func:`add_osl_sensors` does not add (None: the sensor is ``name`` itself)."""
+
+  @property
+  def sensor(self) -> str:
+    """The MuJoCo sensor's entity-level name (``robot/<sensor>`` in the scene)."""
+    return self.source or self.name
 
 
 _S = mujoco.mjtSensor
@@ -137,6 +158,32 @@ OSL_SENSOR_SPECS: tuple[OslSensorSpec, ...] = (
 """Every added sensor, in a fixed order. None has a MuJoCo ``cutoff``: the hardware
 ranges are the observation's (``mdp.observations.osl_actpack``)."""
 OSL_SENSORS: tuple[str, ...] = tuple(s.name for s in OSL_SENSOR_SPECS)
+OSL_CONTACT_SPECS: tuple[OslSensorSpec, ...] = (
+  OslSensorSpec(
+    HEEL_CONTACT,
+    _S.mjSENS_TOUCH,
+    _SITE,
+    R_FOOT_TOUCH_SITE,
+    1,
+    "N",
+    source=TOUCH_SITE_SENSORS[R_FOOT_TOUCH_SITE],
+  ),
+  OslSensorSpec(
+    TOE_CONTACT,
+    _S.mjSENS_TOUCH,
+    _SITE,
+    R_TOES_TOUCH_SITE,
+    1,
+    "N",
+    source=TOUCH_SITE_SENSORS[R_TOES_TOUCH_SITE],
+  ),
+)
+"""The OSL foot's contact sensors, heel then toe: the model XML's own touch sensors
+(a touch sensor sums the normal force of the contacts on its site's body whose
+normal ray crosses the site's box; >= 0, in N), read raw. They are never added;
+:func:`add_osl_sensors` checks that the spec has them. The ``r_foot`` zone is the
+run's ``osl_touch_sites`` version: under ``original`` it misses the heel and never
+fires."""
 
 TARE_LIFT = 1.0
 """How far :func:`static_load_cell_tare` raises the free joint (m)."""
@@ -165,9 +212,13 @@ def add_osl_sensors(spec: mujoco.MjSpec) -> mujoco.MjSpec:
     raise ValueError(f"The OSL sensors need {missing}, which the spec lacks.")
   if OSL_IMU_SITE in sites:
     raise ValueError(f"The spec already has a site {OSL_IMU_SITE!r}.")
-  taken = sorted({sensor.name for sensor in spec.sensors} & set(OSL_SENSORS))
+  names = {sensor.name for sensor in spec.sensors}
+  taken = sorted(names & set(OSL_SENSORS))
   if taken:
     raise ValueError(f"The spec already has the sensors {taken}.")
+  absent = [s.sensor for s in OSL_CONTACT_SPECS if s.sensor not in names]
+  if absent:
+    raise ValueError(f"The OSL foot's contact sensors {absent} are not in the spec.")
 
   body.add_site(name=OSL_IMU_SITE, pos=OSL_IMU_POS)
   for sensor in OSL_SENSOR_SPECS:
