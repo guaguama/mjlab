@@ -146,7 +146,7 @@ Reward = Literal["mimic", "clf"]
 Curves = Literal["offset", "none"]
 MODEL_TAGS: dict[Model, str] = {"robot": "-ROBOT", "msk": "-MSK"}
 """Mirror of ``osl_constants.MODEL_TAGS``."""
-TouchSites = Literal["original", "heel_extended"]
+TouchSites = Literal["original", "heel_extended", "feet_extended"]
 """Mirror of ``osl_constants.TouchSites``."""
 LEGACY_TOUCH_SITES: TouchSites = "original"
 """Mirror of ``osl_constants.LEGACY_TOUCH_SITES``: what a lineage that records no

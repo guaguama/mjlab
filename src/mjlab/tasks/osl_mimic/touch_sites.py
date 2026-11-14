@@ -1,11 +1,13 @@
-"""The OSL foot's touch-site version, chosen per run and recorded where tools find it.
+"""The foot touch-site version, chosen per run and recorded where tools find it.
 
-``osl_touch_sites`` is ``"heel_extended"`` (the default for every newly configured
-run) or ``"original"`` (the model XML's zones, which every run before 2026-11-13
-trained with); :data:`~mjlab.asset_zoo.robots.osl_fullbody.osl_constants.
-R_FOOT_TOUCH_BOXES` has the two boxes. Only the human actor (stage 1's unified
-policy, stage 2's human) and the critics observe touch, but the version is a property
-of the model, so every OSL task carries it:
+``osl_touch_sites`` is ``"feet_extended"`` (the default for every newly configured
+run: the OSL heel zone plus the intact foot's zones lowered to below its colliders),
+``"heel_extended"`` (the OSL heel zone only, the default for part of 2026-11-13) or
+``"original"`` (the model XML's zones, which every run before 2026-11-13 trained
+with); :data:`~mjlab.asset_zoo.robots.osl_fullbody.osl_constants.TOUCH_SITE_BOXES`
+has the boxes. Only the human actor (stage 1's unified policy, stage 2's and stage
+1.5's human) and the critics observe touch, but the version is a property of the
+model, so every OSL task carries it:
 
 * **the env config**: :class:`OslEnvCfg`'s ``osl_touch_sites`` field
   (``--env.osl-touch-sites``), a plain entry of the run's ``params/env.yaml``. It is
@@ -16,13 +18,14 @@ of the model, so every OSL task carries it:
 * **every deployment bundle**: the manifest's ``touch_sites``
   (:func:`touch_sites_manifest`), read from the bundle's own ``model.mjb``.
 
-Anything that records no version means ``"original"``. A policy never meets the
-other zone: resuming refuses a mismatch (:func:`check_checkpoint_touch_sites`),
-stage 2 refuses a warm start trained on the other zone, and play, evaluation and
-export build the version the checkpoint was trained with (:func:`run_touch_sites`).
-The stage-1 normalizer keeps ``r_foot`` at a mean of about 0.0015 N and a std of
-about 1.4 N, so a heel load of 200-700 N would reach an old policy at hundreds of
-normalized units.
+Anything that records no version means ``"original"``. A policy never meets other
+zones: resuming refuses a mismatch (:func:`check_checkpoint_touch_sites`), stage 2
+refuses a warm start trained on other zones, and play, evaluation and export build
+the version the checkpoint was trained with (:func:`run_touch_sites`). The stage-1
+normalizer keeps ``r_foot`` at a mean of about 0.0015 N and a std of about 1.4 N, so
+a heel load of 200-700 N would reach an ``original`` policy at hundreds of
+normalized units; the lowered left zones read loads in quiet stance that the older
+ones missed.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   DEFAULT_TOUCH_SITES,
   LEGACY_TOUCH_SITES,
   R_FOOT_TOUCH_SITE,
+  TOUCH_SITE_EDITS,
   TOUCH_SITE_SENSORS,
   OslEntityCfg,
   TouchSites,
@@ -69,11 +73,13 @@ class OslEnvCfg(ManagerBasedRlEnvCfg):
   foot's touch zones that ``osl_touch_sites`` names."""
 
   osl_touch_sites: TouchSites = DEFAULT_TOUCH_SITES
-  """The OSL foot's touch-sensor zones. ``heel_extended`` (the default) extends the
-  ``r_foot`` zone back over the heel, where the OSL foot touches down;
-  ``original`` is the model XML's zone, which never fires, and what every run
-  before 2026-11-13 trained with. Resuming, warm-starting or playing a checkpoint
-  needs the zones it was trained with."""
+  """The foot touch-sensor zones. ``feet_extended`` (the default) extends the OSL
+  foot's ``r_foot`` zone back over the heel, where it touches down, and lowers the
+  intact foot's ``l_foot`` and ``l_toes`` zones 8 mm, so that they catch a foot
+  resting in the contact margin; ``heel_extended`` has only the ``r_foot`` change;
+  ``original`` is the model XML's zones, whose ``r_foot`` never fires, and what
+  every run before 2026-11-13 trained with. Resuming, warm-starting or playing a
+  checkpoint needs the zones it was trained with."""
 
   def __post_init__(self) -> None:
     # tyro builds the config after applying the command line, so this sees the
@@ -118,7 +124,7 @@ def set_touch_sites(cfg: ManagerBasedRlEnvCfg, touch_sites: TouchSites) -> None:
 
 def env_touch_sites(env: Any) -> TouchSites:
   """The touch-site version an env simulates: its config's ``osl_touch_sites``,
-  checked against its compiled model when that has the OSL ``r_foot`` site.
+  checked against its compiled model when that has the foot touch sites.
 
   Raises:
     TypeError: If the env's config has no ``osl_touch_sites`` (not an OSL task).
@@ -267,10 +273,11 @@ def check_checkpoint_touch_sites(
     raise ValueError(
       f"{path} was trained with OSL touch sites {trained!r}{why}, but this env "
       f"builds {current!r}. A checkpoint only meets the zones it trained with: "
-      "a policy that observes the foot touch sensors would read an r_foot input "
-      "it never saw (the original zone never fires; under the extended one a "
-      "heel load reaches the network at hundreds of normalized units). Relaunch "
-      f"with {CLI_FLAG} {trained}."
+      "a policy that observes the foot touch sensors would read inputs it never "
+      "saw (the original r_foot zone never fires, so under the extended one a heel "
+      "load reaches the network at hundreds of normalized units; the "
+      "feet_extended left zones read quiet-stance loads the others miss). "
+      f"Relaunch with {CLI_FLAG} {trained}."
     )
   return trained
 
@@ -338,26 +345,37 @@ def touch_sites_manifest(model: mujoco.MjModel, prefix: str = f"{ROBOT}/") -> di
     }
   return {
     "version": version,
-    "edited_from_xml": []
-    if version == LEGACY_TOUCH_SITES
-    else [prefix + R_FOOT_TOUCH_SITE],
+    "edited_from_xml": [prefix + site for site in TOUCH_SITE_EDITS[version]],
     "frame": TOUCH_SITES_FRAME,
     "sites": sites,
   }
 
 
+_README_WHAT: dict[TouchSites, str] = {
+  "original": "the model XML's: the OSL heel lands behind the `r_foot` zone, which "
+  "reads 0",
+  "heel_extended": "the OSL foot's `r_foot` zone extended back over the heel",
+  "feet_extended": "the OSL foot's `r_foot` zone extended back over the heel, and "
+  "the intact foot's `l_foot` and `l_toes` zones extended 8 mm down, below its "
+  "colliders",
+}
+
+
 def touch_sites_readme_line(touch_sites: Mapping[str, Any]) -> str:
   """The README's line on a manifest's ``touch_sites``."""
-  r_foot = next(
-    site for site in touch_sites["sites"].values() if site["sensor"].endswith("r_foot")
-  )
+
+  def site(sensor: str) -> Mapping[str, Any]:
+    return next(
+      s for s in touch_sites["sites"].values() if s["sensor"].endswith(f"/{sensor}")
+    )
+
+  r_foot, l_foot = site("r_foot"), site("l_foot")
   back = r_foot["pos"][0] - r_foot["size"][0]
   front = r_foot["pos"][0] + r_foot["size"][0]
-  if touch_sites["version"] == LEGACY_TOUCH_SITES:
-    what = "the model XML's: the OSL heel lands behind the `r_foot` zone, which reads 0"
-  else:
-    what = "the OSL foot's `r_foot` zone extended back over the heel"
+  sole = l_foot["pos"][1] - l_foot["size"][1]
+  version = check_touch_sites(touch_sites["version"], "touch_sites.version")
   return (
-    f"- Touch zones: **{touch_sites['version']}**, {what} (foot x {back:.3f} to "
-    f"{front:.3f} m; manifest `touch_sites`)"
+    f"- Touch zones: **{version}**, {_README_WHAT[version]} (OSL foot x {back:.3f} "
+    f"to {front:.3f} m, intact foot zones down to y {sole:.3f} m; manifest "
+    "`touch_sites`)"
   )

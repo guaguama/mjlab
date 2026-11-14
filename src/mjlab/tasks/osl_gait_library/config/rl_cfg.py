@@ -14,7 +14,7 @@ from mjlab.tasks.osl_mimic.config.rl_cfg import (
   osl_mimic_runner_cfg,
 )
 
-from .env_cfgs import EPISODE_LENGTH_S, Variant
+from .env_cfgs import VALIDATION_EPISODE_LENGTH_S, Variant
 
 # ===== The unicycle MSK recipe (tuned on -MSK-CLF-Compliant, 2026-11) =============
 # musclemimic's muscle std of 3.0 with no bound let the 2026-11-06 run settle at a
@@ -81,7 +81,8 @@ def osl_gait_library_runner_cfg(
   cfg.validation = GaitLibraryValidationCfg(
     interval=base.validation.interval,
     num_envs=0,  # One env per library clip.
-    num_steps=round(EPISODE_LENGTH_S * 100),
+    # One validation episode (20 s at 100 Hz); stages 1.5 and 2 inherit it.
+    num_steps=round(VALIDATION_EPISODE_LENGTH_S * 100),
     model=model,
     socket=socket,
     reward=reward,

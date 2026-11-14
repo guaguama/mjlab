@@ -14,8 +14,10 @@ checkpoint was trained with (``touch_sites.run_touch_sites``), the checkpoint is
 loaded into the task's runner, and the runner's passes run once per inference mode:
 
 * validation (``Validation*/``): every library clip in its own env from phase 0 at
-  its own twist, on the nominal plant with mid-range actuator delays, for one
-  episode, ending early only on the 0.5 m site check;
+  its own twist, on the nominal plant with mid-range actuator delays, for one 20 s
+  episode (the task's validation config, as in training since 2026-11-13), ending
+  early only on the 0.5 m site check, seeded by ``--validation-seed``, with the
+  per-family metrics (the ``slow`` group included);
 * stress validation (``Stress*/``): each env's first episode of the training
   distribution (random clips and switches, physical draws, pushes, random delays),
   with the same failure check.
@@ -52,7 +54,12 @@ class EvaluateConfig:
   """Deterministic actions to evaluate: ``mean``, ``expected`` and/or ``sampled``."""
   validation: bool = True
   """Run the per-clip validation."""
-  validation_steps: int = 1000
+  validation_steps: int | None = None
+  """Steps per validation; default the task's own (2000: one 20 s episode). A pass
+  shorter than the episode ends before any clip times out, so its early-termination
+  rate counts only the early ends; the episode length is the task's, not this."""
+  validation_seed: int = 0
+  """Seeds the validation env's build and every pass (``validation.seed``)."""
   stress_envs: int = 512
   """Envs of the stress validation; 0 skips it."""
   stress_steps: int = 1000
@@ -158,9 +165,11 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
     std_cap_start=0.0, std_cap_end=0.0, std_floor=0.0, init_std_terms={}
   )
   validation = agent_cfg["validation"]
+  if cfg.validation_steps is not None:
+    validation["num_steps"] = cfg.validation_steps
   validation.update(
     inference=list(cfg.inference),
-    num_steps=cfg.validation_steps,
+    seed=cfg.validation_seed,
     stress_num_envs=cfg.stress_envs,
     stress_num_steps=cfg.stress_steps,
     stress_inference=list(cfg.inference),

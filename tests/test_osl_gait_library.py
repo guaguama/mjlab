@@ -11,10 +11,13 @@ checked by the slow rollouts (``MJLAB_OSL_GAIT_LIBRARY`` for the forward library
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
 from collections import Counter
+from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -23,6 +26,7 @@ import numpy as np
 import pytest
 import torch
 import warp as wp
+from test_osl_split_runner import HIDDEN, NUM_STEPS, _FakeEnv, _GlobalRngEnv
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   OSL_TORQUE_JOINTS,
@@ -32,6 +36,8 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
 )
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.scripts.play import strip_disturbances
+from mjlab.tasks.osl_fsm.config.env_cfgs import osl_fsm_env_cfg
+from mjlab.tasks.osl_fsm.config.rl_cfg import osl_fsm_runner_cfg
 from mjlab.tasks.osl_gait_library import mdp
 from mjlab.tasks.osl_gait_library.config.dr import FOOT_GEOMS, SLIDE_SCALE, OslDrCfg
 from mjlab.tasks.osl_gait_library.config.env_cfgs import (
@@ -56,6 +62,7 @@ from mjlab.tasks.osl_gait_library.config.rl_cfg import (
   UNICYCLE_MSK_STD_CAP_UPDATES,
   UNICYCLE_MSK_STRESS_INTERVAL,
   GaitLibraryRunnerCfg,
+  osl_gait_library_runner_cfg,
 )
 from mjlab.tasks.osl_gait_library.mdp import (
   GaitLibraryCommand,
@@ -69,10 +76,15 @@ from mjlab.tasks.osl_gait_library.mdp.commands import (
   se2_compose,
   se2_inverse,
 )
-from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
+from mjlab.tasks.osl_gait_library.rl.runner import (
+  GaitLibraryOnPolicyRunner,
+  slow_clips,
+)
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.config.rl_cfg import MuscleMimicPpoCfg, OslMimicRunnerCfg
 from mjlab.tasks.osl_mimic.rl.runner import stage_accessors
+from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
+from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.viewer.native.visualizer import MujocoNativeDebugVisualizer
 
@@ -145,13 +157,14 @@ def test_task_contract(task: str) -> None:
   assert rl.actor.distribution_cfg is not None
   assert rl.actor.distribution_cfg["init_std"] == (0.2 if model == "robot" else 3.0)
   v = rl.validation
-  assert v.num_steps == 1000 and v.num_envs == 0
+  assert v.num_steps == 2000 and v.num_envs == 0
   assert (v.model, v.socket, v.reward) == (model, socket, reward)
   assert isinstance(rl, GaitLibraryRunnerCfg) and rl.validation.variant == "walk_fwd"
 
   validation = osl_gait_library_env_cfg(model, socket, reward, mode="validation")
   v_motion = validation.commands["motion"]
   assert isinstance(v_motion, GaitLibraryCommandCfg) and v_motion.fixed_clips
+  assert validation.episode_length_s == 20.0
   assert set(validation.terminations) == {"time_out", "site_deviation"}
 
   # Round 1 is unchanged: continuous sampling over the forward span, no DR.
@@ -867,6 +880,154 @@ def test_validation_groups_follow_clip_families() -> None:
   assert groups["turn"].nonzero().flatten().tolist() == [6, 7]
 
 
+# The slow band's edges: vx 0.6 and |wz| 0.5 are in, vx 0.65 and |wz| 0.6 out.
+SLOW_TWISTS = [
+  [0.0, 0.0, 0.0],
+  [0.5, 0.0, 0.0],
+  [0.6, 0.0, -0.5],
+  [0.65, 0.0, 0.0],
+  [0.6, 0.0, 0.6],
+  [-0.5, 0.0, 0.0],
+  [0.0, 0.0, 0.8],
+]
+
+
+def test_slow_group_is_the_slow_forward_band() -> None:
+  """``slow``: forward clips up to 0.6 m/s with at most 0.5 rad/s of yaw rate, a
+  subset of ``fwd`` reported beside the families. A single-family library (the
+  walk_fwd one) reports no groups, the slow one included."""
+  assert slow_clips(torch.tensor(SLOW_TWISTS)).tolist() == [
+    False,
+    True,
+    True,
+    False,
+    False,
+    False,
+    False,
+  ]
+  cmd = _indexed_command(SLOW_TWISTS, sampling="library", **UNICYCLE_SPLIT)
+  env = SimpleNamespace(
+    num_envs=9, device="cpu", command_manager=SimpleNamespace(get_term=lambda _: cmd)
+  )
+  runner = GaitLibraryOnPolicyRunner.__new__(GaitLibraryOnPolicyRunner)
+  groups = runner._validation_groups(cast(Any, env))
+  assert set(groups) == {"idle", "fwd", "fwd_tight", "bck", "turn", "slow"}
+  # Validation env i plays clip i % 7.
+  assert groups["slow"].nonzero().flatten().tolist() == [1, 2, 8]
+  assert groups["fwd"].nonzero().flatten().tolist() == [1, 2, 3, 8]
+
+  walk_fwd = SimpleNamespace(
+    clip_groups=["fwd", "fwd"],
+    num_clips=2,
+    twists=torch.tensor([[0.5, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+  )
+  env.command_manager = SimpleNamespace(get_term=lambda _: walk_fwd)
+  assert runner._validation_groups(cast(Any, env)) == {}
+
+
+##
+# Validation: osl_deploy's 20 s, seeded, and at the final checkpoint.
+##
+
+
+@pytest.mark.parametrize("stage", ["stage1", "stage2", "stage1.5"])
+def test_validation_episodes_last_20_s(stage: str) -> None:
+  """Validation plays osl_deploy's 20 s in all three stages (one 2000-step episode
+  per clip); training stays at 10 s and play is endless."""
+  args = ("msk", "compliant", "clf")
+  if stage == "stage1":
+    rl: Any = osl_gait_library_runner_cfg(*args, "t", variant="unicycle")
+
+    def env_cfg(mode: Any) -> Any:
+      return osl_gait_library_env_cfg(*args, mode, "unicycle")
+  elif stage == "stage2":
+    rl = osl_split_runner_cfg(*args, "t")
+
+    def env_cfg(mode: Any) -> Any:
+      return osl_split_env_cfg(*args, mode)
+  else:
+    rl = osl_fsm_runner_cfg(*args, "t")
+
+    def env_cfg(mode: Any) -> Any:
+      return osl_fsm_env_cfg(*args, mode)
+
+  assert env_cfg("validation").episode_length_s == 20.0
+  assert env_cfg("train").episode_length_s == 10.0
+  assert env_cfg("play").episode_length_s == 1.0e9
+  assert rl.validation.num_steps == 2000 and rl.validation.seed == 0
+  # Stress validation keeps its 10 s.
+  assert rl.validation.stress_num_steps == 1000
+
+
+def _stage1_cfg() -> dict[str, Any]:
+  """The stage-1 recipe's runner config, shrunk for the split tests' fake env."""
+  cfg = asdict(osl_gait_library_runner_cfg("msk", "compliant", "clf", "t", "unicycle"))
+  for key in ("actor", "critic"):
+    cfg[key]["hidden_dims"] = HIDDEN
+  cfg["obs_groups"] = {"actor": ["actor"], "critic": ["actor"]}
+  cfg["num_steps_per_env"] = NUM_STEPS
+  cfg["algorithm"]["num_mini_batches"] = 2
+  cfg["logger"] = "tensorboard"
+  cfg["upload_model"] = False
+  cfg["video"]["enabled"] = False
+  cfg["save_interval"] = 100
+  cfg["env_stages"] = ()  # The fake env has no managers to stage.
+  cfg["validation"].update(interval=2, stress_interval=2, num_steps=5)
+  return cfg
+
+
+@pytest.mark.parametrize("iterations, evaluated", [(0, []), (2, [1]), (3, [1, 2])])
+def test_the_final_checkpoint_is_validated_once(
+  tmp_path: Path, iterations: int, evaluated: list[int]
+) -> None:
+  """Stage 1's loop with an interval of 2: a launch ending off the grid (at 2) is
+  validated and stress-validated there once more, before its final save; one
+  ending on it (at 1) is not evaluated twice; a launch of no iteration never."""
+  calls: list[tuple[str, int, bool]] = []
+
+  class Runner(GaitLibraryOnPolicyRunner):
+    def validate(self, it: int) -> dict[str, float]:
+      calls.append(("validation", it, (tmp_path / f"model_{it}.pt").exists()))
+      return {}
+
+    def stress_validate(self, it: int) -> dict[str, float]:
+      calls.append(("stress", it, (tmp_path / f"model_{it}.pt").exists()))
+      return {}
+
+  runner = Runner(cast(Any, _FakeEnv()), _stage1_cfg(), str(tmp_path), "cpu")
+  runner.learn(iterations)
+  assert calls == [
+    (kind, it, False) for it in evaluated for kind in ("validation", "stress")
+  ]
+  if iterations:
+    assert (tmp_path / f"model_{iterations - 1}.pt").is_file()
+
+
+def test_validation_is_seeded_and_leaves_training_rng() -> None:
+  """Every validation pass, and the validation env's build, draws from
+  ``validation.seed``: the same weights score the same in every mode, and
+  training's random state is untouched."""
+
+  class Runner(GaitLibraryOnPolicyRunner):
+    def _make_validation_env(self) -> Any:
+      return _GlobalRngEnv(num_envs=4, seed=1)
+
+  runner = Runner(cast(Any, _FakeEnv()), _stage1_cfg(), None, "cpu")
+  assert runner.validation_cfg["inference"] == ("mean", "expected")
+  torch.manual_seed(123)
+  state = torch.get_rng_state()
+  first = runner.validate(0)
+  assert torch.equal(torch.get_rng_state(), state)
+  assert first["Validation/early_termination_rate"] > 0.0  # The env drew dones.
+  assert runner.validate(0) == first
+  assert torch.equal(torch.get_rng_state(), state)
+  env = cast(_GlobalRngEnv, runner._validation_env)
+  torch.manual_seed(0)
+  assert env.built_with == float(torch.rand(1))
+  runner.validation_cfg["seed"] = 1
+  assert runner.validate(0) != first
+
+
 ##
 # The stride-averaged twist reward.
 ##
@@ -1136,3 +1297,40 @@ def test_episodes_start_at_a_random_heading_on_the_env_origin() -> None:
   cmd._start_episode(ids)
   cmd._cache.clear()  # As _resample_command does after an episode start.
   torch.testing.assert_close(cmd.anchor[:, 2], torch.zeros(4))
+
+
+PANEL_GROUPS = (
+  Path(__file__).parents[1]
+  / "logs/handover/stage1_deploy_toolkit/deploy_panel/groups.json"
+)
+"""The osl_deploy panel's clip groups (local, untracked)."""
+PANEL_SLOW = {
+  f"walk_fwd_vx+{vx:05d}_vy+00000_wz{wz:+06d}"
+  for vx in (500, 550, 600)
+  for wz in range(-500, 501, 50)
+}
+"""The deploy panel's slow band on unicycle_v001: vx 0.5-0.6 x |wz| <= 0.5."""
+
+
+@pytest.mark.skipif(
+  not UNICYCLE_LIBRARY, reason="set MJLAB_OSL_UNICYCLE_LIBRARY to unicycle_v001"
+)
+def test_slow_group_on_unicycle_v001_is_the_deploy_panels_slow_band() -> None:
+  library = Path(UNICYCLE_LIBRARY)
+  release = json.loads((library / "library.json").read_text()).get("release")
+  if release != "unicycle_v001":
+    pytest.skip(f"the library is {release}, not unicycle_v001")
+  # The command's order and labels: the sorted clips' float32 twists.
+  files = sorted(library.glob("*.npz"))
+  twists = []
+  for path in files:
+    with np.load(path) as data:
+      twists.append(np.asarray(data["twist"], dtype=np.float64).reshape(3))
+  slow = slow_clips(torch.tensor(np.stack(twists), dtype=torch.float32))
+  names = {p.stem for p, is_slow in zip(files, slow.tolist(), strict=True) if is_slow}
+  assert len(PANEL_SLOW) == 63 and names == PANEL_SLOW
+  if PANEL_GROUPS.is_file():
+    panel = json.loads(PANEL_GROUPS.read_text())
+    assert panel["names"] == [path.stem for path in files]
+    indices = {int(i) for i, group in panel["groups"].items() if group == "slow"}
+    assert slow.nonzero().flatten().tolist() == sorted(indices)

@@ -1,12 +1,13 @@
 """The validating runner, with validation over every library clip.
 
 Validation plays each clip (the idle one included) in its own env from phase 0 at
-its own twist, deterministically, for one 10 s episode, ending early only on the
-0.5 m site check. The metrics are the training diagnostics (imitation reward, CLF
-when on, and twist) averaged over the run, plus the early-termination rate and
-episode length and return. Key diagnostics are also reported per clip family
-(``fwd``, ``fwd_tight``, ``bck``, ``turn``, ``idle``), e.g.
-``Validation/twist_err_wz/turn``.
+its own twist, deterministically, for one 20 s episode (osl_deploy's run length;
+training episodes last 10 s), ending early only on the 0.5 m site check. The
+metrics are the training diagnostics (imitation reward, CLF when on, and twist)
+averaged over the run, plus the early-termination rate and episode length and
+return. Key diagnostics are also reported per clip family (``fwd``, ``fwd_tight``,
+``bck``, ``turn``, ``idle``) and for the slow forward arcs (``slow``, see
+:func:`slow_clips`), e.g. ``Validation/twist_err_wz/turn``.
 """
 
 from __future__ import annotations
@@ -18,12 +19,29 @@ from typing import cast
 import torch
 
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
-from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommand, GaitLibraryCommandCfg
+from mjlab.tasks.osl_gait_library.mdp import (
+  TIGHT_ARC_WZ,
+  GaitLibraryCommand,
+  GaitLibraryCommandCfg,
+)
 from mjlab.tasks.osl_mimic.rl.runner import (
   EvalPurpose,
   OslMimicOnPolicyRunner,
   eval_mode,
 )
+
+SLOW_VX = 0.6
+"""The ``slow`` validation group's top speed (m/s): see :func:`slow_clips`."""
+
+
+def slow_clips(twists: torch.Tensor) -> torch.Tensor:
+  """(C,) mask of the slow forward arcs among clips of twist labels ``twists``
+  (C, 3): 0 < vx <= ``SLOW_VX`` and |wz| <= ``TIGHT_ARC_WZ``. On unicycle_v001 these
+  are the deploy panel's slow band (vx 0.5-0.6, 63 clips), where stage 2 regressed
+  most; they are ``fwd`` clips too."""
+  eps = 1e-6
+  vx, wz = twists[:, 0], twists[:, 2]
+  return (vx > eps) & (vx <= SLOW_VX + eps) & (wz.abs() <= TIGHT_ARC_WZ + eps)
 
 
 class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
@@ -77,7 +95,8 @@ class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
 
   def _validation_groups(self, env: ManagerBasedRlEnv) -> dict[str, torch.Tensor]:
     """Validation env ``i`` plays clip ``i % num_clips``: group it by that clip's
-    family. A single-family library reports no groups."""
+    family, and the slow forward arcs (:func:`slow_clips`) also as ``slow``, a
+    subset of ``fwd``. A single-family library reports no groups."""
     cmd = cast(GaitLibraryCommand, env.command_manager.get_term("motion"))
     names = sorted(set(cmd.clip_groups))
     if len(names) < 2:
@@ -85,5 +104,10 @@ class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
     of_clip = torch.tensor(
       [names.index(g) for g in cmd.clip_groups], dtype=torch.long, device=env.device
     )
-    group = of_clip[torch.arange(env.num_envs, device=env.device) % cmd.num_clips]
-    return {name: group == i for i, name in enumerate(names)}
+    clip = torch.arange(env.num_envs, device=env.device) % cmd.num_clips
+    group = of_clip[clip]
+    groups = {name: group == i for i, name in enumerate(names)}
+    slow = slow_clips(torch.as_tensor(cmd.twists, device=env.device))
+    if bool(slow.any()):
+      groups["slow"] = slow[clip]
+    return groups

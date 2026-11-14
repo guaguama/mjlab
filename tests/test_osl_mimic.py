@@ -42,7 +42,10 @@ from mjlab.tasks.osl_mimic.mdp import kinematics as K
 from mjlab.tasks.osl_mimic.rl.models import RunningMeanStd
 from mjlab.tasks.osl_mimic.rl.muon import MuonAdam
 from mjlab.tasks.osl_mimic.rl.ppo import MuscleMimicPPO
-from mjlab.tasks.osl_mimic.rl.runner import OslMimicOnPolicyRunner
+from mjlab.tasks.osl_mimic.rl.runner import (
+  OslMimicOnPolicyRunner,
+  final_evaluation_due,
+)
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 
 TASKS = {
@@ -359,6 +362,22 @@ def test_reference_start_and_first_step(model: str) -> None:
 ##
 # Checkpoint videos.
 ##
+
+
+@pytest.mark.parametrize(
+  "start, end, interval, due",
+  [
+    (0, 3001, 250, True),  # Retrain phase A1, its 0..3000: validated at 3000.
+    (3000, 4500, 250, False),  # A2, resumed at 3000: ends at 4499, on the grid.
+    (4499, 5999, 250, True),  # B, resumed at 4499: validated at 5998.
+    (0, 500, 60, True),  # A 500-iteration stage-2 run (stage-local): at k = 499.
+    (0, 480, 60, False),  # One of 480: its k = 479 is on the grid.
+    (7, 7, 250, False),  # A launch of no iteration.
+    (0, 3001, 0, False),  # The evaluation is off.
+  ],
+)
+def test_final_evaluation_due(start: int, end: int, interval: int, due: bool) -> None:
+  assert final_evaluation_due(start, end, interval) is due
 
 
 def _video_runner(tmp_path: Path, fail: bool = False) -> tuple[Any, list[float]]:

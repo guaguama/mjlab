@@ -378,8 +378,12 @@ class SplitValidationCfg(GaitLibraryValidationCfg):
   """Validate (and stress-validate) the split policies once before stage 2's first
   update."""
   seed: int = 0
-  """Seeds the ``osl_sampled`` validation family, so every validation draws the same
-  OSL action noise. Training's random state is left untouched."""
+  """Seeds torch's generators for the validation env's build and for every
+  validation family alike (the ``osl_sampled`` family's OSL action noise included),
+  so checkpoints meet the same draws; training's random state is left untouched.
+  It cannot make passes bitwise identical on the GPU: mujoco_warp's GPU kernels are
+  not deterministic, so the same weights can still score slightly differently from
+  pass to pass there."""
   stress_interval: int = STRESS_INTERVAL
   """Stage-local iterations between stress validations; 0 disables them (and the
   zero-shot one). Stress validation plays a copy of the training config, OSL sensor

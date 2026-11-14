@@ -41,6 +41,7 @@ from tensordict import TensorDict
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   OSL_TORQUE_JOINTS,
+  TOUCH_SITES,
   Model,
   OslEntityCfg,
   Socket,
@@ -263,14 +264,14 @@ class _FakeEnv:
   """A vec env and its unwrapped env in one object: what the runner, the algorithm
   and the export read. Episodes time out after ``EPISODE_STEPS`` steps or end at
   random; every step's channel and twist rewards are random, and the agents'
-  expected rewards are recorded. Its config builds the OSL foot's ``touch_sites``
-  (a freshly configured run's ``heel_extended`` by default)."""
+  expected rewards are recorded. Its config builds the foot ``touch_sites`` (a
+  freshly configured run's ``feet_extended`` by default)."""
 
   def __init__(
     self,
     num_envs: int = NUM_ENVS,
     seed: int = 0,
-    touch_sites: TouchSites = "heel_extended",
+    touch_sites: TouchSites = "feet_extended",
   ) -> None:
     self.num_envs = num_envs
     self.num_actions = HUMAN_DIM + 2
@@ -352,6 +353,28 @@ class _FakeEnv:
     pass
 
 
+class _GlobalRngEnv(_FakeEnv):
+  """The fake env drawing from torch's global generators, as mjlab's commands and
+  events do; it records a draw made while it is built."""
+
+  def __init__(self, *args: Any, **kwargs: Any) -> None:
+    self.built_with = float(torch.rand(1))
+    super().__init__(*args, **kwargs)
+
+  def _rand(self, *shape: int) -> torch.Tensor:
+    return torch.rand(*shape)
+
+  def get_observations(self) -> TensorDict:
+    n = self.num_envs
+    return TensorDict(
+      {
+        "actor": torch.randn(n, ACTOR_DIM),
+        "osl": 2.0 * torch.randn(n, OSL_DIM) + 1.0,
+      },
+      batch_size=[n],
+    )
+
+
 class _Runner(SplitOnPolicyRunner):
   """The runner with fake evaluation envs (the real ones are mjlab envs)."""
 
@@ -385,7 +408,7 @@ def _lineage(reward: str = "clf") -> dict[str, Any]:
     "env_steps": STAGE1_ENV_STEPS,
     "model": "msk",
     "socket": "compliant",
-    "osl_touch_sites": "heel_extended",  # As the fake env builds by default.
+    "osl_touch_sites": "feet_extended",  # As the fake env builds by default.
     "reward": reward,
     "variant": "unicycle",
     "experiment_name": "stage1",
@@ -852,11 +875,11 @@ def test_runner_trains_validates_saves_and_resumes(
   assert env.reward_manager.mimic.weights_set == weights
   assert weights[1]["osl"]["osl_joints"] == 5.0  # Half-way to osl_end.
   # ...and the evaluation envs' before each evaluation: validation and stress at
-  # zero-shot, then at k = 1.
+  # zero-shot, at k = 1, and at the final k = 2 (off the interval-2 grid).
   validation_env = cast(_FakeEnv, runner._validation_env)
-  assert validation_env.reward_manager.mimic.weights_set == weights[:2]
+  assert validation_env.reward_manager.mimic.weights_set == weights
   stress_env = cast(_FakeEnv, runner._stress_env)
-  assert stress_env.reward_manager.mimic.weights_set == weights[:2]
+  assert stress_env.reward_manager.mimic.weights_set == weights
 
   steps = [STAGE_START + k for k in range(ITERATIONS)]
   logged = _scalars(
@@ -917,7 +940,8 @@ def test_runner_trains_validates_saves_and_resumes(
     "Validation/early_termination_rate/turn_right",
     "Validation/split_leg_contact_force_peak",
   ):
-    assert set(logged[tag]) == {steps[0], steps[1]}, tag  # Zero-shot, then k = 1.
+    # Zero-shot, k = 1, then the final checkpoint.
+    assert set(logged[tag]) == set(steps), tag
   # The teacher's families at zero-shot only: the stage-1 policy, raw and
   # noise-averaged (validation), raw (stress)...
   for tag in (
@@ -928,8 +952,9 @@ def test_runner_trains_validates_saves_and_resumes(
     "Perf/zero_shot_stress_time",
   ):
     assert set(logged[tag]) == {steps[0]}, tag
-  # ...and the stress families of the OSL actor at its interval only (k = 1): the
-  # fresh actor at zero-shot would fail at the floor.
+  # ...and the stress families of the OSL actor at its interval (k = 1) and the
+  # final checkpoint (k = 2) only: the fresh actor at zero-shot would fail at the
+  # floor.
   for tag in (
     "Stress/survival_rate",
     "Stress/mean_first_episode_return_osl",
@@ -937,7 +962,7 @@ def test_runner_trains_validates_saves_and_resumes(
     "Perf/validation_time",
     "Perf/stress_time",
   ):
-    assert set(logged[tag]) == {steps[1]}, tag
+    assert set(logged[tag]) == {steps[1], steps[2]}, tag
   tags = _tags(log_dir)
   assert not any(tag.startswith("ValidationExpected/") for tag in tags)
   assert not any(tag.startswith("ValidationOslSampled/") for tag in tags)
@@ -1072,12 +1097,6 @@ def test_play_loads_only_the_actors(tmp_path: Path) -> None:
     played.learn(1)
 
 
-OTHER_TOUCH_SITES: dict[TouchSites, TouchSites] = {
-  "heel_extended": "original",
-  "original": "heel_extended",
-}
-
-
 def _touch_runner(touch_sites: TouchSites) -> _Runner:
   """A runner without a warm start, on an env that builds ``touch_sites``."""
   env = _FakeEnv(touch_sites=touch_sites)
@@ -1088,13 +1107,13 @@ def test_checkpoints_record_and_require_the_touch_sites(tmp_path: Path) -> None:
   """Every checkpoint records the OSL foot touch sites its env simulates, under the
   top-level ``osl_touch_sites``. One loaded into an env that builds the other
   zones is refused, by a resume and by play's load of the actors alone, naming the
-  flag that builds the trained zones: the human actor's ``r_foot`` input would read
-  what it never saw. A checkpoint that records none was saved before the setting
+  flag that builds the trained zones: the human actor's touch inputs would read
+  what they never saw. A checkpoint that records none was saved before the setting
   and trained with ``original``. Play builds the checkpoint's zones itself, and a
   matching checkpoint loads and records its value again."""
   ws = _write_warm_start(tmp_path / "ws.pt")
   checkpoints: dict[Path, TouchSites] = {}
-  for touch_sites in OTHER_TOUCH_SITES:
+  for touch_sites in TOUCH_SITES:
     runner = _touch_runner(touch_sites)
     runner.warm_start(
       replace(ws, lineage={**ws.lineage, "osl_touch_sites": touch_sites})
@@ -1104,9 +1123,9 @@ def test_checkpoints_record_and_require_the_touch_sites(tmp_path: Path) -> None:
     assert torch.load(path, weights_only=False)["osl_touch_sites"] == touch_sites
     checkpoints[path] = touch_sites
   # The env's zones, also from a runner that holds no lineage to copy them from.
-  _touch_runner("heel_extended").save(str(tmp_path / "bare.pt"))
+  _touch_runner("feet_extended").save(str(tmp_path / "bare.pt"))
   bare = torch.load(tmp_path / "bare.pt", weights_only=False)
-  assert bare["osl_touch_sites"] == "heel_extended"
+  assert bare["osl_touch_sites"] == "feet_extended"
   legacy = torch.load(tmp_path / "model_original.pt", weights_only=False)
   del legacy["osl_touch_sites"]
   torch.save(legacy, tmp_path / "model_legacy.pt")
@@ -1115,9 +1134,10 @@ def test_checkpoints_record_and_require_the_touch_sites(tmp_path: Path) -> None:
   for path, trained in checkpoints.items():
     flag = re.escape(f"--env.osl-touch-sites {trained}")
     for load_cfg in (None, {"actor": True}):  # A resume, then play's load.
-      refusing = _touch_runner(OTHER_TOUCH_SITES[trained])
-      with pytest.raises(ValueError, match=flag):
-        refusing.load(str(path), load_cfg=load_cfg)
+      for other in TOUCH_SITES:
+        if other != trained:
+          with pytest.raises(ValueError, match=flag):
+            _touch_runner(other).load(str(path), load_cfg=load_cfg)
 
     # play.py makes the task's config build the checkpoint's zones, then loads.
     cfg = osl_split_env_cfg("msk", "compliant", "clf", "play")
@@ -1140,19 +1160,23 @@ def test_warm_start_needs_the_stage1_touch_sites(
 ) -> None:
   """Stage 2 builds the OSL foot touch sites stage 1 trained with: the human actor
   reads the touch sensors, and its normalizer's single count would never adapt to
-  another ``r_foot`` reading. A lineage that records none (converted before the
-  setting) trained with ``original``: refused by the default ``heel_extended``
-  env, naming the flag, and accepted by an ``original`` one. The runner reports
+  other touch readings. A lineage that records none (converted before the
+  setting) trained with ``original``: refused by the default ``feet_extended``
+  env, naming the flag, and accepted by an ``original`` one. A heel_extended
+  stage 1 is refused by a feet_extended stage 2 and vice versa. The runner reports
   the zones stage 1 trained with."""
   ws = _write_warm_start(tmp_path / "ws.pt")
-  assert ws.lineage["osl_touch_sites"] == "heel_extended"
+  assert ws.lineage["osl_touch_sites"] == "feet_extended"
   legacy = replace(
     ws, lineage={k: v for k, v in ws.lineage.items() if k != "osl_touch_sites"}
   )
+  heel = replace(ws, lineage={**ws.lineage, "osl_touch_sites": "heel_extended"})
   # (the warm start, stage 2's zones, stage 1's zones)
   mismatches: tuple[tuple[WarmStart, TouchSites, TouchSites], ...] = (
-    (legacy, "heel_extended", "original"),
-    (ws, "original", "heel_extended"),
+    (legacy, "feet_extended", "original"),
+    (ws, "original", "feet_extended"),
+    (heel, "feet_extended", "heel_extended"),
+    (ws, "heel_extended", "feet_extended"),
   )
   for stage1, stage2, trained in mismatches:
     refused = _touch_runner(stage2)
@@ -1166,10 +1190,10 @@ def test_warm_start_needs_the_stage1_touch_sites(
   assert started._ready and started.stage_start == STAGE_START
   out = capsys.readouterr().out
   assert "[INFO] OSL touch sites: original (not recorded" in out
-  started = _touch_runner("heel_extended")
+  started = _touch_runner("feet_extended")
   started.warm_start(ws)
   assert started._ready and started.stage_start == STAGE_START
-  assert "[INFO] OSL touch sites: heel_extended\n" in capsys.readouterr().out
+  assert "[INFO] OSL touch sites: feet_extended\n" in capsys.readouterr().out
 
 
 def test_resume_keeps_the_checkpoint_curriculum(
@@ -1414,6 +1438,9 @@ def test_evaluations_are_guarded_and_timed(
     ("zero_shot_stress", steps[0]),
     ("validation", steps[1]),
     ("stress", steps[1]),
+    # The final checkpoint's (k = 2, off the interval-2 grid), guarded alike.
+    ("validation", steps[2]),
+    ("stress", steps[2]),
   ):
     assert f"[WARN] {name} at it={it} failed (training continues)" in out, name
   assert (log_dir / f"model_{steps[-1]}.pt").is_file()  # Training finished.
@@ -1427,7 +1454,7 @@ def test_evaluations_are_guarded_and_timed(
   )
   assert set(logged["Perf/zero_shot_validation_time"]) == {steps[0]}
   assert set(logged["Perf/validation_time"]) == set(logged["Perf/stress_time"])
-  assert set(logged["Perf/stress_time"]) == {steps[1]}
+  assert set(logged["Perf/stress_time"]) == {steps[1], steps[2]}
   assert set(logged["Perf/video_time"]) == {steps[2]}  # The k = 2 save.
   events = EventAccumulator(str(log_dir), size_guidance={"scalars": 0})
   events.Reload()
@@ -1435,6 +1462,68 @@ def test_evaluations_are_guarded_and_timed(
   assert memory_steps == [*steps, steps[-1]]
   # CPU: no GPU memory to log.
   assert SplitOnPolicyRunner._gpu_memory(runner) == {}
+
+
+@pytest.mark.parametrize("iterations, evaluated", [(0, []), (2, [1]), (3, [1, 2])])
+def test_the_final_checkpoint_is_evaluated_once(
+  tmp_path: Path, iterations: int, evaluated: list[int]
+) -> None:
+  """With an interval of 2, a launch ending off the grid (k = 2) is validated and
+  stress-validated there once more, before its final save; one ending on it (k = 1)
+  is not evaluated twice, and a launch of no iteration is not evaluated at all."""
+  ws_path = tmp_path / "ws.pt"
+  _write_warm_start(ws_path)
+  cfg = _train_cfg(ws_path)
+  cfg["validation"].update(stress_interval=2, zero_shot=False)
+  cfg["save_interval"] = 100  # No periodic save at k = 2 before the final one.
+  log_dir = tmp_path / "run"
+  runner = _Runner(cast(Any, _FakeEnv()), cfg, str(log_dir), "cpu")
+  calls: list[tuple[str, int, bool]] = []
+
+  def spy(kind: str) -> Any:
+    def record(it: int, zero_shot: bool = False) -> dict[str, float]:
+      saved = (log_dir / f"model_{it}.pt").exists()
+      calls.append((kind, it - STAGE_START, saved))
+      return {}
+
+    return record
+
+  runner.validate = spy("validation")
+  runner.stress_validate = spy("stress")
+  runner.learn(iterations)
+  assert calls == [
+    (kind, k, False) for k in evaluated for kind in ("validation", "stress")
+  ]
+  if iterations:
+    assert (log_dir / f"model_{STAGE_START + iterations - 1}.pt").is_file()
+
+
+def test_validation_is_seeded_and_leaves_training_rng(tmp_path: Path) -> None:
+  """Every validation family, and the validation env's build, draws from
+  ``validation.seed``: the same weights score the same, and training's random
+  state is untouched."""
+  ws_path = tmp_path / "ws.pt"
+  _write_warm_start(ws_path)
+
+  class Runner(_Runner):
+    def _make_validation_env(self) -> Any:
+      return _GlobalRngEnv(num_envs=4, seed=1)
+
+  cfg = _train_cfg(ws_path)
+  cfg["validation"]["inference"] = ("mean", "osl_sampled")
+  runner = Runner(cast(Any, _FakeEnv()), cfg, None, "cpu")
+  torch.manual_seed(123)
+  state = torch.get_rng_state()
+  first = runner.validate(STAGE_START + 1)
+  assert torch.equal(torch.get_rng_state(), state)
+  assert first["Validation/early_termination_rate"] > 0.0  # The env drew dones.
+  assert runner.validate(STAGE_START + 1) == first
+  assert torch.equal(torch.get_rng_state(), state)
+  env = cast(_GlobalRngEnv, runner._validation_env)
+  torch.manual_seed(0)
+  assert env.built_with == float(torch.rand(1))
+  runner.validation_cfg["seed"] = 1
+  assert runner.validate(STAGE_START + 1) != first
 
 
 def test_video_plays_the_human_action_by_its_std(tmp_path: Path) -> None:

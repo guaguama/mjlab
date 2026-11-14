@@ -117,9 +117,16 @@ class OslMimicValidationCfg:
   reports each env's first episode (``Stress/``, ``StressExpected/``, ...)."""
   stress_num_envs: int = 512
   stress_num_steps: int = 1000
-  """Steps per stress episode (10 s at 100 Hz)."""
+  """Steps per stress episode (10 s at 100 Hz); the stress env's episode length
+  follows it, so ``--agent.validation.stress-num-steps 2000`` alone gives 20 s."""
   stress_inference: tuple[str, ...] = ("expected",)
   """Deterministic actions stress-validated (as ``inference``)."""
+  seed: int = 0
+  """Seeds torch's generators for the validation env's build and for every
+  validation pass alike, so checkpoints meet the same draws; training's random
+  state is left untouched. It cannot make passes bitwise identical on the GPU:
+  mujoco_warp's GPU kernels are not deterministic, so the same weights can still
+  score slightly differently from pass to pass there."""
   stress_seed: int = 0
   """Seeds every stress validation alike (commands, pushes, delays), so checkpoints
   meet the same disturbances. Training's random state is left untouched."""

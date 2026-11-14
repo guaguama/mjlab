@@ -432,6 +432,15 @@ def test_check_compatible(tmp_path: Path) -> None:
   assert f"{CLI_FLAG} heel_extended." in str(error.value)
   with pytest.raises(ValueError, match="touch sites cannot switch"):
     check(touch_sites="original", reward="mimic")  # Not with a reward switch either.
+  # Nor between the two extended versions: the left zones differ.
+  with pytest.raises(ValueError, match="touch sites cannot switch") as error:
+    check(touch_sites="feet_extended")
+  assert f"{CLI_FLAG} heel_extended." in str(error.value)
+  ws.lineage[ENV_FIELD] = "feet_extended"
+  assert check(touch_sites="feet_extended") is False
+  with pytest.raises(ValueError, match="touch sites cannot switch") as error:
+    check(touch_sites="heel_extended")
+  assert f"{CLI_FLAG} feet_extended." in str(error.value)
 
   # A lineage without the key (converted before the setting) asks the stage-1
   # checkpoint it names, which here records none: "original".
@@ -526,13 +535,13 @@ def test_lineage_reads_a_dumped_env_yaml(tmp_path: Path) -> None:
   checks its checkpoint against the top-level ``osl_touch_sites`` (not the robot
   entity's nested one)."""
   run_dir = _stage1_run(
-    tmp_path, "msk", iterations=(12,), checkpoint_touch="heel_extended"
+    tmp_path, "msk", iterations=(12,), checkpoint_touch="feet_extended"
   )
   env_cfg = osl_gait_library_env_cfg("msk", "compliant", "clf", "train", "unicycle")
   dump_yaml(run_dir / "params" / "env.yaml", asdict(env_cfg))
   text = (run_dir / "params" / "env.yaml").read_text()
-  assert f"\n{ENV_FIELD}: heel_extended\n" in text  # The default, at top level.
-  assert build_warm_start(run_dir, verify=False).lineage[ENV_FIELD] == "heel_extended"
+  assert f"\n{ENV_FIELD}: feet_extended\n" in text  # The default, at top level.
+  assert build_warm_start(run_dir, verify=False).lineage[ENV_FIELD] == "feet_extended"
   # A key-less checkpoint in it contradicts that line, and is refused.
   torch.save(_stage1_checkpoint("msk", 12, None), run_dir / "model_12.pt")
   with pytest.raises(ValueError, match="records no OSL touch sites"):

@@ -1,11 +1,11 @@
 """The OSL touch-site setting across configs, checkpoints and play
 (``tasks/osl_mimic/touch_sites.py``).
 
-Every OSL task builds ``heel_extended`` unless told otherwise
+Every OSL task builds ``feet_extended`` unless told otherwise
 (``--env.osl-touch-sites``), records its value in ``params/env.yaml`` and in every
-checkpoint, and never lets a policy meet the other zone: resuming refuses a
-mismatch, play builds what the checkpoint trained with and evaluation envs build
-the training env's. Anything that records no value trained with ``original``. The
+checkpoint, and never lets a policy meet other zones: resuming refuses a mismatch,
+play builds what the checkpoint trained with and evaluation envs build the
+training env's. Anything that records no value trained with ``original``. The
 model-level tests are in ``test_osl_constants.py``.
 """
 
@@ -25,6 +25,7 @@ import tyro
 import mjlab
 import mjlab.tasks  # noqa: F401  (registers the tasks)
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
+  DEFAULT_TOUCH_SITES,
   TOUCH_SITES,
   OslEntityCfg,
   touch_sites_of_model,
@@ -59,54 +60,128 @@ TRACKING = "Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT"
 RUNNER_TASKS = [MIMIC, GAIT_LIBRARY, SPLIT, FSM, STAIRS, TRACKING]
 
 R_FOOT = "robot/OSL_KA_L1_r_foot_touch"
+R_TOES = "robot/OSL_KA_L1_r_toes_touch"
+L_FOOT = "robot/foot_touch_l"
+L_TOES = "robot/toes_touch_l"
 OSL_FOOT = "robot/OSL_KA_L1_osl_foot_assembly"
 IDENTITY = [1.0, 0.0, 0.0, 0.0]
-# The bundle manifest's ``touch_sites`` for heel_extended: the contract shared with
-# osl_deploy (logs/handover/touch_fix/brief_mjlab.md), value for value.
-CONTRACT = {
-  "version": "heel_extended",
-  "edited_from_xml": [R_FOOT],
+L_TOES_QUAT = [0.9393726845901743, 0.0, 0.3428978848663966, 0.0]
+FRAME = (
+  "site pos/quat/size in the parent body's frame (MuJoCo site_pos, site_quat, "
+  "site_size; box half-sizes)"
+)
+
+
+def _contract(
+  version: str, edited: list[str], r_foot: dict, l_foot: dict, l_toes: dict
+) -> dict:
+  """A manifest ``touch_sites`` block: the version's three edited-site boxes, and
+  r_toes, which no version edits."""
+  return {
+    "version": version,
+    "edited_from_xml": edited,
+    "frame": FRAME,
+    "sites": {
+      R_FOOT: {"sensor": "robot/r_foot", "body": OSL_FOOT, "type": "box", **r_foot},
+      R_TOES: {
+        "sensor": "robot/r_toes",
+        "body": OSL_FOOT,
+        "type": "box",
+        "pos": [0.215, -0.04, -0.005],
+        "quat": IDENTITY,
+        "size": [0.075, 0.03, 0.06],
+      },
+      L_FOOT: {
+        "sensor": "robot/l_foot",
+        "body": "robot/calcn_l",
+        "type": "box",
+        **l_foot,
+      },
+      L_TOES: {
+        "sensor": "robot/l_toes",
+        "body": "robot/toes_l",
+        "type": "box",
+        **l_toes,
+      },
+    },
+  }
+
+
+# The boxes of the contract: the XML's, and the edited ones.
+XML_R_FOOT = {"pos": [0.025, -0.04, 0.0], "quat": IDENTITY, "size": [0.05, 0.03, 0.05]}
+HEEL_R_FOOT = {"pos": [0.01, -0.04, 0.0], "quat": IDENTITY, "size": [0.065, 0.03, 0.05]}
+XML_L_FOOT = {"pos": [0.09, -0.01, 0.0], "quat": IDENTITY, "size": [0.1, 0.01, 0.055]}
+LOW_L_FOOT = {"pos": [0.09, -0.014, 0.0], "quat": IDENTITY, "size": [0.1, 0.014, 0.055]}
+XML_L_TOES = {
+  "pos": [0.0275, -0.01, 0.0],
+  "quat": L_TOES_QUAT,
+  "size": [0.04, 0.01, 0.0675],
+}
+LOW_L_TOES = {
+  "pos": [0.0275, -0.014, 0.0],
+  "quat": L_TOES_QUAT,
+  "size": [0.04, 0.014, 0.0675],
+}
+# The bundle manifest's ``touch_sites`` per version: the contract shared with
+# osl_deploy (logs/handover/touch_fix/brief_mjlab.md for original and heel_extended,
+# logs/handover/round6/briefs/brief_mjlab_feet_touch_zones.md for feet_extended),
+# value for value.
+TOUCH_SITES_CONTRACT = {
+  "original": _contract("original", [], XML_R_FOOT, XML_L_FOOT, XML_L_TOES),
+  "heel_extended": _contract(
+    "heel_extended", [R_FOOT], HEEL_R_FOOT, XML_L_FOOT, XML_L_TOES
+  ),
+  "feet_extended": _contract(
+    "feet_extended", [R_FOOT, L_FOOT, L_TOES], HEEL_R_FOOT, LOW_L_FOOT, LOW_L_TOES
+  ),
+}
+# The feet_extended block exactly as the brief writes it.
+FEET_EXTENDED_BRIEF = {
+  "version": "feet_extended",
+  "edited_from_xml": [
+    "robot/OSL_KA_L1_r_foot_touch",
+    "robot/foot_touch_l",
+    "robot/toes_touch_l",
+  ],
   "frame": (
     "site pos/quat/size in the parent body's frame (MuJoCo site_pos, site_quat, "
     "site_size; box half-sizes)"
   ),
   "sites": {
-    R_FOOT: {
+    "robot/OSL_KA_L1_r_foot_touch": {
       "sensor": "robot/r_foot",
-      "body": OSL_FOOT,
+      "body": "robot/OSL_KA_L1_osl_foot_assembly",
       "type": "box",
       "pos": [0.01, -0.04, 0.0],
-      "quat": IDENTITY,
+      "quat": [1.0, 0.0, 0.0, 0.0],
       "size": [0.065, 0.03, 0.05],
     },
     "robot/OSL_KA_L1_r_toes_touch": {
       "sensor": "robot/r_toes",
-      "body": OSL_FOOT,
+      "body": "robot/OSL_KA_L1_osl_foot_assembly",
       "type": "box",
       "pos": [0.215, -0.04, -0.005],
-      "quat": IDENTITY,
+      "quat": [1.0, 0.0, 0.0, 0.0],
       "size": [0.075, 0.03, 0.06],
     },
     "robot/foot_touch_l": {
       "sensor": "robot/l_foot",
       "body": "robot/calcn_l",
       "type": "box",
-      "pos": [0.09, -0.01, 0.0],
-      "quat": IDENTITY,
-      "size": [0.1, 0.01, 0.055],
+      "pos": [0.09, -0.014, 0.0],
+      "quat": [1.0, 0.0, 0.0, 0.0],
+      "size": [0.1, 0.014, 0.055],
     },
     "robot/toes_touch_l": {
       "sensor": "robot/l_toes",
       "body": "robot/toes_l",
       "type": "box",
-      "pos": [0.0275, -0.01, 0.0],
+      "pos": [0.0275, -0.014, 0.0],
       "quat": [0.9393726845901743, 0.0, 0.3428978848663966, 0.0],
-      "size": [0.04, 0.01, 0.0675],
+      "size": [0.04, 0.014, 0.0675],
     },
   },
 }
-# For "original": nothing edited, and the r_foot entry carries the XML's box.
-XML_R_FOOT = {"pos": [0.025, -0.04, 0.0], "size": [0.05, 0.03, 0.05]}
 
 
 def _cli_env(task: str, *args: str) -> OslEnvCfg:
@@ -132,13 +207,14 @@ def _robot(cfg: Any) -> OslEntityCfg:
 ##
 
 
-def test_every_osl_task_builds_the_extended_heel_by_default() -> None:
+def test_every_osl_task_builds_the_extended_feet_by_default() -> None:
+  assert DEFAULT_TOUCH_SITES == "feet_extended"
   assert len(OSL_TASKS) > 30
   for task in OSL_TASKS:
     for play in (False, True):
       cfg = load_env_cfg(task, play=play)
       assert isinstance(cfg, OslEnvCfg), task
-      assert cfg.osl_touch_sites == _robot(cfg).touch_sites == "heel_extended", task
+      assert cfg.osl_touch_sites == _robot(cfg).touch_sites == "feet_extended", task
 
 
 def test_env_yaml_records_the_touch_sites(tmp_path: Path) -> None:
@@ -148,17 +224,18 @@ def test_env_yaml_records_the_touch_sites(tmp_path: Path) -> None:
     path = tmp_path / task / "params" / "env.yaml"
     dump_yaml(path, asdict(load_env_cfg(task)))
     lines = re.findall(r"^osl_touch_sites:.*$", path.read_text(), re.M)
-    assert lines == ["osl_touch_sites: heel_extended"], task
-    assert env_yaml_touch_sites(path) == "heel_extended", task
-  overridden = tmp_path / "overridden.yaml"
-  dump_yaml(overridden, asdict(_cli_env(GAIT_LIBRARY, FLAG, "original")))
-  assert env_yaml_touch_sites(overridden) == "original"
+    assert lines == ["osl_touch_sites: feet_extended"], task
+    assert env_yaml_touch_sites(path) == "feet_extended", task
+  for version in ("original", "heel_extended"):
+    overridden = tmp_path / f"{version}.yaml"
+    dump_yaml(overridden, asdict(_cli_env(GAIT_LIBRARY, FLAG, version)))
+    assert env_yaml_touch_sites(overridden) == version
   # A run from before the setting records none. The robot entity's nested
   # touch_sites is no record of the run's.
   legacy = asdict(load_env_cfg(GAIT_LIBRARY))
   del legacy["osl_touch_sites"]
   dump_yaml(tmp_path / "legacy.yaml", legacy)
-  assert "touch_sites: heel_extended" in (tmp_path / "legacy.yaml").read_text()
+  assert "touch_sites: feet_extended" in (tmp_path / "legacy.yaml").read_text()
   assert env_yaml_touch_sites(tmp_path / "legacy.yaml") is None
   assert env_yaml_touch_sites(tmp_path / "missing.yaml") is None
 
@@ -169,10 +246,11 @@ def test_cli_sets_the_touch_sites(
 ) -> None:
   """tyro rebuilds the env config after the overrides, so the flag reaches the robot
   entity. The entity's own field is no flag: the env's is the one runs record."""
-  cfg = _cli_env(task, FLAG, "original")
-  assert type(cfg) is type(load_env_cfg(task))  # The stairs subclass survives.
-  assert cfg.osl_touch_sites == _robot(cfg).touch_sites == "original"
-  assert _cli_env(task).osl_touch_sites == "heel_extended"
+  for version in TOUCH_SITES:
+    cfg = _cli_env(task, FLAG, version)
+    assert type(cfg) is type(load_env_cfg(task))  # The stairs subclass survives.
+    assert cfg.osl_touch_sites == _robot(cfg).touch_sites == version
+  assert _cli_env(task).osl_touch_sites == "feet_extended"
   with pytest.raises(SystemExit) as error:
     _cli_env(task, "--env.scene.entities.robot.touch-sites", "original")
   assert error.value.code == 2
@@ -185,10 +263,11 @@ def test_cli_sets_the_touch_sites(
 def scene_models() -> dict[tuple[str, str], mujoco.MjModel]:
   """The scenes of a stage-2 task (a spec_fn chain adds the OSL sensors) and of a
   tracking task (its own spec_fn), compiled from train.py's command line: the
-  default, and ``--env.osl-touch-sites original``."""
+  default (feet_extended), and ``--env.osl-touch-sites`` with the other two."""
   models = {}
   for task in (SPLIT, TRACKING):
-    for version, args in (("heel_extended", ()), ("original", (FLAG, "original"))):
+    for version in TOUCH_SITES:
+      args = () if version == DEFAULT_TOUCH_SITES else (FLAG, version)
       models[task, version] = Scene(_cli_env(task, *args).scene, "cpu").compile()
   return models
 
@@ -205,20 +284,30 @@ def test_manifest_follows_the_contract(
 ) -> None:
   """A bundle's ``touch_sites``, read from the compiled model, is the contract
   osl_deploy reads: all four sites, full scene names, plain JSON."""
+  assert TOUCH_SITES_CONTRACT["feet_extended"] == FEET_EXTENDED_BRIEF
+  assert set(TOUCH_SITES_CONTRACT) == set(TOUCH_SITES)
+  edges = {
+    "original": ("-0.025 to 0.075", "-0.020"),
+    "heel_extended": ("-0.055 to 0.075", "-0.020"),
+    "feet_extended": ("-0.055 to 0.075", "-0.028"),
+  }
   for (task, version), model in scene_models.items():
     manifest = touch_sites_manifest(model)
     assert json.loads(json.dumps(manifest)) == manifest, task
-    expected = json.loads(json.dumps(CONTRACT))
-    if version == "original":
-      expected.update(version="original", edited_from_xml=[])
-      expected["sites"][R_FOOT].update(XML_R_FOOT)
+    expected = json.loads(json.dumps(TOUCH_SITES_CONTRACT[version]))
     for site in expected["sites"].values():
       for key in ("pos", "quat", "size"):
         site[key] = pytest.approx(site[key], rel=0, abs=1e-12)
     assert manifest == expected, (task, version)
-    edges = "-0.055 to 0.075" if version == "heel_extended" else "-0.025 to 0.075"
+    # edited_from_xml lists exactly the sites whose box is not the XML's.
+    xml = TOUCH_SITES_CONTRACT["original"]["sites"]
+    assert manifest["edited_from_xml"] == [
+      name for name, site in manifest["sites"].items() if site != xml[name]
+    ]
     line = touch_sites_readme_line(manifest)
-    assert f"**{version}**" in line and f"foot x {edges} m" in line
+    osl_x, sole = edges[version]
+    assert f"**{version}**" in line and f"OSL foot x {osl_x} m" in line
+    assert f"intact foot zones down to y {sole} m" in line
 
 
 ##
@@ -254,18 +343,18 @@ def test_env_touch_sites_checks_the_compiled_model(
   assert isinstance(cfg, OslEnvCfg)
   sim = SimpleNamespace(mj_model=scene_models[SPLIT, "original"])
   env = SimpleNamespace(cfg=cfg, sim=sim)
-  with pytest.raises(RuntimeError, match="built with the 'original' zones"):
-    env_touch_sites(env)
-  sim.mj_model = scene_models[SPLIT, "heel_extended"]
-  assert env_touch_sites(env) == "heel_extended"
-  set_touch_sites(cfg, "original")
-  assert cfg.osl_touch_sites == _robot(cfg).touch_sites == "original"
-  with pytest.raises(RuntimeError, match="built with the 'heel_extended' zones"):
-    env_touch_sites(env)
-  sim.mj_model = scene_models[SPLIT, "original"]
-  assert env_touch_sites(env) == "original"
+  for configured in TOUCH_SITES:
+    set_touch_sites(cfg, configured)
+    assert cfg.osl_touch_sites == _robot(cfg).touch_sites == configured
+    for built in TOUCH_SITES:
+      sim.mj_model = scene_models[SPLIT, built]
+      if built == configured:
+        assert env_touch_sites(env) == configured
+      else:
+        with pytest.raises(RuntimeError, match=f"built with the '{built}' zones"):
+          env_touch_sites(env)
   sim.mj_model = mujoco.MjModel.from_xml_string("<mujoco/>")
-  assert env_touch_sites(env) == "original"
+  assert env_touch_sites(env) == "feet_extended"
 
 
 ##
@@ -313,13 +402,32 @@ def test_resume_refuses_a_legacy_checkpoint_on_the_new_default(
   legacy = str(tmp_path / "model_3050.pt")
   MjlabOnPolicyRunner.save(_runner(cls, "original"), legacy)
   assert CHECKPOINT_KEY not in torch.load(legacy, weights_only=False)
-  with pytest.raises(ValueError, match=re.escape(f"{FLAG} original")) as error:
-    _runner(cls, "heel_extended").load(legacy)
-  assert "records none" in str(error.value)
+  for current in ("feet_extended", "heel_extended"):
+    with pytest.raises(ValueError, match=re.escape(f"{FLAG} original")) as error:
+      _runner(cls, current).load(legacy)
+    assert "records none" in str(error.value)
   assert parent_load == []
   runner = _runner(cls, "original")
   assert runner.load(legacy, map_location="cpu") == {"loaded": legacy}
   assert parent_load == [(runner, legacy, None, True, "cpu")]
+
+
+@pytest.mark.parametrize("cls", RUNNERS, ids=lambda cls: cls.__name__)
+def test_resume_refuses_a_heel_extended_checkpoint_on_the_new_default(
+  cls: type, tmp_path: Path, parent_load: list[tuple]
+) -> None:
+  """A checkpoint from the first fix (the extended heel, the XML's left zones) is
+  refused under the new default, naming the flag that rebuilds its zones, and
+  loads with it."""
+  path = str(tmp_path / "model_500.pt")
+  _runner(cls, "heel_extended").save(path)
+  with pytest.raises(ValueError, match=re.escape(f"{FLAG} heel_extended")) as error:
+    _runner(cls, DEFAULT_TOUCH_SITES).load(path)
+  assert "builds 'feet_extended'" in str(error.value)
+  assert parent_load == []
+  runner = _runner(cls, "heel_extended")
+  assert runner.load(path) == {"loaded": path}
+  assert parent_load == [(runner, path, None, True, None)]
 
 
 @pytest.mark.parametrize("touch_sites", TOUCH_SITES)
@@ -342,9 +450,10 @@ def test_checkpoints_record_their_touch_sites(
     CHECKPOINT_KEY: touch_sites,
   }
   assert runner.load(path) == {"loaded": path}
-  other = next(v for v in TOUCH_SITES if v != touch_sites)
-  with pytest.raises(ValueError, match=re.escape(f"{FLAG} {touch_sites}")):
-    _runner(cls, other).load(path)
+  for other in TOUCH_SITES:
+    if other != touch_sites:
+      with pytest.raises(ValueError, match=re.escape(f"{FLAG} {touch_sites}")):
+        _runner(cls, other).load(path)
   assert parent_load == [(runner, path, None, True, None)]
 
 
@@ -395,15 +504,19 @@ def test_play_builds_what_the_checkpoint_trained_with(
     return cfg.osl_touch_sites
 
   # Saved before the setting, from a run before it.
-  assert played(checkpoint("legacy", None, None), "heel_extended") == "original"
+  assert played(checkpoint("legacy", None, None), "feet_extended") == "original"
   # A bare checkpoint, with no run directory around it.
   bare = tmp_path / "bare.pt"
   torch.save({"actor_state_dict": {}, "iter": 10, "infos": None}, bare)
-  assert played(bare, "heel_extended") == "original"
+  assert played(bare, "feet_extended") == "original"
   assert played(checkpoint("new", "heel_extended", None), "original") == "heel_extended"
-  assert played(checkpoint("yaml", None, "original"), "heel_extended") == "original"
+  heel = checkpoint("heel", "heel_extended", "heel_extended")
+  assert played(heel, "feet_extended") == "heel_extended"
+  feet = checkpoint("feet", "feet_extended", "feet_extended")
+  assert played(feet, "heel_extended") == "feet_extended"
+  assert played(checkpoint("yaml", None, "original"), "feet_extended") == "original"
   agreeing = checkpoint("agreeing", "original", "original")
-  assert played(agreeing, "heel_extended") == "original"
+  assert played(agreeing, "feet_extended") == "original"
   moved = checkpoint("moved", "heel_extended", "original")
   with pytest.raises(ValueError, match="params/env.yaml records 'original'"):
     configure(load_env_cfg(task, play=True), moved)

@@ -615,7 +615,7 @@ def check_compatible(
   when it is the same. Raises ``ValueError`` on a model, socket or touch-site
   change: the human actor is the unified actor transplanted exactly, and each change
   would alter its inputs (for the socket, joints the stage-1 normalizer has never
-  seen; for the touch sites, an ``r_foot`` reading it never saw; its single count
+  seen; for the touch sites, foot touch readings it never saw; its single count
   would never give either statistics) or its outputs.
   """
   _check_choice("model", model, get_args(Model))
@@ -647,7 +647,7 @@ def check_compatible(
       f"The warm start ({source}) was trained with the OSL touch sites "
       f"{stage1_touch.value!r} ({stage1_touch.source}), but this stage-2 task "
       f"builds {touch_sites!r}. The human actor reads the foot touch sensors, so "
-      "its r_foot input would read what stage 1 never saw (and the stage-1 "
+      "its touch inputs would read what stage 1 never saw (and the stage-1 "
       "normalizer's single count would never adapt to it): the touch sites cannot "
       f"switch between stages. Train stage 2 with {CLI_FLAG} {stage1_touch.value}."
     )

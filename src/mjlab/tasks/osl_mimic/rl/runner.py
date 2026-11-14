@@ -29,6 +29,12 @@ Beyond musclemimic's:
   validation's site check, and reports each env's first episode (``Stress/``,
   ``StressExpected/``): the survival rate is the share of envs that last the whole
   episode;
+* every validation pass is seeded alike (``validation.seed``, the validation env's
+  build included) and every stress validation too (``validation.stress_seed``),
+  each under ``torch.random.fork_rng``, so training's random state is untouched;
+* a launch whose last iteration is off an evaluation's interval grid (a resumed
+  run ending at 5998, say) runs that evaluation once more there, before the final
+  save, so the final checkpoint always has its numbers;
 * the algorithm's ``policy_stats`` (std per action term, the std cap, the noise gap)
   are logged under ``Policy/`` every iteration;
 * videos play ``video.inference`` (by default the noise-averaged action for muscle
@@ -102,6 +108,14 @@ _EVAL_MODES: dict[str, EvalMode] = {
 def eval_mode(purpose: EvalPurpose) -> EvalMode:
   """The task mode an evaluation env of ``purpose`` is built in."""
   return _EVAL_MODES[purpose]
+
+
+def final_evaluation_due(start: int, end: int, interval: int) -> bool:
+  """Whether a launch that ran iterations ``start .. end - 1`` (counted on the
+  evaluation's grid) owes an evaluation run every ``interval`` iterations one more
+  time at its last iteration: when it ran any iteration, the evaluation is on, and
+  the grid did not just run it (``end`` is no multiple of ``interval``)."""
+  return end > start and interval > 0 and end % interval != 0
 
 
 def inference_modes(modes: Any, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -246,6 +260,12 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
 
     if self.logger.writer is not None:
       it = self.current_learning_iteration
+      # The final checkpoint is the deployed one: evaluate it unless the interval
+      # just did (a resumed run ends off the grid, e.g. at 5998).
+      if final_evaluation_due(start_it, total_it, interval):
+        self._guarded(self.validate, it)
+      if final_evaluation_due(start_it, total_it, stress_interval):
+        self._guarded(self.stress_validate, it)
       self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore[arg-type]
       self.record_video(it)
       self.close_video_env()
@@ -453,16 +473,23 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
 
   def validate(self, it: int) -> dict[str, float]:
     """One validation per ``validation.inference`` mode, each logged under its
-    prefix; returns every metric, prefixed."""
+    prefix and seeded alike (``validation.seed``); returns every metric, prefixed."""
+    seed = int(self.validation_cfg.get("seed", 0))
+    device = torch.device(self.env.unwrapped.device)
+    cuda = [device.index or 0] if device.type == "cuda" else []
     if self._validation_env is None:
-      self._validation_env = self._make_validation_env()
+      with torch.random.fork_rng(devices=cuda):
+        torch.manual_seed(seed)
+        self._validation_env = self._make_validation_env()
     vec = self._validation_env
     summary = ("early_termination_rate", "mean_episode_length", "clf_V_norm")
     summary += ("err_site_abs", "twist_err_vx", "twist_reward")
     results: dict[str, float] = {}
     modes = inference_modes(self.validation_cfg.get("inference"), ("mean",))
     for mode in modes:
-      metrics = self._validation_run(vec, mode)
+      with torch.random.fork_rng(devices=cuda):
+        torch.manual_seed(seed)
+        metrics = self._validation_run(vec, mode)
       results.update(
         self._write_metrics(VALIDATION_PREFIXES[mode], metrics, it, summary)
       )

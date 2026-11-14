@@ -158,7 +158,7 @@ class _FsmEnv(_FakeEnv):
     self,
     num_envs: int = NUM_ENVS,
     seed: int = 0,
-    touch_sites: TouchSites = "heel_extended",
+    touch_sites: TouchSites = "feet_extended",
     fsm: OslFsmCfg | None = None,
     controller: str = "fsm",
   ) -> None:
@@ -240,7 +240,7 @@ def _quick_cfg(warm_start: Path | None) -> dict[str, Any]:
 def _bare_runner(
   fsm: OslFsmCfg | None = None,
   controller: str = "fsm",
-  touch_sites: TouchSites = "heel_extended",
+  touch_sites: TouchSites = "feet_extended",
 ) -> _FsmRunner:
   """A runner without a warm start (it saves, loads and plays, but cannot train
   from scratch) on an env whose controller has ``fsm``'s settings."""
@@ -567,16 +567,17 @@ def test_runner_trains_validates_saves_and_resumes(
   for tag in ("Train/mean_reward", "Train/human/mean_reward", "Policy/std/muscles"):
     assert set(logged[tag]) == set(steps), tag
   # Validation and stress validation at zero-shot (the stage-1 human beside the
-  # controller) and at k = 1, the controller's diagnostics among them.
+  # controller), at k = 1 and at the final k = 2 (off the interval-2 grid), the
+  # controller's diagnostics among them.
   for tag in (
     "Validation/mean_episode_return_human",
     "Validation/early_termination_rate/fwd_tight_left",
     "Stress/survival_rate",
     *diagnostics,
   ):
-    assert set(logged[tag]) == {steps[0], steps[1]}, tag
+    assert set(logged[tag]) == set(steps), tag
   for prefix in ("Validation", "Stress"):
-    for step in (steps[0], steps[1]):
+    for step in steps:
       shares = [logged[f"{prefix}/{name}"][step] for name in STATE_SHARES]
       assert all(0.0 <= share <= 1.0 for share in shares), (prefix, shares)
       assert sum(shares) == pytest.approx(1.0, abs=1e-5)  # One state per step.
@@ -614,7 +615,7 @@ def test_runner_trains_validates_saves_and_resumes(
   assert (
     saved["infos"][FSM_INFO_KEY] == fsm_settings(env) == recorded_fsm_settings(saved)
   )
-  assert saved["osl_touch_sites"] == "heel_extended"
+  assert saved["osl_touch_sites"] == "feet_extended"
 
   # A resumed run (train.py: construct without a warm start, then load) continues
   # after the checkpoint on its schedule.
@@ -715,7 +716,7 @@ def test_checkpoints_record_and_require_their_controller(
     80.0,
     "e_stance",
   )
-  assert cfg.osl_touch_sites == "heel_extended"  # Stage 2's step ran too.
+  assert cfg.osl_touch_sites == "feet_extended"  # Stage 2's step ran too.
   played = _bare_runner(cfg.osl_fsm)
   played.load(str(path), load_cfg={"actor": True}, strict=True, map_location="cpu")
   resumed = _bare_runner(SDK)

@@ -9,7 +9,7 @@ CLF reward, the training terminations and no randomization. The changes:
 * the commanded twist and the stride clock join the observation (actor and critic);
 * a stride-averaged twist reward (``mdp.stride_twist``) joins the imitation reward;
 * clips loop, so the trajectory-end termination is gone and episodes last 10 s, as
-  in sesteban's G1 tasks.
+  in sesteban's G1 tasks (validation's 20 s, osl_deploy's run length).
 
 Two variants:
 
@@ -49,6 +49,9 @@ UNICYCLE_LIBRARY_ENV_VAR = "MJLAB_OSL_UNICYCLE_LIBRARY"
 """Default unicycle library folder, likewise."""
 
 EPISODE_LENGTH_S = 10.0
+VALIDATION_EPISODE_LENGTH_S = 20.0
+"""Validation's episode (stages 1, 1.5 and 2), osl_deploy's run length: half of the
+stage-2 deploy failures came after 10 s, which a 10 s validation never reached."""
 REL_STATIC_ENVS = 0.15
 """sesteban's G1 unicycle stand fraction."""
 
@@ -130,10 +133,10 @@ def osl_gait_library_env_cfg(
     socket: ``"rigid"`` or ``"compliant"``. Library clips are rigid; the compliant
       socket's joints are held at zero in the reference.
     reward: ``"mimic"`` (MimicReward) or ``"clf"`` (CLFReward).
-    mode: ``"train"`` samples twists and random phases; ``"validation"`` plays every
-      clip from phase 0 at its own twist (one env per clip, set by the runner) and
-      ends episodes only on the 0.5 m site check; ``"play"`` samples like training,
-      with endless episodes.
+    mode: ``"train"`` samples twists and random phases, in 10 s episodes;
+      ``"validation"`` plays every clip from phase 0 at its own twist (one env per
+      clip, set by the runner) in 20 s episodes, ending them early only on the 0.5 m
+      site check; ``"play"`` samples like training, with endless episodes.
     variant: ``"walk_fwd"`` (forward library, no randomization) or ``"unicycle"``
       (full library, randomization).
     dr_cfg: Randomization ranges of the unicycle variant (default ``OslDrCfg()``).
@@ -186,5 +189,10 @@ def osl_gait_library_env_cfg(
   if variant == "unicycle":
     apply_osl_dr(cfg, model, socket, mode, dr_cfg)
 
-  cfg.episode_length_s = EPISODE_LENGTH_S if mode != "play" else 1.0e9
+  if mode == "play":
+    cfg.episode_length_s = 1.0e9
+  elif validation:
+    cfg.episode_length_s = VALIDATION_EPISODE_LENGTH_S
+  else:
+    cfg.episode_length_s = EPISODE_LENGTH_S
   return cfg

@@ -44,7 +44,9 @@ wherever one agent did not become two:
   is the task's validation config with the training run's settings (simulation,
   observation groups, every shared reward term's weight and params) and the
   training OSL observation read exactly, at the middle of its training lag. Per
-  clip family it also reports the left and right tight arcs and pivots.
+  clip family (stage 1's, its ``slow`` group included) it also reports the left
+  and right tight arcs and pivots. Episodes last 20 s (stage 1's validation
+  config), and every family is seeded alike by ``validation.seed``.
 * **Stress validation** (every ``stress_interval`` stage-local iterations, and at
   zero-shot with the teacher alone) plays a copy of the training config, the OSL
   sensor noise and every randomization included, seeded by
@@ -52,6 +54,9 @@ wherever one agent did not become two:
   reports each env's first episode: ``Stress/`` (both means), the deployment proxy
   for the OSL actor, and ``StressOslSampled/`` (the OSL actor sampled), whose gap to
   it shows an OSL actor relying on its own noise.
+* **The final checkpoint** is evaluated: a launch whose last stage-local iteration
+  is off the validation (or stress) interval grid runs that evaluation once more
+  there, before the final save, as stage 1 does.
 * **Guards.** Every evaluation (validation, stress, video) is guarded: a failure,
   such as running out of GPU memory, prints a warning, its memory is released and
   training goes on. Their wall times are logged (``Perf/<evaluation>_time``), as is
@@ -98,7 +103,11 @@ from mjlab.tasks.osl_gait_library.config.dr import nominal_plant
 from mjlab.tasks.osl_gait_library.mdp import TIGHT_ARC_WZ, GaitLibraryCommandCfg
 from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
 from mjlab.tasks.osl_mimic.rl.expected import auto_inference
-from mjlab.tasks.osl_mimic.rl.runner import EvalPurpose, eval_mode
+from mjlab.tasks.osl_mimic.rl.runner import (
+  EvalPurpose,
+  eval_mode,
+  final_evaluation_due,
+)
 from mjlab.tasks.osl_mimic.touch_sites import (
   CHECKPOINT_KEY,
   check_checkpoint_touch_sites,
@@ -796,9 +805,16 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
 
     if writer is not None:
       if total_it > start_it:  # Never a checkpoint of an iteration that did not run.
-        path = f"model_{self.current_learning_iteration}.pt"
-        self.save(os.path.join(log_dir, path))
-        self._evaluate("video", self.record_video, self.current_learning_iteration)
+        last = self.current_learning_iteration
+        # The final checkpoint is the deployed one: evaluate it unless the interval
+        # just did (a 500-iteration run ends at k = 499, off a 60-iteration grid).
+        k_start, k_end = start_it - self.stage_start, total_it - self.stage_start
+        if final_evaluation_due(k_start, k_end, interval):
+          self._evaluate("validation", self.validate, last)
+        if final_evaluation_due(k_start, k_end, stress_interval):
+          self._evaluate("stress", self.stress_validate, last)
+        self.save(os.path.join(log_dir, f"model_{last}.pt"))
+        self._evaluate("video", self.record_video, last)
       # Again after the last save and video: the first periodic one comes only at
       # k = save_interval, so a short run's in-loop values never include the video
       # env and its renderer.
@@ -994,11 +1010,13 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     or at zero-shot ``validation.zero_shot_inference`` plus the teacher's. Returns
     every metric under its family's prefix (``Validation/...``,
     ``ValidationExpected/...``, ``ValidationOslSampled/...``,
-    ``ValidationTeacher/...``, ``ValidationTeacherExpected/...``). The OSL-sampled
-    family is seeded (``validation.seed``); training's random state is left
-    untouched."""
+    ``ValidationTeacher/...``, ``ValidationTeacherExpected/...``). Every family, and
+    the validation env's build, is seeded alike (``validation.seed``); training's
+    random state is left untouched."""
+    seed = int(self.validation_cfg.get("seed", 0))
     if self._validation_env is None:
-      self._validation_env = self._make_validation_env()
+      with _seeded(seed, self.env.unwrapped.device):
+        self._validation_env = self._make_validation_env()
       self._validation_rewards = None
     if self._validation_rewards is None:
       self._validation_rewards = AgentRewards(
@@ -1008,12 +1026,10 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     env = vec.unwrapped
     k = max(it - self.stage_start, 0)
     rewards.term.set_group_weights(self.channel_schedule.weights(k))
-    seed = int(self.validation_cfg.get("seed", 0))
     results: dict[str, float] = {}
     for family in self._families("validation", zero_shot):
       policy = self._policy(family, env)
-      sampled = policy.osl_mode == "sampled"
-      with _seeded(seed if sampled else None, self.device, env.device):
+      with _seeded(seed, self.device, env.device):
         metrics = self._validation_pass(vec, policy, rewards)
       prefix = "Validation" + _suffix(family)
       results.update(self._write_family(prefix, metrics, it, k, VALIDATION_SUMMARY))

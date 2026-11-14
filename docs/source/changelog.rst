@@ -237,6 +237,32 @@ Changed
   in a run built with other zones, or warm-starting stage 2 from one, is refused
   with the flag that fixes it; play, evaluation and export build the checkpoint's
   own zones.
+- Every OSL task's intact foot now senses quiet stance: a third touch-site version,
+  ``feet_extended`` (the new default), keeps ``heel_extended``'s ``r_foot`` zone and
+  lowers the bottom faces of the left ``l_foot`` and ``l_toes`` zones 8 mm, to 8 mm
+  below the left foot's colliders, the clearance the OSL zones already have. The
+  XML's left zones ended exactly at the colliders' lowest points, so a lightly
+  loaded foot resting in the 1 mm contact margin was missed: in quiet stance they
+  caught about half of the intact foot's floor force. ``heel_extended`` stays a
+  valid value, and checkpoints, warm starts and bundles made with it keep it
+  (resuming one under the new default is refused, naming ``--env.osl-touch-sites
+  heel_extended``). A bundle's ``touch_sites.edited_from_xml`` lists every site whose
+  box differs from the XML's. Runs on ``feet_extended`` see a new touch-input
+  distribution and are not comparable with earlier runs at matched iterations.
+- In-training validation of the OSL gait-library tasks (stage 1, and the split and
+  FSM tasks of stages 2 and 1.5) measures what the osl_deploy panel measures.
+  Episodes last 20 s, osl_deploy's run length, instead of 10 s (2000 steps;
+  training episodes stay 10 s). A ``slow`` group (forward clips up to 0.6 m/s with
+  a yaw rate of at most 0.5 rad/s, the deploy panel's slow band) is reported beside
+  the clip families. Every pass and the validation env's build are seeded
+  (``--agent.validation.seed``, default 0) without touching training's random
+  state; on the GPU, mujoco_warp is not deterministic, so passes can still differ
+  slightly. A launch whose last iteration is off the validation or stress interval
+  grid now evaluates once more there, before its final save, in every task of the
+  ``osl_mimic`` runner family. ``python -m mjlab.tasks.osl_gait_library.evaluate``
+  follows (``--validation-steps`` defaults to the task's, ``--validation-seed``).
+  Validation numbers of earlier runs (10 s) are not comparable with later ones, and
+  a validation pass takes about twice as long.
 
 - Bumped ``rsl-rl-lib`` from 5.5.0 to 5.5.1. This removes the need for capping
   ``wandb`` below 0.29.

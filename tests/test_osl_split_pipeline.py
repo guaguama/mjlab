@@ -638,7 +638,7 @@ def test_commands(tmp_path: Path, library: Path) -> None:
   assert two_stage.stage2_command(cfg, out, "mimic", "py") == stage2
   # Stage 1's touch sites, when known, go before the extra arguments, which come
   # last (and so win).
-  for touch in ("original", "heel_extended"):
+  for touch in ("original", "heel_extended", "feet_extended"):
     assert two_stage.stage2_command(cfg, out, "mimic", "py", touch_sites=touch) == [
       *stage2[:-2],
       "--env.osl-touch-sites",
@@ -697,7 +697,7 @@ def test_train_cli_accepts_the_commands(tmp_path: Path, library: Path) -> None:
   assert agent.run_name == "p_stage2"
   assert stage2.log_root == str(tmp_path / "logs")
   assert isinstance(stage2.env, mimic_touch_sites.OslEnvCfg)
-  assert stage2.env.osl_touch_sites == "heel_extended"  # Not forwarded: the default.
+  assert stage2.env.osl_touch_sites == "feet_extended"  # Not forwarded: the default.
 
   # The touch-site flag the driver forwards reaches the env and its robot entity.
   forwarded = two_stage.stage2_command(cfg, out, "clf", touch_sites="original")
@@ -769,7 +769,7 @@ def test_parse_run_dir_reads_trains_announcement() -> None:
 def test_warm_start_touch_sites_reads_the_splits_lineage(tmp_path: Path) -> None:
   """Stage 1's OSL touch sites, from the lineage YAML ``WarmStart.save`` writes
   beside the warm start, read without a YAML parser: what mjlab reads too."""
-  for value in ("original", "heel_extended", None):
+  for value in ("original", "heel_extended", "feet_extended", None):
     path = tmp_path / str(value) / "ws.pt"
     save_warm_start(path, split_lineage(value))
     read = two_stage.warm_start_touch_sites(path)
@@ -978,7 +978,7 @@ def test_pipeline_runs_the_steps_in_order(
   )
 
 
-@pytest.mark.parametrize("touch_sites", ["original", "heel_extended"])
+@pytest.mark.parametrize("touch_sites", ["original", "heel_extended", "feet_extended"])
 def test_stage2_builds_the_touch_sites_stage1_trained_with(
   tmp_path: Path, library: Path, monkeypatch: pytest.MonkeyPatch, touch_sites: str
 ) -> None:

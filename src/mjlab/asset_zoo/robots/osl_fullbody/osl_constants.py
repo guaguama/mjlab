@@ -17,10 +17,12 @@ Four variants are vendored, selected by ``model`` and ``socket``:
 * ``socket="compliant"`` adds the four socket DoFs (``socket_piston``,
   ``socket_rotation_1..3``) between the residual femur and the prosthesis.
 
-The OSL foot's ``r_foot`` touch zone comes in two versions (:data:`TouchSites`):
-the XML's ``"original"``, which misses the heel and never fires, and
-``"heel_extended"``, which covers it and is the default since 2026-11-13
-(:data:`R_FOOT_TOUCH_BOXES`). Runs record which one they trained with.
+The foot touch zones come in three versions (:data:`TouchSites`,
+:data:`TOUCH_SITE_BOXES`): the XML's ``"original"``, whose OSL ``r_foot`` zone misses
+the heel and never fires; ``"heel_extended"`` (2026-11-13), which extends that zone
+over the heel; and ``"feet_extended"``, the default since the evening of 2026-11-13,
+which also lowers the intact foot's two zones 8 mm so that they catch quiet stance.
+Runs record which one they trained with.
 
 In every variant 44 of the non-free joints are driven by ``mjEQ_JOINT`` equality
 constraints. The vendored ``xmls/{body,meshes,scene}`` tree is a **byte-identical**
@@ -55,8 +57,8 @@ from mjlab.utils.spec_config import CollisionCfg
 Model = Literal["robot", "msk"]
 Socket = Literal["rigid", "compliant"]
 Collision = Literal["mjlab", "xml"]
-TouchSites = Literal["original", "heel_extended"]
-"""The OSL foot's touch-sensor zones (see :data:`R_FOOT_TOUCH_BOXES`)."""
+TouchSites = Literal["original", "heel_extended", "feet_extended"]
+"""The foot touch-sensor zones (see :data:`TOUCH_SITE_BOXES`)."""
 
 MODEL_TAGS: dict[Model, str] = {"robot": "-ROBOT", "msk": "-MSK"}
 """Each model's tag in the OSL task ids, right after ``OSL-Fullbody``."""
@@ -156,7 +158,7 @@ TOUCH_SITE_SENSORS: dict[str, str] = {
 }
 
 TOUCH_SITES: tuple[TouchSites, ...] = get_args(TouchSites)
-DEFAULT_TOUCH_SITES: TouchSites = "heel_extended"
+DEFAULT_TOUCH_SITES: TouchSites = "feet_extended"
 """What a newly configured OSL entity or task builds."""
 LEGACY_TOUCH_SITES: TouchSites = "original"
 """What a run, checkpoint or bundle that records no touch-site version was trained
@@ -171,24 +173,67 @@ class TouchBox:
   size: tuple[float, float, float]
 
 
-R_FOOT_TOUCH_BOXES: dict[TouchSites, TouchBox] = {
-  "original": TouchBox(pos=(0.025, -0.04, 0.0), size=(0.05, 0.03, 0.05)),
-  "heel_extended": TouchBox(pos=(0.01, -0.04, 0.0), size=(0.065, 0.03, 0.05)),
-}
-"""The OSL foot's ``r_foot`` zone per version, in the foot frame
-(``OSL_KA_L1_osl_foot_assembly``: x forward, y up, z lateral).
+_XML_R_FOOT_BOX = TouchBox(pos=(0.025, -0.04, 0.0), size=(0.05, 0.03, 0.05))
+_HEEL_R_FOOT_BOX = TouchBox(pos=(0.01, -0.04, 0.0), size=(0.065, 0.03, 0.05))
+_XML_L_FOOT_BOX = TouchBox(pos=(0.09, -0.01, 0.0), size=(0.1, 0.01, 0.055))
+_LOW_L_FOOT_BOX = TouchBox(pos=(0.09, -0.014, 0.0), size=(0.1, 0.014, 0.055))
+_XML_L_TOES_BOX = TouchBox(pos=(0.0275, -0.01, 0.0), size=(0.04, 0.01, 0.0675))
+_LOW_L_TOES_BOX = TouchBox(pos=(0.0275, -0.014, 0.0), size=(0.04, 0.014, 0.0675))
 
-The OSL foot collides only through its three capsules (the shell mesh is out of
-collision, :func:`_fix_osl_contacts`), and a capsule meets the floor only at its end
-caps: heel contacts at foot x = -0.035..-0.029, toe contacts at x = 0.182..0.200.
-``original`` is the model XML's box, x = -0.025..0.075, unchanged since the upstream
-Open Source Leg model (assist_sim): it ends 5 mm short of the heel, so ``r_foot``
-never fires although the heel carries about 73% of the OSL foot's normal force
-(``r_toes`` catches the rest). ``heel_extended`` moves only its back edge, to
-x = -0.055: every heel-cap point lies inside with at least 1.3 cm to spare, whatever
-the foot's pitch, and ``r_foot`` and ``r_toes`` together catch the whole load without
-counting any contact twice. The height, the width and the front edge are unchanged.
-Sites neither collide nor carry mass, so only the ``r_foot`` reading differs."""
+TOUCH_SITE_BOXES: dict[TouchSites, dict[str, TouchBox]] = {
+  "original": {
+    R_FOOT_TOUCH_SITE: _XML_R_FOOT_BOX,
+    L_FOOT_TOUCH_SITE: _XML_L_FOOT_BOX,
+    L_TOES_TOUCH_SITE: _XML_L_TOES_BOX,
+  },
+  "heel_extended": {
+    R_FOOT_TOUCH_SITE: _HEEL_R_FOOT_BOX,
+    L_FOOT_TOUCH_SITE: _XML_L_FOOT_BOX,
+    L_TOES_TOUCH_SITE: _XML_L_TOES_BOX,
+  },
+  "feet_extended": {
+    R_FOOT_TOUCH_SITE: _HEEL_R_FOOT_BOX,
+    L_FOOT_TOUCH_SITE: _LOW_L_FOOT_BOX,
+    L_TOES_TOUCH_SITE: _LOW_L_TOES_BOX,
+  },
+}
+"""Each version's box for every touch site some version edits, in the site's body
+frame (site pos and half-sizes). ``original`` is the model XML's, unchanged since the
+upstream models; ``r_toes`` is the XML's in every version, so it is not listed.
+
+* ``r_foot`` (body ``OSL_KA_L1_osl_foot_assembly``: x forward, y up, z lateral). The
+  OSL foot collides only through its three capsules (the shell mesh is out of
+  collision, :func:`_fix_osl_contacts`), and a capsule meets the floor only at its
+  end caps: heel contacts at foot x = -0.035..-0.029, toe contacts at
+  x = 0.182..0.200. The XML's box, x = -0.025..0.075, ends 5 mm short of the heel,
+  so ``r_foot`` never fires although the heel carries about 73% of the OSL foot's
+  normal force (``r_toes`` catches the rest). ``heel_extended`` moves only its back
+  edge, to x = -0.055: every heel-cap point lies inside with at least 1.3 cm to
+  spare, whatever the foot's pitch, and ``r_foot`` and ``r_toes`` together catch the
+  whole load without counting any contact twice.
+* ``l_foot`` (body ``calcn_l``) and ``l_toes`` (body ``toes_l``, rotated about its y
+  axis only, so site y is body y). The XML's bottom faces sit at body y = -0.020,
+  exactly at the lowest points of the colliders ``foot_col1_l``, ``foot_col3_l`` and
+  ``bofoot_col2_l``. A lightly loaded foot rests inside the 1 mm contact margin,
+  where MuJoCo puts the contact point midway in the gap, below the box, and the
+  touch ray along the normal points away from it: in quiet stance the two zones
+  caught 49% of the intact foot's floor force. ``feet_extended`` moves only their
+  bottom faces 8 mm down, to y = -0.028, the clearance both OSL boxes already have
+  below the OSL capsules, and keeps ``heel_extended``'s ``r_foot``.
+
+Only the listed rows move: the tops, widths and quats stay. Sites neither collide
+nor carry mass, so only the touch readings differ. A touch sensor counts only
+contacts of its own body's geoms, and the two left zones sit on different bodies,
+so no contact is counted twice."""
+TOUCH_SITE_EDITS: dict[TouchSites, tuple[str, ...]] = {
+  version: tuple(
+    site
+    for site in TOUCH_SITE_SENSORS
+    if site in boxes and boxes[site] != TOUCH_SITE_BOXES["original"][site]
+  )
+  for version, boxes in TOUCH_SITE_BOXES.items()
+}
+"""The touch sites each version edits from the model XML, in sensor order."""
 
 # musclemimic's exact finger lists (``environments/humanoids/osl_fullbody.py``).
 # Exact names, never patterns: the v3 export renamed four right-hand joints (no
@@ -371,40 +416,58 @@ def check_touch_sites(value: object, what: str = "OSL touch sites") -> TouchSite
   return value  # type: ignore[return-value]
 
 
-def apply_touch_sites(spec: mujoco.MjSpec, touch_sites: TouchSites) -> mujoco.MjSpec:
-  """Give the OSL foot's ``r_foot`` zone the box of ``touch_sites``, in place.
+def _site_boxes(site: str) -> dict[TouchBox, set[TouchSites]]:
+  """A listed touch site's known boxes, each with the versions that give it."""
+  boxes: dict[TouchBox, set[TouchSites]] = {}
+  for version, version_boxes in TOUCH_SITE_BOXES.items():
+    boxes.setdefault(version_boxes[site], set()).add(version)
+  return boxes
 
-  Writes only that site's ``pos`` and ``size`` (:data:`R_FOOT_TOUCH_BOXES`); the
-  other three touch sites, every geom and all physics stay as they are. Either
-  version can be applied over the other, so the last call wins. Returns the spec.
+
+def apply_touch_sites(spec: mujoco.MjSpec, touch_sites: TouchSites) -> mujoco.MjSpec:
+  """Give the touch sites the boxes of ``touch_sites``, in place.
+
+  Writes only the ``pos`` and ``size`` of the sites :data:`TOUCH_SITE_BOXES` lists;
+  ``r_toes``, every geom and all physics stay as they are. Any version can be
+  applied over any other, so the last call wins. Returns the spec.
 
   Raises:
-    ValueError: For an unknown version, or a spec whose ``r_foot`` zone is neither
-      box (a regenerated model: compare it with the XML before updating the boxes).
+    ValueError: For an unknown version, or a spec in which a listed site is missing
+      or has none of its known boxes (a regenerated model: compare it with the XML
+      before updating the table). The spec is then left untouched.
   """
-  box = R_FOOT_TOUCH_BOXES[check_touch_sites(touch_sites)]
+  boxes = TOUCH_SITE_BOXES[check_touch_sites(touch_sites)]
   # From the element list, not spec.site(name): once anything has been deleted
   # from a spec, MuJoCo 3.11's name lookup can miss elements until the next compile.
-  sites = [s for s in spec.sites if s.name == R_FOOT_TOUCH_SITE]
-  if len(sites) != 1:
-    raise ValueError(
-      f"Expected one site {R_FOOT_TOUCH_SITE!r}, found {len(sites)}. Was the model "
-      "regenerated?"
+  found: dict[str, list[mujoco.MjsSite]] = {name: [] for name in boxes}
+  for site in spec.sites:
+    if site.name in found:
+      found[site.name].append(site)
+  # Check every site before writing any, so that a refusal edits nothing.
+  for name, sites in found.items():
+    if len(sites) != 1:
+      raise ValueError(
+        f"Expected one site {name!r}, found {len(sites)}. Was the model regenerated?"
+      )
+    site = sites[0]
+    current = TouchBox(
+      pos=tuple(float(v) for v in site.pos),  # type: ignore[arg-type]
+      size=tuple(float(v) for v in site.size),  # type: ignore[arg-type]
     )
-  site = sites[0]
-  current = (tuple(float(v) for v in site.pos), tuple(float(v) for v in site.size))
-  if current not in {(b.pos, b.size) for b in R_FOOT_TOUCH_BOXES.values()}:
-    raise ValueError(
-      f"Site {R_FOOT_TOUCH_SITE!r} has pos {current[0]} and size {current[1]}, "
-      "neither OSL touch-site version's box. Was the model regenerated?"
-    )
-  site.pos = box.pos
-  site.size = box.size
+    if current not in _site_boxes(name):
+      raise ValueError(
+        f"Site {name!r} has pos {current.pos} and size {current.size}, none of "
+        "the OSL touch-site versions' boxes. Was the model regenerated?"
+      )
+  for name, (site,) in found.items():
+    site.pos = np.array(boxes[name].pos)
+    site.size = np.array(boxes[name].size)
   return spec
 
 
 def touch_sites_of_model(model: mujoco.MjModel, prefix: str = "") -> TouchSites | None:
-  """The touch-site version a compiled model carries, read from its ``r_foot`` box.
+  """The touch-site version a compiled model carries, read from the boxes of the
+  sites :data:`TOUCH_SITE_BOXES` lists.
 
   Args:
     model: A compiled model.
@@ -412,24 +475,48 @@ def touch_sites_of_model(model: mujoco.MjModel, prefix: str = "") -> TouchSites 
       for a bare model from :func:`get_spec`.
 
   Returns:
-    The version, or None when the model has no OSL ``r_foot`` touch site.
+    The version, or None when the model has none of those touch sites.
 
   Raises:
-    ValueError: If the site's box is neither version's.
+    ValueError: If only some of the sites exist, a site's box is none of its known
+      ones, or the boxes belong to different versions (``heel_extended``'s
+      ``r_foot`` with ``feet_extended``'s left zones, say).
   """
-  site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, prefix + R_FOOT_TOUCH_SITE)
-  if site < 0:
+  candidates = set(TOUCH_SITES)
+  missing: list[str] = []
+  found: list[str] = []
+  for name in TOUCH_SITE_BOXES[LEGACY_TOUCH_SITES]:
+    site = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, prefix + name)
+    if site < 0:
+      missing.append(prefix + name)
+      continue
+    pos, size = model.site_pos[site], model.site_size[site]
+    versions = next(
+      (
+        versions
+        for box, versions in _site_boxes(name).items()
+        if np.allclose(pos, box.pos, rtol=0.0, atol=1e-12)
+        and np.allclose(size, box.size, rtol=0.0, atol=1e-12)
+      ),
+      None,
+    )
+    if versions is None:
+      raise ValueError(
+        f"Site {prefix + name!r} has pos {pos.tolist()} and size {size.tolist()}, "
+        "none of the OSL touch-site versions' boxes."
+      )
+    found.append(f"{prefix + name} ({' or '.join(sorted(versions))})")
+    candidates &= versions
+  if not found:
     return None
-  pos, size = model.site_pos[site], model.site_size[site]
-  for version, box in R_FOOT_TOUCH_BOXES.items():
-    if np.allclose(pos, box.pos, rtol=0.0, atol=1e-12) and np.allclose(
-      size, box.size, rtol=0.0, atol=1e-12
-    ):
-      return version
-  raise ValueError(
-    f"Site {prefix + R_FOOT_TOUCH_SITE!r} has pos {pos.tolist()} and size "
-    f"{size.tolist()}, neither OSL touch-site version's box."
-  )
+  if missing:
+    raise ValueError(f"The model has some touch sites but not {missing}.")
+  if len(candidates) != 1:
+    raise ValueError(
+      "The touch sites' boxes belong to different versions: " + ", ".join(found)
+    )
+  (version,) = candidates
+  return version
 
 
 def get_spec(
@@ -445,7 +532,7 @@ def get_spec(
     socket: ``"rigid"`` or ``"compliant"``.
     fingers: Keep the musculoskeletal model's 40 finger joints and 62 finger
       muscles. The default deletes them, as musclemimic does. The robot has none.
-    touch_sites: The OSL foot's touch zones (:data:`R_FOOT_TOUCH_BOXES`).
+    touch_sites: The foot touch zones (:data:`TOUCH_SITE_BOXES`).
       ``"original"`` keeps the XML's. An :class:`OslEntityCfg` applies its own
       setting over this one when it builds.
   """
@@ -677,7 +764,7 @@ def _collisions(collision: Collision) -> tuple[CollisionCfg, ...]:
 
 @dataclass
 class OslEntityCfg(EntityCfg):
-  """An OSL full-body entity, which also sets the OSL foot's touch zones.
+  """An OSL full-body entity, which also sets the foot touch zones.
 
   :meth:`build` applies ``touch_sites`` (:func:`apply_touch_sites`) to whatever
   ``spec_fn`` returns, so a task may wrap ``spec_fn`` freely and the entity's setting
@@ -713,7 +800,7 @@ def get_osl_robot_cfg(
     socket: ``"rigid"`` or ``"compliant"``.
     collision: ``"mjlab"`` applies :data:`FULL_COLLISION`; ``"xml"`` keeps the
       model's own contact settings, which is what musclemimic simulates.
-    touch_sites: The OSL foot's touch zones (:data:`R_FOOT_TOUCH_BOXES`).
+    touch_sites: The foot touch zones (:data:`TOUCH_SITE_BOXES`).
   """
   return OslEntityCfg(
     init_state=WALK_START_KEYFRAME,
@@ -739,7 +826,7 @@ def get_osl_msk_cfg(
     socket: ``"rigid"`` or ``"compliant"``.
     collision: See :func:`get_osl_robot_cfg`.
     fingers: Keep the 40 finger joints and 62 finger muscles (default: deleted).
-    touch_sites: The OSL foot's touch zones (:data:`R_FOOT_TOUCH_BOXES`).
+    touch_sites: The foot touch zones (:data:`TOUCH_SITE_BOXES`).
   """
   return OslEntityCfg(
     init_state=WALK_START_KEYFRAME,
