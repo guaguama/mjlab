@@ -309,6 +309,10 @@ Changed
 Fixed
 ^^^^^
 
+- The OSL stairs tasks reset an environment whose physics state turns NaN
+  (``nan_detection`` termination) instead of crashing the run. mujoco_warp's
+  convex collision can return NaN when a fall drives a 2 mm finger ellipsoid
+  wholly inside a stair box; it crashed the first two stairs runs.
 - OSL gait-library deployment bundles get at least 10 Newton and 20 line-search
   solver iterations (``--solver-iterations``, ``--ls-solver-iterations`` to set
   them), recorded in the manifest's ``deployment``. The tasks train at mujoco_warp's
