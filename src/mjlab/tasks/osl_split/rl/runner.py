@@ -450,12 +450,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     self._install_schedule(self.schedule_iterations, reward_switch)
     self._ready = True
 
-    variant = v.get("variant", "unicycle")
-    if ws.lineage.get("variant") != variant:
-      print(
-        f"[WARN] The warm start was trained on the {ws.lineage.get('variant')!r} "
-        f"variant; stage 2 trains on {variant!r}."
-      )
+    self._check_stage1_variant(ws.lineage)
     switch = (
       f", reward switch {ws.lineage['reward']} -> {reward}: fresh critics and "
       "return statistics"
@@ -467,6 +462,17 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
       f"{ws.lineage.get('stage1_checkpoint')} ({model}, {socket}{switch})."
     )
     self._report_provenance(ws.lineage)
+
+  def _check_stage1_variant(self, lineage: Mapping[str, Any]) -> None:
+    """Warn when the warm start was trained on another motion variant than this
+    run's ``validation.variant``. A task whose stage-1 runs record no variant
+    (stairs) checks its own provenance instead."""
+    variant = self.validation_cfg.get("variant", "unicycle")
+    if lineage.get("variant") != variant:
+      print(
+        f"[WARN] The warm start was trained on the {lineage.get('variant')!r} "
+        f"variant; stage 2 trains on {variant!r}."
+      )
 
   def _check_pen_w(self, lineage: Mapping[str, Any], reward_switch: bool) -> None:
     """Refuse a warm start trained with another CLF penalty weight, whose copied

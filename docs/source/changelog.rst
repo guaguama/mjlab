@@ -140,6 +140,16 @@ Added
   the scene as static boxes; it follows the motion file given on the command line.
   Episodes start at the clip's own world pose, without re-centring. Each run keeps
   a copy of its terrain in ``params/terrain.json``.
+- ``Mjlab-Split-Stairs-OSL-Fullbody`` tasks (``-ROBOT``/``-MSK``, ``-CLF``,
+  ``-Compliant``; ``tasks/osl_split_stairs``): stage 2 on the stairs clip. The
+  stairs task goes through the unicycle split stage unchanged, so the OSL actor
+  reads the unicycle stage-2 sensor set and switches, and trains with the unicycle
+  stage-2 runner settings, except that time-outs are not bootstrapped and
+  validation covers one clip from 100 envs, as in stairs stage 1. The
+  musculoskeletal CLF penalty weight defaults to 0, as in unicycle stage 2. The
+  warm start must come from a stairs stage-1 run: other runs are refused, and a
+  different clip or terrain draws a warning. Checkpoints record the clip and
+  terrain. There is no export or deploy path, since osl_deploy has no terrain.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and

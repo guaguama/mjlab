@@ -16,7 +16,7 @@ from __future__ import annotations
 import shutil
 from copy import deepcopy
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.tasks.osl_mimic.rl.runner import (
@@ -30,6 +30,21 @@ TERRAIN_COPY = "terrain.json"
 """The terrain's copy in the run's ``params`` folder."""
 
 
+def copy_terrain(env: Any, logger: Any) -> Path | None:
+  """Copy the terrain JSON that ``env``'s stairs motion command loaded to
+  ``<log_dir>/params/terrain.json``, where ``logger`` writes the run (main process
+  only); returns the copy. Every stairs runner calls it as training starts."""
+  log_dir = logger.log_dir
+  if log_dir is None or logger.disable_logs:
+    return None
+  cmd = env.command_manager.get_term("motion")
+  params = Path(log_dir) / "params"
+  params.mkdir(parents=True, exist_ok=True)
+  return Path(
+    shutil.copyfile(cast(StairsMotionCommand, cmd).terrain_path, params / TERRAIN_COPY)
+  )
+
+
 class OslStairsOnPolicyRunner(OslMimicOnPolicyRunner):
   def learn(
     self, num_learning_iterations: int, init_at_random_ep_len: bool = False
@@ -40,17 +55,7 @@ class OslStairsOnPolicyRunner(OslMimicOnPolicyRunner):
   def save_terrain(self) -> Path | None:
     """Copy the training env's terrain JSON to ``<log_dir>/params/terrain.json``
     (main process only); returns the copy."""
-    log_dir = self.logger.log_dir
-    if log_dir is None or self.logger.disable_logs:
-      return None
-    cmd = self.env.unwrapped.command_manager.get_term("motion")
-    params = Path(log_dir) / "params"
-    params.mkdir(parents=True, exist_ok=True)
-    return Path(
-      shutil.copyfile(
-        cast(StairsMotionCommand, cmd).terrain_path, params / TERRAIN_COPY
-      )
-    )
+    return copy_terrain(self.env.unwrapped, self.logger)
 
   def _eval_env_cfg(self, purpose: EvalPurpose) -> ManagerBasedRlEnvCfg:
     # Local imports: config imports this runner to register the tasks.

@@ -55,9 +55,10 @@ GAIT_LIBRARY = "Mjlab-Gait-Library-Unicycle-OSL-Fullbody-MSK-CLF-Compliant"
 SPLIT = "Mjlab-Split-Unicycle-OSL-Fullbody-MSK-CLF-Compliant"
 FSM = "Mjlab-FSM-Unicycle-OSL-Fullbody-MSK-CLF-Compliant"
 STAIRS = "Mjlab-Stairs-OSL-Fullbody-ROBOT"
+STAIRS_SPLIT = "Mjlab-Split-Stairs-OSL-Fullbody-MSK-CLF-Compliant"
 TRACKING = "Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT"
 # One task per OSL runner class.
-RUNNER_TASKS = [MIMIC, GAIT_LIBRARY, SPLIT, FSM, STAIRS, TRACKING]
+RUNNER_TASKS = [MIMIC, GAIT_LIBRARY, SPLIT, FSM, STAIRS, STAIRS_SPLIT, TRACKING]
 
 R_FOOT = "robot/OSL_KA_L1_r_foot_touch"
 R_TOES = "robot/OSL_KA_L1_r_toes_touch"
@@ -550,7 +551,9 @@ def test_play_builds_what_the_checkpoint_trained_with(
     configure(load_env_cfg(task, play=True), stray)
 
 
-@pytest.mark.parametrize("task", [MIMIC, GAIT_LIBRARY, SPLIT, FSM, STAIRS])
+@pytest.mark.parametrize(
+  "task", [MIMIC, GAIT_LIBRARY, SPLIT, FSM, STAIRS, STAIRS_SPLIT]
+)
 def test_evaluation_envs_build_the_training_touch_sites(task: str) -> None:
   """Validation and video configs are rebuilt from the task and stress copies the
   training one: all three build the training env's zones, as a resumed run on the
