@@ -30,6 +30,8 @@ from dataclasses import dataclass, fields
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs.mdp.terminations import nan_detection
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.tasks.osl_gait_library.config.dr import OslDrCfg, apply_osl_dr
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward, osl_mimic_env_cfg
 from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
@@ -94,4 +96,8 @@ def osl_stairs_env_cfg(
   # reference, with the env origin at the world origin.
   base.scene.env_spacing = 0.0
   apply_osl_dr(base, model, socket, mode, dr_cfg)
+  # mujoco_warp's convex collision can return NaN when a fall drives a finger
+  # ellipsoid (2 mm thick) wholly inside a step, which would crash the whole run.
+  # Reset that env instead: the episode has failed by then anyway.
+  base.terminations["nan_term"] = TerminationTermCfg(func=nan_detection)
   return OslStairsEnvCfg(**{f.name: getattr(base, f.name) for f in fields(base)})

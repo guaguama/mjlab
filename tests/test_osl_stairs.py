@@ -22,6 +22,7 @@ from conftest import get_test_device
 import mjlab
 from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnv
+from mjlab.envs.mdp.terminations import nan_detection
 from mjlab.scene import Scene
 from mjlab.scripts.train import TrainConfig
 from mjlab.tasks.osl_mimic.mdp.commands import _clip_joint_names
@@ -174,6 +175,10 @@ def test_tasks_and_configs() -> None:
       assert cfg.scene.env_spacing == 0.0
       assert ("push_robot" in cfg.events) is not play
       assert "trajectory_end" in cfg.terminations
+  # A NaN physics state resets its env instead of crashing training, in every mode.
+  for mode in ("train", "play", "validation"):
+    term = osl_stairs_env_cfg("msk", "compliant", "clf", mode).terminations["nan_term"]
+    assert term.func is nan_detection and not term.time_out
 
 
 def test_domain_randomization_per_mode() -> None:
