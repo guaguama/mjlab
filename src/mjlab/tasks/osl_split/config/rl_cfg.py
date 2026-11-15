@@ -377,6 +377,11 @@ class SplitValidationCfg(GaitLibraryValidationCfg):
   zero_shot: bool = True
   """Validate (and stress-validate) the split policies once before stage 2's first
   update."""
+  at_resume: bool = False
+  """Validate once before a resumed launch's first update (``--agent.resume``): the
+  ``inference`` families at the checkpoint's own weights, logged at its iteration,
+  so a fine-tune's log holds its baseline. Off, a resumed run validates on the
+  ``interval`` grid (and its last iteration) only."""
   seed: int = 0
   """Seeds torch's generators for the validation env's build and for every
   validation family alike (the ``osl_sampled`` family's OSL action noise included),

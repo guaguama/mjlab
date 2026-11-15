@@ -46,7 +46,11 @@ wherever one agent did not become two:
   training OSL observation read exactly, each bus at the middle of its training
   lag. Per clip family (stage 1's, its ``slow`` group included) it also reports
   the left and right tight arcs and pivots. Episodes last 20 s (stage 1's validation
-  config), and every family is seeded alike by ``validation.seed``.
+  config), and every family is seeded alike by ``validation.seed``. On a motion with
+  a stride period (the gait library), it also reports the gait asymmetry the policy
+  adds, the gait-symmetry penalty on or off (:func:`gait_symmetry_metrics`). A
+  resumed launch can validate once before its first update
+  (``validation.at_resume``).
 * **Stress validation** (every ``stress_interval`` stage-local iterations, and at
   zero-shot with the teacher alone) plays a copy of the training config, the OSL
   sensor noise and every randomization included, seeded by
@@ -90,7 +94,7 @@ from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -118,13 +122,20 @@ from mjlab.tasks.osl_mimic.touch_sites import (
   env_touch_sites,
 )
 from mjlab.tasks.osl_split.config.env_cfgs import (
+  GAIT_SYMMETRY_FIELD,
   REWARD_NAME,
+  GaitSymmetryCfg,
+  add_gait_symmetry_metric,
   osl_split_env_cfg,
+  sync_gait_symmetry,
   sync_osl_group,
 )
 from mjlab.tasks.osl_split.mdp import (
   OSL_OBSERVATION_KEY,
+  SYMMETRY_GROUPS,
+  SYMMETRY_METRIC,
   describe_osl_sensors,
+  gait_symmetry,
   osl_group_from_record,
   osl_observation_entry,
   osl_validation_group,
@@ -190,6 +201,7 @@ VALIDATION_SUMMARY = (
   "split_err_osl_knee",
   "split_leg_contact",
   "twist_err_vx",
+  "gait_symmetry_deg",
 )
 STRESS_SUMMARY = (
   "survival_rate",
@@ -222,11 +234,11 @@ class AgentRewards:
   The split ``mimic`` term returns the stage-1 (team) reward to mjlab and keeps
   each agent's imitation reward in ``channel_rewards``, times the term's weight
   here as the reward manager weighs the team reward. Every other active term
-  (the twist reward) is additive: both agents earn it, times its
-  ``additive_term_weights`` pair ``(human, osl)``, 1 each unless listed. The terms
-  come from the manager's ``_step_reward``, each term's ``value x weight`` for the
-  step, which is what the env's reward adds only without dt scaling; stage 1 runs
-  without it, and a dt-scaled env is refused.
+  (the twist reward, and the gait-symmetry penalty when it is on) is additive: both
+  agents earn it, times its ``additive_term_weights`` pair ``(human, osl)``, 1 each
+  unless listed. The terms come from the manager's ``_step_reward``, each term's
+  ``value x weight`` for the step, which is what the env's reward adds only without
+  dt scaling; stage 1 runs without it, and a dt-scaled env is refused.
 
   Read it after ``env.step()``: the reward state survives the env's auto-resets.
 
@@ -757,6 +769,12 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
           lambda i: self.stress_validate(i, zero_shot=True),
           start_it,
         )
+    # A resumed launch (``validation.at_resume``): its checkpoint's own weights,
+    # logged at the checkpoint's iteration, as the baseline of a fine-tune.
+    at_resume = bool(self.validation_cfg.get("at_resume", False))
+    resumed = start_it > self.stage_start
+    if at_resume and resumed and interval > 0 and writer is not None:
+      self._evaluate("validation", self.validate, start_it - 1)
 
     frozen: tuple[bool, bool] | None = None
     for it in range(start_it, total_it):
@@ -976,6 +994,26 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
       train_osl, osl_validation_lags(train_osl)
     )
     return cfg
+
+  def _inherit_training_settings(self, cfg: ManagerBasedRlEnvCfg) -> None:
+    """Stage 1's (the touch sites, the simulation, the observation groups, every
+    shared reward term's weight and params), after giving ``cfg`` the training
+    env's gait-symmetry penalty (:func:`~..config.env_cfgs.sync_gait_symmetry`):
+    an evaluation's rewards include it whenever training's do."""
+    train = getattr(self.env.unwrapped.cfg, GAIT_SYMMETRY_FIELD, None)
+    if isinstance(train, GaitSymmetryCfg) and hasattr(cfg, GAIT_SYMMETRY_FIELD):
+      setattr(cfg, GAIT_SYMMETRY_FIELD, replace(train))
+      sync_gait_symmetry(cfg)
+    super()._inherit_training_settings(cfg)
+
+  def _make_validation_env(self) -> RslRlVecEnvWrapper:
+    """Stage 1's validation env, plus the gait-symmetry metric where the motion has
+    a stride period (:func:`~..config.env_cfgs.add_gait_symmetry_metric`): a
+    metrics term, which changes no reward."""
+    cfg = self._eval_env_cfg("validation")
+    add_gait_symmetry_metric(cfg)
+    cfg.scene.num_envs = self._validation_num_envs()
+    return self._build_eval_env(cfg)
 
   def _build_eval_env(
     self, cfg: ManagerBasedRlEnvCfg, render: bool = False
@@ -1218,8 +1256,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     rewards: AgentRewards,
   ) -> dict[str, float]:
     """One validation run of ``policy``: stage 1's loop and metrics, plus each
-    agent's completed-episode return (``mean_episode_return_<agent>``) and the
-    peak of :data:`PEAK_KEYS` (``<key>_peak``).
+    agent's completed-episode return (``mean_episode_return_<agent>``), the peak
+    of :data:`PEAK_KEYS` (``<key>_peak``) and, where the env has the gait-symmetry
+    metric, the gait asymmetry (:func:`gait_symmetry_metrics`).
 
     The policy keeps both observation normalizers frozen, so no snapshot is taken.
     """
@@ -1228,6 +1267,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     if num_steps <= 0:
       num_steps = self._default_validation_steps(env)
     terms = self._diagnostic_reward_terms(env, rewards)
+    symmetry = _symmetry_metric(env)
 
     n = env.num_envs
     sums: dict[str, torch.Tensor] = {}
@@ -1235,6 +1275,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     episode_return = torch.zeros(n, device=env.device)
     agent_return = torch.zeros(n, len(AGENTS), device=env.device)
     episode_length = torch.zeros(n, device=env.device)
+    # Per env, each symmetry group's d² summed over the steps it counts, and those.
+    symmetry_squares = torch.zeros(n, len(SYMMETRY_GROUPS), device=env.device)
+    symmetry_steps = torch.zeros(n, device=env.device)
     finished_returns: list[torch.Tensor] = []
     finished_agent_returns: list[torch.Tensor] = []
     finished_lengths: list[torch.Tensor] = []
@@ -1273,6 +1316,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
               name = f"{key}/{group}"
               mean = (per_env * weight).sum() / group_sizes[group]
               sums[name] = sums[name] + mean if name in sums else mean
+        if symmetry is not None:  # The step's, kept through the auto-reset.
+          symmetry_squares += symmetry.group_sq
+          symmetry_steps += symmetry.valid.float()
         episode_return += reward
         agent_return += agent
         episode_length += 1
@@ -1308,6 +1354,10 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
       lengths = torch.cat(group_lengths[group]) if group_lengths[group] else None
       if lengths is not None and lengths.numel():
         metrics[f"mean_episode_length/{group}"] = float(lengths.mean())
+    if symmetry is not None:
+      metrics.update(
+        gait_symmetry_metrics(symmetry_squares, symmetry_steps, groups, num_steps)
+      )
     return metrics
 
   def close(self) -> None:
@@ -1475,6 +1525,61 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
 ##
 # Helpers.
 ##
+
+
+def gait_symmetry_metrics(
+  squares: torch.Tensor,
+  counted: torch.Tensor,
+  groups: Mapping[str, torch.Tensor],
+  num_steps: int,
+) -> dict[str, float]:
+  """A validation pass's gait asymmetry (:mod:`~..mdp.symmetry`), in degrees, over
+  the env-steps where it counts (not on the idle clip, nor in the first half stride
+  of an episode):
+
+  * ``gait_symmetry_<group>_deg``: each group's RMS asymmetry (knee, ankle, hip;
+    the hip's d² is the mean of its three pairs');
+  * ``gait_symmetry_deg``: all of them, ``sqrt(mean s)``;
+  * both per clip family as ``<key>/<family>``, for families with a counted step;
+  * ``gait_symmetry_valid``: the share of the pass's env-steps counted.
+
+  Args:
+    squares: (B, 3) per env, each group's d² summed over the pass.
+    counted: (B,) per env, the steps counted.
+    groups: The families' (B,) env masks.
+    num_steps: The pass's steps.
+  """
+  names = list(SYMMETRY_GROUPS)
+  metrics: dict[str, float] = {}
+
+  def add(mask: torch.Tensor | None, suffix: str) -> None:
+    steps = counted if mask is None else counted[mask]
+    total = float(steps.sum())
+    if total <= 0.0:
+      return
+    mean_square = (squares if mask is None else squares[mask]).sum(0) / total
+    for name, value in zip(names, mean_square.tolist(), strict=True):
+      metrics[f"gait_symmetry_{name}_deg{suffix}"] = math.degrees(math.sqrt(value))
+    combined = float(mean_square.mean())
+    metrics[f"gait_symmetry_deg{suffix}"] = math.degrees(math.sqrt(combined))
+
+  add(None, "")
+  metrics["gait_symmetry_valid"] = float(counted.sum()) / max(
+    counted.numel() * num_steps, 1
+  )
+  for group, mask in groups.items():
+    add(mask, f"/{group}")
+  return metrics
+
+
+def _symmetry_metric(env: Any) -> gait_symmetry | None:
+  """The env's gait-symmetry metrics term (:data:`~..mdp.SYMMETRY_METRIC`, which
+  :meth:`SplitOnPolicyRunner._make_validation_env` adds), or None: a motion
+  without a stride period, or an env without the term."""
+  cfgs = getattr(getattr(env, "metrics_manager", None), "cfg", None)
+  term = cfgs.get(SYMMETRY_METRIC) if isinstance(cfgs, Mapping) else None
+  func = getattr(term, "func", None)
+  return func if isinstance(func, gait_symmetry) else None
 
 
 def _family_names(families: Any) -> tuple[str, ...]:

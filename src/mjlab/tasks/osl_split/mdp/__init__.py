@@ -44,3 +44,10 @@ from .rewards import SPLIT_DIAGNOSTICS as SPLIT_DIAGNOSTICS
 from .rewards import SplitRewardCfg as SplitRewardCfg
 from .rewards import leg_contact_diagnostics as leg_contact_diagnostics
 from .rewards import split_mimic_reward as split_mimic_reward
+from .symmetry import SYMMETRY_DIAGNOSTICS as SYMMETRY_DIAGNOSTICS
+from .symmetry import SYMMETRY_GROUPS as SYMMETRY_GROUPS
+from .symmetry import SYMMETRY_METRIC as SYMMETRY_METRIC
+from .symmetry import SYMMETRY_PAIRS as SYMMETRY_PAIRS
+from .symmetry import SYMMETRY_SIGMA as SYMMETRY_SIGMA
+from .symmetry import gait_symmetry as gait_symmetry
+from .symmetry import stride_periods as stride_periods

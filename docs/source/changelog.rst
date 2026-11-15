@@ -161,6 +161,19 @@ Added
   observation that mjlab's own terms build at a set of reference frames (the last
   lookahead span included), and for stage 2 the OSL observation sequence over the
   climb.
+- An opt-in gait-symmetry penalty for the stage-2 split tasks
+  (``--env.gait-symmetry.weight w``, ``--env.gait-symmetry.sigma``, default 0.15
+  rad): each step, both agents earn ``-w (1 - exp(-s / sigma^2))``, where ``s`` is
+  the mean over the knee, the ankle and the hip (flexion, adduction, rotation) of the
+  squared difference between the OSL side's tracking error and the intact side's half
+  a stride earlier. Asymmetry already in the reference does not count; idle clips and
+  the first half stride after a reset or a clip switch are masked. At weight 0, the
+  default, the term is absent. It is refused on the stairs' single clip. Every
+  stage-2 validation on the gait library now reports that asymmetry as an RMS in
+  degrees, overall and per joint group and clip family
+  (``Validation/gait_symmetry_deg``, ``Validation/gait_symmetry_knee_deg/fwd``, ...),
+  with the penalty on or off, and ``--agent.validation.at-resume True`` validates a
+  resumed run's checkpoint once before its first update.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and
