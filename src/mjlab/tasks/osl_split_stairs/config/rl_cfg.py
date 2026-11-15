@@ -12,8 +12,8 @@ The changes, each stairs stage 1's own value (``osl_stairs_runner_cfg``):
   (``num_steps`` 0), so ``ValidationTeacher/`` compares with the stage-1
   checkpoint's own ``Validation/``;
 
-plus the variant ``"stairs"`` (which both exporters refuse: there is no deploy path
-for a terrain), videos of one climb, and the stairs tags.
+plus the variant ``"stairs"`` (the unicycle exporters refuse it; ``export`` here
+writes the stairs bundle), videos of one climb, and the stairs tags.
 """
 
 from __future__ import annotations

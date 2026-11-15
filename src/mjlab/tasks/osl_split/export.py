@@ -454,10 +454,30 @@ def osl_conformance(
     (S, F) each step's undelayed frame (the terms' channels concatenated),
     ``lags`` (n,) and ``obs_lag<L>`` (S, D) for each L, ``clip`` the clip index.
   """
-  rng = np.random.default_rng(seed)
   twists = command.twists.cpu().double().numpy()
   clip = int(np.argmin(np.linalg.norm(twists - np.asarray(CONFORMANCE_TWIST), axis=1)))
   qpos, qvel = reference_states(model, command, joint_names, clip, steps)
+  return osl_conformance_sequence(
+    cfg, model, actions, step_dt, qpos, qvel, {"clip": np.asarray(clip)}, seed
+  )
+
+
+def osl_conformance_sequence(
+  cfg: Any,
+  model: mujoco.MjModel,
+  actions: Mapping[str, BaseAction],
+  step_dt: float,
+  qpos: np.ndarray,
+  qvel: np.ndarray,
+  labels: Mapping[str, np.ndarray],
+  seed: int = 0,
+) -> dict[str, np.ndarray]:
+  """The ``osl`` observation mjlab builds over the consecutive states ``qpos``
+  (S, nq) and ``qvel`` (S, nv), with random muscle activations, controls and
+  previous OSL commands (see :func:`osl_conformance`). ``labels``, where the
+  states come from, join the result after ``lags``."""
+  rng = np.random.default_rng(seed)
+  steps = int(qpos.shape[0])
   act = rng.uniform(0.0, 0.3, (steps, model.na))
   low, high = model.actuator_ctrlrange[:, 0], model.actuator_ctrlrange[:, 1]
   ctrl = rng.uniform(low, high, (steps, model.nu))
@@ -482,7 +502,7 @@ def osl_conformance(
     "ctrl": ctrl,
     "last_action": last_action,
     "lags": np.asarray(lags),
-    "clip": np.asarray(clip),
+    **labels,
   }
   # Lag 0 always runs: its newest frames are the undelayed ones.
   for lag in sorted({0, *lags}):

@@ -149,7 +149,18 @@ Added
   musculoskeletal CLF penalty weight defaults to 0, as in unicycle stage 2. The
   warm start must come from a stairs stage-1 run: other runs are refused, and a
   different clip or terrain draws a warning. Checkpoints record the clip and
-  terrain. There is no export or deploy path, since osl_deploy has no terrain.
+  terrain.
+- Deployment export of stairs checkpoints for osl_deploy:
+  ``python -m mjlab.tasks.osl_stairs.export`` (stage 1) and
+  ``python -m mjlab.tasks.osl_split_stairs.export`` (stage 2) write the gait-library
+  bundles (schema 1, and schema 2 ``osl_split_dual``) with what one clip on its
+  terrain needs: the full-body observation ``osl_mimic_v1`` (no twist or stride
+  clock), the clip as a ``single_clip`` reference in world coordinates, the
+  terrain boxes in ``model.mjb`` and the run's terrain file as ``terrain.json``, the
+  start state and the validation failure rule. ``parity.npz`` adds the full-body
+  observation that mjlab's own terms build at a set of reference frames (the last
+  lookahead span included), and for stage 2 the OSL observation sequence over the
+  climb.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and

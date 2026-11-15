@@ -23,7 +23,7 @@ Everything is shared with those two packages:
 
 ``config`` holds the env config, the runner settings and the task registration
 (``Mjlab-Split-Stairs-OSL-Fullbody{-ROBOT,-MSK}[-CLF][-Compliant]``), ``rl`` the
-runner. There is no export or deploy path: osl_deploy has no terrain, so the stairs
-actors are judged in training (validation, stress validation, videos). The OSL actor
-is still exported as ONNX with every checkpoint.
+runner, ``export`` the two-controller deployment bundle for osl_deploy (the clip,
+its terrain and both actors). The OSL actor is also exported as ONNX with every
+checkpoint.
 """

@@ -376,8 +376,6 @@ def compile_task(
     ValueError: If the run's command cannot be reproduced, the library folder is
       missing or a solver cap is not positive.
   """
-  from mjlab.scene import Scene
-
   command_cfg = cfg.commands["motion"]
   assert isinstance(command_cfg, GaitLibraryCommandCfg)
   saved_motion = saved["commands"]["motion"]
@@ -392,9 +390,27 @@ def compile_task(
       f"No gait library at {folder}. Pass --library <folder of the run's clips>."
     )
   command_cfg.library_dir = str(folder.resolve())
+  solver = deployment_solver(cfg, solver_iterations, ls_solver_iterations)
+  env = cpu_scene_env(cfg)
+  command = command_cfg.build(env)  # type: ignore[arg-type]
+  env.command_manager = SimpleNamespace(get_term=lambda _: command)
+  return env, command, build_actions(cfg, env), solver
 
+
+def deployment_solver(
+  cfg: ManagerBasedRlEnvCfg,
+  solver_iterations: int | None = None,
+  ls_solver_iterations: int | None = None,
+) -> dict[str, Any]:
+  """Raise ``cfg``'s solver caps to the deployment ones, in place: the given caps,
+  else the run's own, at least ``DEPLOY_SOLVER_ITERATIONS`` and
+  ``DEPLOY_LS_ITERATIONS``. Returns both (``training`` and ``deployment``).
+
+  Raises:
+    ValueError: If a cap is not positive.
+  """
   mj = cfg.sim.mujoco
-  solver = {
+  solver: dict[str, Any] = {
     "training": {"iterations": mj.iterations, "ls_iterations": mj.ls_iterations},
   }
   mj.iterations = (
@@ -413,6 +429,14 @@ def compile_task(
     "iterations": mj.iterations,
     "ls_iterations": mj.ls_iterations,
   }
+  return solver
+
+
+def cpu_scene_env(cfg: ManagerBasedRlEnvCfg) -> SimpleNamespace:
+  """The config's scene compiled on CPU for one env, with its simulation options,
+  in the namespace a command or action term reads as its env (``scene``,
+  ``sim.mj_model``, ``device``, ``num_envs``, ``step_dt``, ``cfg``)."""
+  from mjlab.scene import Scene
 
   cfg.scene.num_envs = 1
   scene = Scene(cfg.scene, "cpu")
@@ -427,13 +451,18 @@ def compile_task(
     cfg=cfg,
   )
   env.sim = SimpleNamespace(mj_model=model)
-  command = command_cfg.build(env)  # type: ignore[arg-type]
-  env.command_manager = SimpleNamespace(get_term=lambda _: command)
-  actions = {
+  return env
+
+
+def build_actions(
+  cfg: ManagerBasedRlEnvCfg, env: SimpleNamespace
+) -> dict[str, BaseAction]:
+  """The config's action terms on a CPU env (:func:`cpu_scene_env`), in
+  action-manager order."""
+  return {
     name: cast("BaseAction", action.build(env))  # type: ignore[arg-type]
     for name, action in cfg.actions.items()
   }
-  return env, command, actions, solver
 
 
 def load_actor(checkpoint: str | Path, action_dim: int) -> torch.nn.Module:
