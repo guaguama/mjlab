@@ -1,3 +1,6 @@
+from .observations import AXIAL_COMPONENT as AXIAL_COMPONENT
+from .observations import AXIAL_FIELDS as AXIAL_FIELDS
+from .observations import AXIAL_SWITCHES as AXIAL_SWITCHES
 from .observations import LEGACY_OSL_SENSORS as LEGACY_OSL_SENSORS
 from .observations import OSL_BUS_TERMS as OSL_BUS_TERMS
 from .observations import OSL_OBS_GROUP as OSL_OBS_GROUP
@@ -9,9 +12,11 @@ from .observations import SWITCH_FIELDS as SWITCH_FIELDS
 from .observations import OslObsCfg as OslObsCfg
 from .observations import OslSensorSwitches as OslSensorSwitches
 from .observations import OslTermLayout as OslTermLayout
+from .observations import check_axial_switches as check_axial_switches
 from .observations import contact_sensor_names as contact_sensor_names
 from .observations import describe_osl_sensors as describe_osl_sensors
 from .observations import legacy_osl_record as legacy_osl_record
+from .observations import load_cell_channels as load_cell_channels
 from .observations import load_cell_sensor_names as load_cell_sensor_names
 from .observations import osl_actpack as osl_actpack
 from .observations import osl_actpack_dim as osl_actpack_dim
@@ -36,6 +41,7 @@ from .observations import osl_switch as osl_switch
 from .observations import osl_validation_group as osl_validation_group
 from .observations import osl_validation_lags as osl_validation_lags
 from .observations import term_channels as term_channels
+from .observations import term_components as term_components
 from .rewards import CHANNELS as CHANNELS
 from .rewards import GROUPS as GROUPS
 from .rewards import SPLIT_CLF_DIAGNOSTICS as SPLIT_CLF_DIAGNOSTICS

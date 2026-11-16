@@ -292,8 +292,7 @@ def _readme(manifest: dict[str, Any]) -> str:
     f"(validation {b['validation_steps']})"
     for name, b in buses.items()
   )
-  sensor_set = osl["observation"].get("sensor_set") or {}
-  sensors = ", ".join(split.SENSOR_NAMES[k] for k, on in sensor_set.items() if on)
+  sensors = split.sensor_names(osl["observation"].get("sensor_set") or {})
   stage1 = lineage.get("stage1_checkpoint")
   return f"""# {run["task"]}: {run["run"]} / {run["checkpoint"]}
 

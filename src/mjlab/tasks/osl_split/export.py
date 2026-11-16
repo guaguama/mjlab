@@ -46,9 +46,12 @@ decimation, the human's observation, actions, actuator delays). Its ``osl`` grou
 checkpoint's ``osl_observation`` key, else its env.yaml
 (:func:`~.rl.osl_observation.run_osl_observation`), so runs of any sensor set
 export as trained: two cells (R2), the socket cell alone (s2_D), 50 frames (s2_B,
-s2_E), or the real leg's ankle cell and foot contacts (the default since
-2026-11-14). The manifest's ``controllers.osl.observation.sensor_set`` summarizes
-the set (informational: a consumer builds from ``term_layout``).
+s2_E), the real leg's ankle cell and foot contacts (the default since
+2026-11-14), or a cell's axial force alone (its ``term_layout`` entry lists the
+cell's force sensor alone, with ``components`` ``{sensor: [1]}``). The manifest's
+``controllers.osl.observation.sensor_set`` summarizes the set (informational: a
+consumer builds from ``term_layout``); its ``*_load_cell_axial`` keys appear only
+for a set with an axial cell, and a set without them reads six axes per cell.
 """
 
 from __future__ import annotations
@@ -141,7 +144,8 @@ SENSOR_NAMES = {
   "heel_contact": "heel contact",
   "toe_contact": "toe contact",
 }
-"""The README's names for the manifest's ``sensor_set`` keys."""
+"""The README's names for the manifest's ``sensor_set`` keys (an axial cell's
+``<cell>_axial`` key marks its name, :func:`sensor_names`)."""
 CONFORMANCE_STEPS = 40
 CONFORMANCE_TWIST = (1.0, 0.0, 0.5)
 """The conformance sequence plays the clip nearest this (vx, vy, wz): a turning
@@ -703,6 +707,16 @@ def check_coverage(model: mujoco.MjModel, sections: Mapping[str, Any]) -> None:
 ##
 
 
+def sensor_names(sensor_set: Mapping[str, bool]) -> str:
+  """The README's list of the sensors a manifest ``sensor_set`` turns on, a load
+  cell that reads its axial force alone marked as such."""
+  return ", ".join(
+    SENSOR_NAMES[key] + (" (axial force)" if sensor_set.get(f"{key}_axial") else "")
+    for key, on in sensor_set.items()
+    if on and key in SENSOR_NAMES
+  )
+
+
 def _readme(manifest: dict[str, Any]) -> str:
   run, human, osl = (
     manifest["run"],
@@ -728,8 +742,7 @@ def _readme(manifest: dict[str, Any]) -> str:
     f"(validation {b['validation_steps']})"
     for name, b in buses.items()
   )
-  sensor_set = osl["observation"].get("sensor_set") or {}
-  sensors = ", ".join(SENSOR_NAMES[k] for k, on in sensor_set.items() if on)
+  sensors = sensor_names(osl["observation"].get("sensor_set") or {})
   stage1 = lineage.get("stage1_checkpoint")
   return f"""# {run["task"]}: {run["run"]} / {run["checkpoint"]}
 

@@ -174,6 +174,16 @@ Added
   (``Validation/gait_symmetry_deg``, ``Validation/gait_symmetry_knee_deg/fwd``, ...),
   with the penalty on or off, and ``--agent.validation.at-resume True`` validates a
   resumed run's checkpoint once before its first update.
+- The stage-2 OSL actor can read a load cell's axial force alone, the force along
+  the pylon (the cell's tared force y), one channel instead of six:
+  ``--env.observations.osl.terms.loadcell.params.ankle-axial True`` or
+  ``...socket-axial True`` (``OslObsCfg.ankle_load_cell_axial``,
+  ``socket_load_cell_axial``; the cell must be on). Training adds the force
+  channels' per-episode bias and noise to it. Checkpoint records and bundles carry
+  the switches; a bundle's ``loadcell`` entry then lists the cell's force sensor
+  alone with ``components`` ``{sensor: [1]}``, and its ``sensor_set`` adds
+  ``ankle_load_cell_axial`` and ``socket_load_cell_axial``. Sets without an axial
+  cell, and every older run, record and bundle, rebuild and export as before.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and

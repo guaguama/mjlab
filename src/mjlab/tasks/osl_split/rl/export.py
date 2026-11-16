@@ -5,12 +5,17 @@ prosthesis's own sensors and drives its two motors. A controller on the device h
 to rebuild its input exactly, so every export carries, next to the network:
 
 * ``obs``: the ``osl`` observation's layout, term by term (offset, frame size,
-  history length, the channel of every index and its unit). Terms are concatenated
-  in order, each holding its frames oldest first: index ``offset + t * frame_dim +
-  c`` is channel ``c`` of frame ``t``. The network normalizes its input itself
+  history length, the channel of every index and its unit, the sensors read).
+  Terms are concatenated in order, each holding its frames oldest first: index
+  ``offset + t * frame_dim + c`` is channel ``c`` of frame ``t``. A term's frame is
+  its sensors' readings in order, every component of each, except the sensors its
+  optional ``components`` lists (``{sensor: [component, ...]}``), which contribute
+  those components alone, in that order: a load cell that reads its axial force
+  alone lists its force sensor, ``[1]``. The network normalizes its input itself
   (the frozen running statistics are part of the graph), so it takes raw values;
 * ``sensors``: what each channel reads, where (site or joint), in which frame and
-  unit, and the load cells' tare, which the observation subtracts. The twelve added
+  unit, and the load cells' tare, which the observation subtracts (every component
+  of a sensor read; an axial cell subtracts its force tare's y). The twelve added
   OSL sensors are always listed (``observed`` says which the actor reads); the
   foot's contact sensors, the model's own touch sensors, only when observed;
 * ``action``: how the two outputs become torque: clipped to [-1, 1], times the
@@ -73,6 +78,7 @@ from mjlab.tasks.osl_split.mdp.observations import (
   load_cell_sensor_names,
   osl_noise_std,
   osl_sensor_set,
+  term_components,
 )
 from mjlab.tasks.osl_split.mdp.observations import (
   term_channels as term_channels,
@@ -126,6 +132,9 @@ _BIAS_PARAMS = {
   "contact": ("contact_bias",),
 }
 """The class terms' per-episode error bounds (``mdp.observations``)."""
+_LOAD_CELL_TORQUES = frozenset(
+  spec.name for spec in OSL_SENSOR_SPECS if spec.type == mujoco.mjtSensor.mjSENS_TORQUE
+)
 _OSL_MOTOR_STRENGTH_EVENT = "osl_motor_strength"
 
 
@@ -235,22 +244,26 @@ def _obs_metadata(env: ManagerBasedRlEnv, alg: TwoAgentPPO) -> dict[str, Any]:
         f"OSL observation term {name!r} holds {size} values, not {len(channels)} "
         f"channels x {frames} frames."
       )
-    terms.append(
-      {
-        "name": name,
-        "offset": offset,
-        "dim": size,
-        "frame_dim": len(channels),
-        "history_length": frames,
-        "channels": [channel for channel, _, _ in channels],
-        "units": [unit for _, unit, _ in channels],
-        "sensors": [
-          sensor
-          for sensor in dict.fromkeys(sensor for _, _, sensor in channels)
-          if sensor is not None
-        ],
-      }
-    )
+    entry: dict[str, Any] = {
+      "name": name,
+      "offset": offset,
+      "dim": size,
+      "frame_dim": len(channels),
+      "history_length": frames,
+      "channels": [channel for channel, _, _ in channels],
+      "units": [unit for _, unit, _ in channels],
+      "sensors": [
+        sensor
+        for sensor in dict.fromkeys(sensor for _, _, sensor in channels)
+        if sensor is not None
+      ],
+    }
+    # Only for a term that reads part of a sensor (an axial load cell), so the
+    # entries of every other set keep their keys.
+    components = term_components(name, cfg.params)
+    if components:
+      entry["components"] = components
+    terms.append(entry)
     offset += size
   actor = alg.osl_actor
   if list(actor.obs_groups) != [OSL_OBS_GROUP] or int(actor.obs_dim) != offset:
@@ -320,7 +333,9 @@ def _sensor_metadata(env: ManagerBasedRlEnv, used: set[str]) -> dict[str, Any]:
 
 
 def _load_cell_tare(env: ManagerBasedRlEnv) -> dict[str, list[float]]:
-  """The tare the ``loadcell`` term subtracts, by sensor (empty without it)."""
+  """The tare the ``loadcell`` term subtracts, by sensor read, every component
+  (an axial cell's force sensor too, of which the term keeps the y); empty without
+  the term."""
   manager = env.observation_manager
   if "loadcell" not in manager.active_terms[OSL_OBS_GROUP]:
     return {}
@@ -432,7 +447,7 @@ def _randomization_metadata(env: ManagerBasedRlEnv) -> dict[str, Any]:
     if cfg.params.get("randomize", False):
       entry["per_episode_bias"] = {
         key: float(cfg.params[key])
-        for key in _BIAS_PARAMS.get(name, ())
+        for key in _bias_params(name, cfg.params)
         if key in cfg.params
       }
     observation[name] = entry
@@ -447,6 +462,18 @@ def _randomization_metadata(env: ManagerBasedRlEnv) -> dict[str, Any]:
   if strength is not None:
     out["osl_motor_strength"] = strength
   return out
+
+
+def _bias_params(name: str, params: Mapping[str, Any]) -> tuple[str, ...]:
+  """The per-episode error bounds of a term's channels (:data:`_BIAS_PARAMS`): a
+  load-cell term whose cells all read their axial force alone has no torque
+  channel, so no torque bias."""
+  keys = _BIAS_PARAMS.get(name, ())
+  if name == "loadcell" and _LOAD_CELL_TORQUES.isdisjoint(
+    load_cell_sensor_names(params)
+  ):
+    keys = tuple(key for key in keys if key != "torque_bias")
+  return keys
 
 
 def _osl_actuator_delay_s(env: ManagerBasedRlEnv) -> list[float] | None:

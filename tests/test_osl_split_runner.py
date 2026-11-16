@@ -1285,6 +1285,31 @@ def test_checkpoints_record_and_require_the_osl_sensor_set(
   assert "contact.params.contact_noise 1.0 -> 0.5" in warning
 
 
+def test_axial_checkpoints_record_and_require_their_cells(tmp_path: Path) -> None:
+  """A run whose socket cell reads its axial force alone records it (the loadcell
+  params, the summary's axial keys, the width) and loads only into an env that
+  reads it alike: a six-axis socket cell is another layout either way, and the
+  refusal names the flag that builds the checkpoint's."""
+  ws = _write_warm_start(tmp_path / "ws.pt")
+  axial_obs = replace(SOCKET_OBS, socket_load_cell_axial=True)
+  path = _osl_checkpoint(tmp_path / "model_axial.pt", axial_obs, ws)
+  entry = torch.load(path, weights_only=False)["osl_observation"]
+  assert entry["dim"] == osl_obs_dim(axial_obs) == 2 * 15
+  assert entry["group"]["terms"]["loadcell"]["params"]["socket_axial"] is True
+  assert entry["sensor_set"]["socket_load_cell_axial"]
+  assert not entry["sensor_set"]["ankle_load_cell_axial"]
+  axial_flag = "--env.observations.osl.terms.loadcell.params.socket-axial True"
+  with pytest.raises(ValueError, match=re.escape(axial_flag)):
+    _osl_runner(SOCKET_OBS).load(str(path))
+  six_axis = _osl_checkpoint(tmp_path / "model_six.pt", SOCKET_OBS, ws)
+  with pytest.raises(ValueError, match="socket load cell, heel contact") as error:
+    _osl_runner(axial_obs).load(str(six_axis))
+  assert "socket-axial" not in str(error.value).split("these OSL sensor flags")[1]
+  resumed = _osl_runner(axial_obs)
+  resumed.load(str(path))
+  assert resumed.stage_start == STAGE_START
+
+
 def test_play_builds_the_checkpoint_osl_sensor_set(
   tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

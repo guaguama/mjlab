@@ -52,6 +52,7 @@ from mjlab.tasks.osl_split.config.env_cfgs import (
   osl_split_env_cfg,
   sync_osl_group,
 )
+from mjlab.tasks.osl_split.rl.osl_observation import setting_differences
 from mjlab.utils.buffers import DelayBuffer
 from mjlab.utils.os import dump_yaml
 
@@ -450,6 +451,113 @@ def test_load_cells_subtract_the_tare(scene_model: mujoco.MjModel) -> None:
   torch.testing.assert_close(_changed_rows(term.bias, before), reset)
 
 
+AXIAL_FLAG = "--env.observations.osl.terms.loadcell.params"
+LOADED_CELLS = {  # Each load-cell sensor's reading in stance (N, N m).
+  sensors.ANKLE_FORCE: [12.0, -650.0, 30.0],
+  sensors.ANKLE_LOAD_TORQUE: [1.5, -2.0, 3.0],
+  sensors.SOCKET_FORCE: [-20.0, -780.0, 5.0],
+  sensors.SOCKET_TORQUE: [4.0, -5.0, 6.0],
+}
+
+
+def test_axial_load_cells_read_the_tared_axial_force(
+  scene_model: mujoco.MjModel,
+) -> None:
+  """A cell's axial switch makes it read one channel, its force sensor's tared y
+  (the force along the pylon): exactly the six-axis cell's tared F_y on the same
+  state, in the cell's place. It keeps the force channels' bias bound and noise
+  std, and is refused on a cell that is off, naming the flags."""
+  n = 6
+  env = _fake_env(scene_model, num_envs=n)
+  for name, reading in LOADED_CELLS.items():
+    _set(env, name, reading)
+  six = _load_cells(env, socket=True, randomize=False)(env)
+  ankle = _load_cells(env, socket=False, ankle_axial=True, randomize=False)
+  socket = _load_cells(env, socket=True, socket_axial=True, randomize=False)
+  both = _load_cells(
+    env, socket=True, ankle_axial=True, socket_axial=True, randomize=False
+  )
+  assert torch.equal(ankle(env), six[:, 1:2])
+  assert torch.equal(socket(env), torch.cat([six[:, :6], six[:, 7:8]], dim=-1))
+  assert torch.equal(both(env), six[:, [1, 7]])
+  tare = sensors.static_load_cell_tare(scene_model)
+  expected = LOADED_CELLS[sensors.SOCKET_FORCE][1] - tare[sensors.SOCKET_FORCE][1]
+  torch.testing.assert_close(both(env)[:, 1], torch.full((n,), float(expected)))
+  # The tare covers every component of each sensor read; the torque goes unread.
+  assert ankle.tare.shape == (3,) and both.tare.shape == (6,)
+  full = _load_cells(env, socket=True, randomize=False).tare
+  assert torch.equal(both.tare, torch.cat([full[:3], full[6:9]]))
+  params = {"socket": True, "socket_axial": True}
+  assert mdp.load_cell_sensor_names(params) == [
+    sensors.ANKLE_FORCE,
+    sensors.ANKLE_LOAD_TORQUE,
+    sensors.SOCKET_FORCE,
+  ]
+  both_params = {"socket": True, "ankle_axial": True, "socket_axial": True}
+  assert mdp.load_cell_sensor_names(both_params) == [
+    sensors.ANKLE_FORCE,
+    sensors.SOCKET_FORCE,
+  ]
+  assert mdp.load_cell_channels(params)[-1] == (sensors.SOCKET_FORCE, 1)
+  assert mdp.term_channels("loadcell", params)[-1] == (
+    f"{sensors.SOCKET_FORCE}_y",
+    "N",
+    sensors.SOCKET_FORCE,
+  )
+  assert mdp.term_components("loadcell", params) == {sensors.SOCKET_FORCE: [1]}
+  assert mdp.term_components("loadcell", {"socket": True}) == {}
+
+  for off in (
+    {"socket": False, "socket_axial": True},
+    {"ankle": False, "ankle_axial": True},
+  ):
+    cell = "socket" if "socket_axial" in off else "ankle"
+    message = f"{AXIAL_FLAG}.{cell}-axial True reads the {cell} load cell"
+    with pytest.raises(ValueError, match=re.escape(message)) as error:
+      _load_cells(env, **off)
+    assert f"{AXIAL_FLAG}.{cell} True" in str(error.value)
+
+  # Randomized: the force bound (2 N, not the torque's 0.2 N m), held per episode.
+  torch.manual_seed(8)
+  many = _fake_env(scene_model, num_envs=64)
+  for name, reading in LOADED_CELLS.items():
+    _set(many, name, reading)
+  clean = _load_cells(many, socket=False, ankle_axial=True, randomize=False)
+  term = _load_cells(
+    many,
+    socket=False,
+    ankle_axial=True,
+    randomize=True,
+    force_bias=2.0,
+    torque_bias=0.2,
+    **QUIET_LOADCELL,
+  )
+  assert term.bias.shape == (64, 1)
+  assert bool((term.bias.abs() <= 2.0).all()) and float(term.bias.abs().max()) > 0.2
+  torch.testing.assert_close(term(many), clean(many) + term.bias)
+  before = term.bias.clone()
+  term.reset(torch.tensor([3]))
+  assert _changed_rows(term.bias, before).nonzero().flatten().tolist() == [3]
+
+  # White noise: the force std on the axial channel, the cell's own on the rest.
+  wide = _fake_env(scene_model, num_envs=4096)
+  noisy = _load_cells(
+    wide,
+    socket=True,
+    socket_axial=True,
+    randomize=True,
+    force_bias=0.0,
+    torque_bias=0.0,
+  )
+  stds = LOADCELL_STDS[:6] + (1.0,)
+  assert noisy.noise_std.tolist() == pytest.approx(stds)
+  assert mdp.osl_noise_std("loadcell", params) == stds
+  noise = noisy(wide) - noisy(wide)
+  torch.testing.assert_close(
+    noise.std(dim=0) / math.sqrt(2.0), torch.tensor(stds), rtol=0.1, atol=0.0
+  )
+
+
 def test_terms_add_their_own_white_noise_when_randomized(
   scene_model: mujoco.MjModel,
 ) -> None:
@@ -646,6 +754,132 @@ def test_observation_options() -> None:
     mdp.osl_observation_group(cast(Mode, "eval"))
 
 
+ANKLE_SIX = [
+  f"{s}_{a}" for s in (sensors.ANKLE_FORCE, sensors.ANKLE_LOAD_TORQUE) for a in "xyz"
+]
+SOCKET_SIX = [
+  f"{s}_{a}" for s in (sensors.SOCKET_FORCE, sensors.SOCKET_TORQUE) for a in "xyz"
+]
+AXIAL_SETS: tuple[tuple[dict[str, Any], int, list[str]], ...] = (
+  ({}, 500, ANKLE_SIX),
+  (
+    {
+      "ankle_load_cell": False,
+      "socket_load_cell": True,
+      "socket_load_cell_axial": True,
+    },
+    375,
+    [f"{sensors.SOCKET_FORCE}_y"],
+  ),
+  ({"ankle_load_cell_axial": True}, 375, [f"{sensors.ANKLE_FORCE}_y"]),
+  (
+    {"socket_load_cell": True, "ankle_load_cell_axial": True},
+    525,
+    [f"{sensors.ANKLE_FORCE}_y", *SOCKET_SIX],
+  ),
+  (
+    {
+      "socket_load_cell": True,
+      "ankle_load_cell_axial": True,
+      "socket_load_cell_axial": True,
+      "heel_contact": False,
+      "toe_contact": False,
+    },
+    350,
+    [f"{sensors.ANKLE_FORCE}_y", f"{sensors.SOCKET_FORCE}_y"],
+  ),
+  ({"socket_load_cell": True}, 650, ANKLE_SIX + SOCKET_SIX),
+)
+"""``OslObsCfg`` switches, the OSL input size and the load-cell channels: the
+default (unchanged), the socket cell's axial force with the contacts (the user's
+375-input run), the ankle cell's, a six-axis socket cell with an axial ankle cell,
+both axial without contacts, and both six-axis cells."""
+
+
+@pytest.mark.parametrize("switches, dim, channels", AXIAL_SETS)
+def test_axial_sets(switches: dict[str, Any], dim: int, channels: list[str]) -> None:
+  """An axial cell gives one channel, its force sensor's y, with the force
+  channels' noise std and bias bound; the dims, the layout, the noise stds and the
+  ``sensor_set`` follow the switches (the axial keys only with an axial cell)."""
+  cfg = mdp.OslObsCfg(**switches)
+  group = mdp.osl_observation_group("train", cfg)
+  layout = {t.name: t for t in mdp.osl_obs_layout(group)}
+  assert mdp.osl_obs_dim(cfg) == dim == mdp.osl_layout_dim(tuple(layout.values()))
+  assert mdp.osl_loadcell_dim(cfg) == len(channels)
+  assert list(layout["loadcell"].channels) == channels
+  params = group.terms["loadcell"].params
+  assert params["ankle_axial"] == cfg.ankle_load_cell_axial
+  assert params["socket_axial"] == cfg.socket_load_cell_axial
+  stds = tuple(0.1 if "torque" in c else 1.0 for c in channels)
+  assert mdp.osl_noise_std("loadcell", params) == stds
+  components = {
+    f"osl_{cell}_load_force": [1]
+    for cell in ("ankle", "socket")
+    if switches.get(f"{cell}_load_cell_axial")
+  }
+  assert mdp.term_components("loadcell", params) == components
+  sensor_set = mdp.osl_sensor_set(group)
+  cells = ("ankle_load_cell", "socket_load_cell")
+  axial = tuple(mdp.AXIAL_FIELDS.values())
+  assert axial == tuple(f"{cell}_axial" for cell in cells)
+  for field in cells + (axial if components else ()):
+    assert sensor_set[field] == getattr(cfg, field)
+  if not components:
+    assert not set(axial) & set(sensor_set)
+
+
+def test_axial_switch_needs_its_cell() -> None:
+  """Asking a cell that is off for its axial force is refused, naming the flags:
+  by ``OslObsCfg``, and on the env config however the switch was set (a term
+  param, as the train CLI sets it), even with both cells off (no loadcell term).
+  Old records (no axial switch) read six axes."""
+  refused: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("socket", {"socket_load_cell_axial": True}),
+    (
+      "ankle",
+      {
+        "ankle_load_cell": False,
+        "socket_load_cell": True,
+        "ankle_load_cell_axial": True,
+      },
+    ),
+  )
+  for cell, fields in refused:
+    message = f"{cell}_load_cell_axial reads the {cell} load cell"
+    with pytest.raises(ValueError, match=message) as e:
+      mdp.OslObsCfg(**fields)
+    flags = f"{AXIAL_FLAG}.{cell}-axial True needs {AXIAL_FLAG}.{cell} True"
+    assert flags in str(e.value)
+
+  cfg = osl_split_env_cfg("robot", "rigid", "mimic", "train")
+  for edits in (
+    {"socket_axial": True},
+    {"ankle": False, "ankle_axial": True},
+    {"ankle": False, "socket": False, "socket_axial": True},  # The term drops.
+  ):
+    group = copy.deepcopy(cfg.observations["osl"])
+    group.terms["loadcell"].params.update(edits)
+    with pytest.raises(ValueError, match="axial force, but the") as error:
+      replace(cfg, observations={**cfg.observations, "osl": group})
+    assert f"{AXIAL_FLAG}." in str(error.value)
+    with pytest.raises(ValueError, match="axial force, but the"):
+      mdp.osl_group_from_record(mdp.osl_group_record(group))
+  # A record from before the axial switches: both cells, six axes each.
+  record = mdp.legacy_osl_record()
+  params = record["terms"]["loadcell"]["params"]
+  del params["ankle_axial"], params["socket_axial"]
+  assert mdp.term_channels("loadcell", params) == mdp.term_channels(
+    "loadcell", {"ankle": True, "socket": True}
+  )
+  assert mdp.term_components("loadcell", params) == {}
+  # It loads into today's legacy env with neither a refusal nor a warning: the
+  # axial switches set the layout, which is the same, not a lag or noise.
+  today = mdp.legacy_osl_record()
+  assert mdp.osl_obs_layout(record) == mdp.osl_obs_layout(today)
+  assert setting_differences(record, today) == []
+  assert mdp.osl_sensor_set(record) == mdp.osl_sensor_set(today)
+
+
 def _observe(manager: ObservationManager, env: Any, value: float) -> torch.Tensor:
   """Set every sensor and the OSL command to ``value`` and run one step's
   observation."""
@@ -746,6 +980,18 @@ SWITCH_FLIPS: tuple[tuple[str, str, bool, dict[str, Any], dict[str, Any]], ...] 
   ),
   ("contact", "heel", False, {}, {"heel_contact": False}),
   ("contact", "toe", False, {}, {"toe_contact": False}),
+  ("loadcell", "ankle_axial", True, {}, {"ankle_load_cell_axial": True}),
+  (
+    "loadcell",
+    "socket_axial",
+    True,
+    {"ankle_load_cell": False, "socket_load_cell": True},
+    {
+      "ankle_load_cell": False,
+      "socket_load_cell": True,
+      "socket_load_cell_axial": True,
+    },
+  ),
 )
 """A switch the train CLI can flip on a term's params, the ``OslObsCfg`` fields of
 the group it is flipped on, and those of the group it gives."""
@@ -1084,10 +1330,28 @@ FLAG_SETS: tuple[tuple[str, int, dict[str, Any]], ...] = (
       "toe_contact": False,
     },
   ),
+  (
+    f"{FLAG}.terms.loadcell.params.ankle False "
+    f"{FLAG}.terms.loadcell.params.socket True "
+    f"{FLAG}.terms.loadcell.params.socket-axial True",
+    375,
+    {
+      "ankle_load_cell": False,
+      "socket_load_cell": True,
+      "socket_load_cell_axial": True,
+    },
+  ),
+  (
+    f"{FLAG}.terms.loadcell.params.socket True "
+    f"{FLAG}.terms.loadcell.params.ankle-axial True",
+    525,
+    {"socket_load_cell": True, "ankle_load_cell_axial": True},
+  ),
 )
 """Train flags, the OSL input size they give, and the set's switches: the
 default, R2's two cells, contacts off, two cells plus contacts, a 50-frame
-history, and s2_D's socket cell alone."""
+history, s2_D's socket cell alone, the socket cell's axial force with the contacts
+(the 375-input run) and a six-axis socket cell with an axial ankle cell."""
 
 
 @pytest.mark.parametrize("flags, dim, switches", FLAG_SETS)
@@ -1096,7 +1360,7 @@ def test_sensor_flags_parse_and_round_trip(
 ) -> None:
   """The flags parse as ``train`` parses them, give the set, and the flags
   :func:`~mjlab.tasks.osl_split.mdp.osl_sensor_flags` prints for the parsed group
-  are the same."""
+  are the same. The axial flags parse with underscores too."""
   args = tyro.cli(
     TrainConfig,
     args=flags.split(),
@@ -1105,15 +1369,27 @@ def test_sensor_flags_parse_and_round_trip(
   )
   group = args.env.observations["osl"]
   assert _dim(args.env) == dim
+  fields = {*mdp.SWITCH_FIELDS.values(), *mdp.AXIAL_FIELDS.values()}
   expected = {
     key: value
     for key, value in asdict(mdp.OslObsCfg(**switches)).items()
-    if key in mdp.SWITCH_FIELDS.values()
+    if key in fields
   }
   sensor_set = mdp.osl_sensor_set(group)
-  for (term, switch), field in mdp.SWITCH_FIELDS.items():
-    assert sensor_set[field] == expected[field], (term, switch)
+  for (term, switch), field in {**mdp.SWITCH_FIELDS, **mdp.AXIAL_FIELDS}.items():
+    # The axial keys join the summary only for a set with an axial cell.
+    assert sensor_set.get(field, False) == expected[field], (term, switch)
   assert mdp.osl_sensor_flags(group) == flags
+  if "history-length" not in flags:
+    built = mdp.osl_observation_group("train", mdp.OslObsCfg(**switches))
+    assert group == built
+  underscored = tyro.cli(
+    TrainConfig,
+    args=flags.replace("-axial", "_axial").split(),
+    default=TrainConfig.from_task(SPLIT_TASK),
+    config=mjlab.TYRO_FLAGS,
+  )
+  assert underscored.env.observations["osl"] == group
 
 
 def _legacy_record(**edits: Any) -> dict[str, Any]:
@@ -1150,15 +1426,36 @@ def _legacy_record(**edits: Any) -> dict[str, Any]:
     ),
     (_legacy_record(ankle=None, history=50), 1200, None),
     (mdp.osl_group_record(mdp.osl_observation_group("train")), 500, ""),
+    (
+      _legacy_record(ankle=None, ankle_axial=None, socket_axial=None),
+      600,
+      f"{FLAG}.terms.loadcell.params.socket True "
+      f"{FLAG}.terms.contact.params.heel False {FLAG}.terms.contact.params.toe False",
+    ),
+    (
+      mdp.osl_group_record(
+        mdp.osl_observation_group(
+          "train",
+          mdp.OslObsCfg(
+            ankle_load_cell=False, socket_load_cell=True, socket_load_cell_axial=True
+          ),
+        )
+      ),
+      375,
+      f"{FLAG}.terms.loadcell.params.ankle False "
+      f"{FLAG}.terms.loadcell.params.socket True "
+      f"{FLAG}.terms.loadcell.params.socket-axial True",
+    ),
   ],
-  ids=["r2", "s2_d", "history_50", "default"],
+  ids=["r2", "s2_d", "history_50", "default", "r2_as_recorded", "socket_axial"],
 )
 def test_record_round_trips(
   record: dict[str, Any], dim: int, flags: str | None
 ) -> None:
   """A run's record rebuilds its group at its size: R2's (no ``ankle`` key, so both
-  cells), s2_D's (the socket cell alone), a 50-frame history and the new default;
-  its record is itself, and its flags rebuild it."""
+  cells; as R2 recorded it, without the axial switches too: six axes each), s2_D's
+  (the socket cell alone), a 50-frame history, the default and the socket cell's
+  axial force; its record is itself, and its flags rebuild it."""
   group = mdp.osl_group_from_record(record)
   layout = mdp.osl_obs_layout(group)
   assert (
@@ -1182,11 +1479,20 @@ def test_record_round_trips(
     mdp.osl_group_from_record(bad)
 
 
-@pytest.mark.parametrize("legacy", [False, True], ids=["default", "legacy"])
-def test_env_yaml_is_a_record(tmp_path: Path, legacy: bool) -> None:
+@pytest.mark.parametrize(
+  "osl_obs",
+  [
+    None,
+    mdp.OslObsCfg(**mdp.LEGACY_OSL_SENSORS),
+    mdp.OslObsCfg(
+      ankle_load_cell=False, socket_load_cell=True, socket_load_cell_axial=True
+    ),
+  ],
+  ids=["default", "legacy", "socket_axial"],
+)
+def test_env_yaml_is_a_record(tmp_path: Path, osl_obs: mdp.OslObsCfg | None) -> None:
   """A run's params/env.yaml, read as data as the exporter reads it, is a record of
   its group: it rebuilds the group exactly."""
-  osl_obs = mdp.OslObsCfg(**mdp.LEGACY_OSL_SENSORS) if legacy else None
   cfg = osl_split_env_cfg("robot", "rigid", "mimic", "train", osl_obs=osl_obs)
   dump_yaml(tmp_path / "env.yaml", asdict(cfg))
   saved = read_config(tmp_path / "env.yaml")["observations"]["osl"]

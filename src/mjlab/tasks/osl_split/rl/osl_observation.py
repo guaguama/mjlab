@@ -29,6 +29,7 @@ from typing import Any, NamedTuple
 from mjlab.tasks.osl_gait_library.export import read_config
 from mjlab.tasks.osl_mimic.touch_sites import load_checkpoint
 from mjlab.tasks.osl_split.mdp.observations import (
+  AXIAL_SWITCHES,
   OSL_OBS_GROUP,
   OSL_OBSERVATION_FORMAT,
   OSL_OBSERVATION_KEY,
@@ -53,9 +54,12 @@ _LAYOUT_PARAMS = frozenset(
     "projected_gravity",
     "applied_torque",
     *(switch for switches in SENSOR_SWITCHES.values() for switch in switches),
+    *AXIAL_SWITCHES.values(),
   }
 )
-"""Params that set the layout or the mode, not a lag, error bound or noise."""
+"""Params that set the layout or the mode, not a lag, error bound or noise (a
+record without the axial switches reads six-axis cells, which the layout check
+compares)."""
 
 
 class ResolvedOslObservation(NamedTuple):

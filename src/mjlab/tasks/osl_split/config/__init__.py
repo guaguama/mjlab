@@ -29,6 +29,11 @@ OSL group's term params, a sensor term with every sensor off being left out::
   --env.observations.osl.terms.contact.params.toe False
   # Contacts off (450): the last two flags. Both cells and contacts (650): the
   # first. Another history for every term: --env.observations.osl.history-length N
+  # A cell's axial force alone, the force along the pylon (one channel instead of
+  # six; the cell must be on), e.g. the socket cell's with the contacts (375):
+  --env.observations.osl.terms.loadcell.params.ankle False \\
+  --env.observations.osl.terms.loadcell.params.socket True \\
+  --env.observations.osl.terms.loadcell.params.socket-axial True
 
 Resume a stage-2 run with ``--agent.resume`` as usual; it is refused, with the flags
 that build it, unless the env builds the checkpoint's OSL sensor set and history.

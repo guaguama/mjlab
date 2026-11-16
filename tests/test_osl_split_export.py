@@ -38,6 +38,7 @@ from mjlab.tasks.osl_split import export as split_export
 from mjlab.tasks.osl_split import mdp
 from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
 from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
+from mjlab.tasks.osl_split.config.sensors import static_load_cell_tare
 from mjlab.utils.os import dump_yaml
 
 DT = 0.01
@@ -259,16 +260,18 @@ def _make_run(
   library: Path,
   legacy: bool = False,
   touch_sites: TouchSites | None = None,
+  osl_obs: mdp.OslObsCfg | None = None,
 ) -> Path:
-  """A run on the default touch sites and OSL sensor set, recorded in its env.yaml,
-  its checkpoint and its warm start's lineage; a ``legacy`` run predates both
-  settings, so none of them records any touch sites (``original``), its checkpoint
-  records no OSL group, and its env.yaml records both load cells without the
-  ``ankle`` switch and no contacts, as R2 did."""
+  """A run on the default touch sites and OSL sensor set (or ``osl_obs``'s),
+  recorded in its env.yaml, its checkpoint and its warm start's lineage; a
+  ``legacy`` run predates both settings, so none of them records any touch sites
+  (``original``), its checkpoint records no OSL group, and its env.yaml records both
+  load cells without the ``ankle`` or axial switches and no contacts, as R2 did."""
   model, socket, reward = case
   obs_dim, terms = CASES[case]
   run = root / f"{model}_{socket}" / "run"
-  osl_obs = mdp.OslObsCfg(**mdp.LEGACY_OSL_SENSORS) if legacy else None
+  if legacy:
+    osl_obs = mdp.OslObsCfg(**mdp.LEGACY_OSL_SENSORS)
   env_cfg = osl_split_env_cfg(model, socket, reward, "train", osl_obs=osl_obs)
   env_cfg.commands["motion"].library_dir = str(library)  # type: ignore[attr-defined]
   agent = osl_split_runner_cfg(model, socket, reward, "exp")
@@ -281,13 +284,14 @@ def _make_run(
   env = asdict(env_cfg)
   if legacy:
     del env["osl_touch_sites"], env["scene"]["entities"]["robot"]["touch_sites"]
-    del env["observations"]["osl"]["terms"]["loadcell"]["params"]["ankle"]
+    loadcell = env["observations"]["osl"]["terms"]["loadcell"]["params"]
+    del loadcell["ankle"], loadcell["ankle_axial"], loadcell["socket_axial"]
   dump_yaml(run / "params" / "env.yaml", env)
   dump_yaml(run / "params" / "agent.yaml", asdict(agent))
   torch.manual_seed(0)
   human_dim = sum(int(dim) for name, dim in terms if name != "osl_motors")
   human = _actor("actor", obs_dim, human_dim, dict(agent.actor.distribution_cfg or {}))
-  osl_dim = LEGACY_OSL_OBS if legacy else OSL_OBS
+  osl_dim = mdp.osl_obs_dim(osl_obs)
   osl = _actor("osl", osl_dim, 2, dict(agent.osl_actor.distribution_cfg or {}))
   lineage = {
     "model": model,
@@ -321,6 +325,25 @@ def exported(request, tmp_path_factory, library):
 def legacy(tmp_path_factory, library):
   """The bundle and manifest of a robot run from before the touch-site setting."""
   checkpoint = _make_run(tmp_path_factory.mktemp("legacy"), ROBOT, library, True)
+  bundle = split_export.export_bundle(checkpoint)
+  return bundle, json.loads((bundle / "manifest.json").read_text())
+
+
+AXIAL_OBS = mdp.OslObsCfg(
+  ankle_load_cell=False, socket_load_cell=True, socket_load_cell_axial=True
+)
+"""The socket cell's axial force alone, the contacts, no ankle cell: 375 inputs."""
+
+
+@pytest.fixture(scope="module")
+def axial(tmp_path_factory, library):
+  """The bundle and manifest of an MSK run on :data:`AXIAL_OBS`."""
+  checkpoint = _make_run(
+    tmp_path_factory.mktemp("axial"),
+    ("msk", "compliant", "clf"),
+    library,
+    osl_obs=AXIAL_OBS,
+  )
   bundle = split_export.export_bundle(checkpoint)
   return bundle, json.loads((bundle / "manifest.json").read_text())
 
@@ -407,18 +430,21 @@ def test_onnx_parity_and_metadata(exported) -> None:
     assert meta["controller"] == name and meta["kind"] == "osl_split_dual"
 
 
-@pytest.fixture(params=["default", "legacy"])
-def any_bundle(request, exported, legacy) -> tuple[Path, dict[str, Any]]:
-  """A default-set bundle (both models) and the legacy run's."""
+@pytest.fixture(params=["default", "legacy", "axial"])
+def any_bundle(request, exported, legacy, axial) -> tuple[Path, dict[str, Any]]:
+  """A default-set bundle (both models), the legacy run's and the axial run's."""
   if request.param == "legacy":
     return legacy
+  if request.param == "axial":
+    return axial
   return exported[2], exported[3]
 
 
 def test_osl_conformance_matches_a_numpy_rebuild(any_bundle) -> None:
   """A consumer's OSL observation, from model.mjb and the manifest alone,
   reproduces mjlab's own terms and buffers at every training latency, foot
-  contacts (raw touch sensors, on their own bus) included."""
+  contacts (raw touch sensors, on their own bus) and axial load cells (the
+  components a term lists, of the tared reading) included."""
   bundle, m = any_bundle
   model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
   obs = m["controllers"]["osl"]["observation"]
@@ -429,12 +455,13 @@ def test_osl_conformance_matches_a_numpy_rebuild(any_bundle) -> None:
   last = parity["osl_conformance_last_action"]
   assert np.all(last[0] == 0.0) and np.abs(last).max() > 1.0
 
-  def read(data, name):
+  def read(data, name, components=None):
     s = model.sensor(sensors[name]["scene_name"])
     value = data.sensordata[s.adr[0] : s.adr[0] + s.dim[0]].copy()
     if sensors[name]["saturation"] is not None:
       value = np.clip(value, -sensors[name]["saturation"], sensors[name]["saturation"])
-    return value - np.asarray(tare.get(name, 0.0))
+    value = value - np.asarray(tare.get(name, 0.0))
+    return value if components is None else value[components]
 
   data = mujoco.MjData(model)
   frames = []
@@ -447,7 +474,9 @@ def test_osl_conformance_matches_a_numpy_rebuild(any_bundle) -> None:
       {
         term["name"]: np.clip(last[t], -1.0, 1.0)
         if term["name"] == "last_action"
-        else np.concatenate([read(data, s) for s in term["sensors"]])
+        else np.concatenate(
+          [read(data, s, term.get("components", {}).get(s)) for s in term["sensors"]]
+        )
         for term in obs["term_layout"]
       }
     )
@@ -535,6 +564,12 @@ def test_bundle_declares_the_contact_sensors(exported) -> None:
   }
   randomization = m["controllers"]["osl"]["training"]["observation_randomization"]
   assert randomization["observation"]["contact"] == CONTACT_RANDOMIZATION
+  assert randomization["observation"]["loadcell"]["per_episode_bias"] == {
+    "force_bias": 2.0,
+    "torque_bias": 0.2,
+  }
+  # Six-axis cells only: no term lists components, the summary no axial key.
+  assert not any("components" in t for t in obs["term_layout"])
   assert obs["sensor_set"] == DEFAULT_SENSOR_SET
   # Channel names are unique across terms; the FSM's stays.
   channels = [c for t in obs["term_layout"] for c in t["channels"]]
@@ -576,6 +611,90 @@ def test_legacy_run_exports_its_own_sensor_set(legacy) -> None:
     "toe_contact": False,
   }
   assert {t["name"]: t["dim"] for t in obs["term_layout"]}["loadcell"] == 300
+
+
+# The loadcell term of the axial set's manifest (the socket cell's axial force
+# alone): the contract shared with osl_deploy, whose ``components`` key lists the
+# components a sensor contributes, verbatim.
+AXIAL_LOADCELL_TERM = {
+  "name": "loadcell",
+  "offset": 250,
+  "dim": 25,
+  "frame_dim": 1,
+  "history_length": 25,
+  "channels": ["osl_socket_load_force_y"],
+  "units": ["N"],
+  "sensors": ["osl_socket_load_force"],
+  "components": {"osl_socket_load_force": [1]},
+}
+AXIAL_LOADCELL_RANDOMIZATION = {
+  "delay_steps": [0, 2],
+  "delay_held_per_episode": True,
+  "noise_std": [1.0],
+  "per_episode_bias": {"force_bias": 2.0},
+}
+
+
+def test_axial_run_exports_its_axial_cell(axial) -> None:
+  """A run whose socket cell read its axial force alone: its loadcell entry lists
+  the force sensor alone with the component it reads, the tare the force's whole
+  vector, the randomization one force channel (no torque bias), and the summary
+  the axial keys; the other terms keep their entries, and the ONNX metadata
+  carries the same layout."""
+  bundle, m = axial
+  osl = m["controllers"]["osl"]
+  obs = osl["observation"]
+  assert obs["size"] == 375 and osl["io"]["input_shape"] == [1, 375]
+  assert [(t["name"], t["offset"], t["dim"]) for t in obs["term_layout"]] == [
+    ("actpack", 0, 250),
+    ("loadcell", 250, 25),
+    ("contact", 275, 50),
+    ("last_action", 325, 50),
+  ]
+  layout = {t["name"]: t for t in obs["term_layout"]}
+  assert layout["loadcell"] == AXIAL_LOADCELL_TERM
+  assert {**layout["contact"], "offset": 400} == CONTACT_TERM
+  assert ["components" in t for t in obs["term_layout"]] == [False, True, False, False]
+  sensors = {s["name"]: s for s in obs["sensors"]["sensors"]}
+  load_cells = ("osl_ankle_load_force", "osl_ankle_load_torque")
+  load_cells += ("osl_socket_load_force", "osl_socket_load_torque")
+  assert [sensors[name]["observed"] for name in load_cells] == [
+    False,
+    False,
+    True,
+    False,
+  ]
+  tare = obs["sensors"]["load_cell_tare"]["values"]
+  assert list(tare) == ["osl_socket_load_force"]
+  assert sensors["osl_socket_load_force"]["tare"] == tare["osl_socket_load_force"]
+  assert "tare" not in sensors["osl_socket_load_torque"]
+  model = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
+  hanging = static_load_cell_tare(model)["osl_socket_load_force"]
+  np.testing.assert_allclose(tare["osl_socket_load_force"], hanging, rtol=1e-6)
+  assert hanging[1] > 40.0  # The prosthesis hangs below the cell, along +y.
+  randomization = osl["training"]["observation_randomization"]["observation"]
+  assert randomization["loadcell"] == AXIAL_LOADCELL_RANDOMIZATION
+  assert randomization["contact"] == CONTACT_RANDOMIZATION
+  assert obs["sensor_set"] == {
+    **DEFAULT_SENSOR_SET,
+    "ankle_load_cell": False,
+    "socket_load_cell": True,
+    "ankle_load_cell_axial": False,
+    "socket_load_cell_axial": True,
+  }
+  readme = (bundle / "README.md").read_text()
+  assert (
+    "- Sensors: encoders, shank IMU, socket load cell (axial force), heel contact, "
+    "toe contact (manifest `sensor_set`)"
+  ) in readme
+  session = ort.InferenceSession(
+    str(bundle / "osl_actor.onnx"), providers=["CPUExecutionProvider"]
+  )
+  meta = json.loads(session.get_modelmeta().custom_metadata_map["osl_policy"])
+  assert meta["observation"]["term_layout"] == obs["term_layout"]
+  parity = np.load(bundle / "parity.npz")
+  assert parity["osl_conformance_frames"].shape[1] == 15
+  assert parity["osl_conformance_obs_lag1"].shape[1] == 375
 
 
 def test_bundle_declares_its_touch_sites(exported) -> None:

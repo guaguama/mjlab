@@ -10,7 +10,8 @@ hardware path, in this order (:data:`OSL_OBS_TERMS`):
   orientation estimator's output rather than a raw channel) and the joints' applied
   torque (the drive's current-based estimate);
 * ``loadcell``: the load-cell bus, the six-axis cell above the ankle (on by default)
-  and the one below the socket (off by default), both tared;
+  and the one below the socket (off by default), both tared; either cell can read
+  its axial force alone instead, the force along the pylon (one channel);
 * ``contact``: the foot-contact bus, the OSL foot's heel and toe contact forces (the
   model's ``r_foot`` and ``r_toes`` touch sensors), raw, both on by default;
 * ``last_action``: the controller's own previous command, which crosses no bus.
@@ -18,9 +19,11 @@ hardware path, in this order (:data:`OSL_OBS_TERMS`):
 The default set is the real leg's: encoders, IMU, the ankle cell and the two foot
 contacts, 500 inputs. Each sensor has one switch, a param of its term (``ankle``,
 ``socket``, ``heel``, ``toe``), and a sensor term whose switches are all off is left
-out of the group (the drop rule; ``actpack`` always stays). Old runs recorded other
-sets (both cells and no contacts, :data:`LEGACY_OSL_SENSORS`); the record helpers at
-the end of this module rebuild any of them from a run's record.
+out of the group (the drop rule; ``actpack`` always stays). A load cell's
+``ankle_axial`` or ``socket_axial`` param (:data:`AXIAL_SWITCHES`, off by default)
+reads its axial force alone, and needs its cell on. Old runs recorded other sets
+(both cells and no contacts, :data:`LEGACY_OSL_SENSORS`); the record helpers at the
+end of this module rebuild any of them from a run's record.
 
 Perception randomization models the hardware and applies in training only, from the
 first stage-2 iteration:
@@ -116,18 +119,47 @@ SWITCH_FIELDS: Mapping[tuple[str, str], str] = MappingProxyType(
   }
 )
 """Each sensor switch, ``(term, param)``, and its :class:`OslObsCfg` field."""
+AXIAL_SWITCHES: Mapping[str, str] = MappingProxyType(
+  {"ankle": "ankle_axial", "socket": "socket_axial"}
+)
+"""Each load cell's switch (a ``loadcell`` param) and the ``loadcell`` param that
+makes the cell read its axial force alone (:data:`AXIAL_COMPONENT`), one channel
+instead of six. An axial switch needs its cell on."""
+AXIAL_FIELDS: Mapping[tuple[str, str], str] = MappingProxyType(
+  {
+    ("loadcell", "ankle_axial"): "ankle_load_cell_axial",
+    ("loadcell", "socket_axial"): "socket_load_cell_axial",
+  }
+)
+"""Each axial switch, ``(term, param)``, and its :class:`OslObsCfg` field (also its
+key in :func:`osl_sensor_set`)."""
+_AXIAL_CELLS = {axial: cell for cell, axial in AXIAL_SWITCHES.items()}
+"""Each axial switch's cell switch."""
+AXIAL_COMPONENT = 1
+"""A load cell's axial force, the force along the pylon: the y component of its
+force sensor in the cell site's frame (the OSL bodies' OpenSim axes, y along the
+limb, up), tared like the six-axis reading."""
+_LOAD_CELLS: tuple[tuple[str, str, str], ...] = (
+  ("ankle", ANKLE_FORCE, ANKLE_LOAD_TORQUE),
+  ("socket", SOCKET_FORCE, SOCKET_TORQUE),
+)
+"""Each load cell's switch and its force and torque sensors, in channel order."""
+_LOAD_CELL_FORCES = frozenset(force for _, force, _ in _LOAD_CELLS)
 _SWITCH_DEFAULTS = {
   "projected_gravity": False,
   "applied_torque": False,
   "ankle": True,
   "socket": True,
+  "ankle_axial": False,
+  "socket_axial": False,
   "heel": True,
   "toe": True,
 }
 """A class term's switches when its params leave them out: what a MISSING key
 means, not :class:`OslObsCfg`'s defaults. Never change the load cells' entries:
 the records of runs before the ``ankle`` param (M0, R1, R2, s2_A, s2_B) have no
-``ankle`` key and read both cells."""
+``ankle`` key and read both cells, and those before the axial switches read every
+cell's six axes."""
 
 
 class OslSensorSwitches(TypedDict):
@@ -164,7 +196,8 @@ class OslObsCfg:
   sample; biases are uniform in +-value per component, drawn at every reset and held
   for the episode. The switches, bounds and stds reach the class terms as their
   params, under the same names (``ankle_load_cell`` as ``ankle``,
-  ``socket_load_cell`` as ``socket``).
+  ``socket_load_cell`` as ``socket``, ``ankle_load_cell_axial`` as ``ankle_axial``,
+  ``socket_load_cell_axial`` as ``socket_axial``).
   """
 
   history_length: int = 25
@@ -178,6 +211,13 @@ class OslObsCfg:
   socket_load_cell: bool = False
   """The six-axis cell below the socket, which the real leg does not have. With both
   cells off the ``loadcell`` term is left out."""
+  ankle_load_cell_axial: bool = False
+  """The ankle cell reads its axial force alone, the force along the pylon (its
+  force sensor's y, tared): one channel instead of six, with the force channels'
+  bias and noise. Needs ``ankle_load_cell``."""
+  socket_load_cell_axial: bool = False
+  """The socket cell reads its axial force alone (one channel instead of six).
+  Needs ``socket_load_cell``."""
   heel_contact: bool = True
   """The OSL foot's heel contact force (``contact``'s first channel). It needs the
   extended heel zone: ``r_foot`` never fires under ``osl_touch_sites`` original."""
@@ -228,6 +268,14 @@ class OslObsCfg:
     negative = sorted(name for name, value in magnitudes.items() if value < 0)
     if negative:
       raise ValueError(f"Bias, noise and mount bounds must be >= 0: {negative}")
+    for (term, axial), field in AXIAL_FIELDS.items():
+      cell = SWITCH_FIELDS[(term, _AXIAL_CELLS[axial])]
+      if getattr(self, field) and not getattr(self, cell):
+        raise ValueError(
+          f"{field} reads the {cell.removesuffix('_load_cell')} load cell's axial "
+          f"force, but {cell} is off ({_param_flag(term, axial)} True needs "
+          f"{_param_flag(term, _AXIAL_CELLS[axial])} True)."
+        )
 
 
 def osl_actpack_dim(cfg: OslObsCfg) -> int:
@@ -236,8 +284,15 @@ def osl_actpack_dim(cfg: OslObsCfg) -> int:
 
 
 def osl_loadcell_dim(cfg: OslObsCfg) -> int:
-  """The ankle cell's force and torque if on, then the socket cell's if on."""
-  return 6 * cfg.ankle_load_cell + 6 * cfg.socket_load_cell
+  """The ankle cell's force and torque if on (its axial force alone if axial),
+  then the socket cell's."""
+
+  def cell(on: bool, axial: bool) -> int:
+    return (1 if axial else 6) if on else 0
+
+  return cell(cfg.ankle_load_cell, cfg.ankle_load_cell_axial) + cell(
+    cfg.socket_load_cell, cfg.socket_load_cell_axial
+  )
 
 
 def osl_contact_dim(cfg: OslObsCfg) -> int:
@@ -284,8 +339,11 @@ def osl_noise_std(term: str, params: Mapping[str, Any]) -> tuple[float, ...] | N
       stds += std("applied_torque_noise", 2)
     return stds
   if term == "loadcell":
-    cell = std("force_noise", 3) + std("torque_noise", 3)
-    return cell * (int(osl_switch(params, "ankle")) + int(osl_switch(params, "socket")))
+    (force,), (torque,) = std("force_noise", 1), std("torque_noise", 1)
+    return tuple(
+      force if sensor in _LOAD_CELL_FORCES else torque
+      for sensor, _ in load_cell_channels(params, allow_none=True)
+    )
   if term == "contact":
     return std("contact_noise", 1) * len(contact_sensor_names(params, allow_none=True))
   return None
@@ -297,24 +355,79 @@ def osl_switch(params: Mapping[str, Any], name: str) -> bool:
   return bool(params.get(name, _SWITCH_DEFAULTS[name]))
 
 
-def load_cell_sensor_names(params: Mapping[str, Any]) -> list[str]:
-  """The sensors the ``loadcell`` term reads under its params, in channel order: the
-  ankle cell's force and torque when ``ankle``, then the socket cell's when
-  ``socket``.
+def check_axial_switches(params: Mapping[str, Any]) -> None:
+  """Refuse an axial switch (:data:`AXIAL_SWITCHES`) on a load cell that is off,
+  naming the flags.
 
   Raises:
-    ValueError: If both cells are switched off.
+    ValueError: If ``ankle_axial`` is on with ``ankle`` off, or ``socket_axial``
+      with ``socket`` off.
   """
-  names: list[str] = []
-  if osl_switch(params, "ankle"):
-    names += [ANKLE_FORCE, ANKLE_LOAD_TORQUE]
-  if osl_switch(params, "socket"):
-    names += [SOCKET_FORCE, SOCKET_TORQUE]
-  if not names:
+  for cell, axial in AXIAL_SWITCHES.items():
+    if osl_switch(params, axial) and not osl_switch(params, cell):
+      raise ValueError(
+        f"{_param_flag('loadcell', axial)} True reads the {cell} load cell's axial "
+        f"force, but the {cell} cell is off: pass "
+        f"{_param_flag('loadcell', cell)} True, or leave the cell's axial switch "
+        "off."
+      )
+
+
+def load_cell_channels(
+  params: Mapping[str, Any], allow_none: bool = False
+) -> list[tuple[str, int]]:
+  """The ``loadcell`` term's channels under its params, in order, each as ``(sensor,
+  component)``: the ankle cell's force then torque components when ``ankle`` (its
+  force's :data:`AXIAL_COMPONENT` alone when ``ankle_axial``), then the socket
+  cell's when ``socket`` (``socket_axial``).
+
+  Raises:
+    ValueError: For an axial switch on a cell that is off, or if both cells are
+      off, unless ``allow_none``.
+  """
+  check_axial_switches(params)
+  channels: list[tuple[str, int]] = []
+  for cell, force, torque in _LOAD_CELLS:
+    if not osl_switch(params, cell):
+      continue
+    if osl_switch(params, AXIAL_SWITCHES[cell]):
+      channels.append((force, AXIAL_COMPONENT))
+    else:
+      channels += [(sensor, axis) for sensor in (force, torque) for axis in range(3)]
+  if not channels and not allow_none:
     raise ValueError(
       "The loadcell term needs at least one load cell: ankle and socket are both off."
     )
-  return names
+  return channels
+
+
+def load_cell_sensor_names(params: Mapping[str, Any]) -> list[str]:
+  """The sensors the ``loadcell`` term reads under its params, in channel order: the
+  ankle cell's force and torque when ``ankle`` (its force alone when
+  ``ankle_axial``), then the socket cell's when ``socket`` (``socket_axial``).
+
+  Raises:
+    ValueError: If both cells are switched off, or for an axial switch on a cell
+      that is off.
+  """
+  return list(dict.fromkeys(sensor for sensor, _ in load_cell_channels(params)))
+
+
+def term_components(name: str, params: Mapping[str, Any]) -> dict[str, list[int]]:
+  """The sensors an ``osl`` term reads only some components of, each with those
+  components in channel order (a bundle term's ``components``): an axial load
+  cell's force sensor, ``[1]``. A sensor not listed contributes every component;
+  empty for a term without such a sensor (every set without an axial cell)."""
+  if name != "loadcell":
+    return {}
+  read: dict[str, list[int]] = {}
+  for sensor, component in load_cell_channels(params):
+    read.setdefault(sensor, []).append(component)
+  return {
+    sensor: components
+    for sensor, components in read.items()
+    if components != list(range(_SPECS[sensor].dim))
+  }
 
 
 def contact_sensor_names(
@@ -372,7 +485,7 @@ def term_channels(name: str, params: Mapping[str, Any]) -> list[Channel]:
       channels += [_scalar(KNEE_TORQUE), _scalar(ANKLE_TORQUE)]
     return channels
   if name == "loadcell":
-    return [c for sensor in load_cell_sensor_names(params) for c in _vector(sensor)]
+    return [_component(*channel) for channel in load_cell_channels(params)]
   if name == "contact":
     return [_scalar(sensor) for sensor in contact_sensor_names(params)]
   if name == "last_action":
@@ -386,7 +499,11 @@ def _scalar(sensor: str) -> Channel:
 
 
 def _vector(sensor: str) -> list[Channel]:
-  return [(f"{sensor}_{axis}", _SPECS[sensor].unit, sensor) for axis in _XYZ]
+  return [_component(sensor, axis) for axis in range(len(_XYZ))]
+
+
+def _component(sensor: str, axis: int) -> Channel:
+  return f"{sensor}_{_XYZ[axis]}", _SPECS[sensor].unit, sensor
 
 
 def _noise_std(term: str, params: Mapping[str, Any], device: str) -> torch.Tensor:
@@ -530,28 +647,32 @@ class osl_actpack(ManagerTermBase):
 class osl_load_cells(ManagerTermBase):
   """The load-cell bus: the ankle cell's force (3) and torque (3) when ``ankle``, then
   the socket cell's when ``socket``, so (B, 12) by default and (B, 6) with one cell.
+  A cell whose axial switch is on (``ankle_axial``, ``socket_axial``) gives its
+  axial force alone, (B, 1): the force along the pylon, its force sensor's y.
 
   Each reading is in its site's frame (OpenSim axes, y up the limb), minus its
   static tare: what the cell reads with the leg hanging still, computed once from the
   nominal model (:func:`~..config.sensors.static_load_cell_tare`). A tared cell reads
   zero in swing near the upright pose and minus the transmitted load in stance:
-  about minus body weight along y at the socket in single support. The randomization
-  adds a per-episode bias, the residual of an imperfect tare and of thermal drift,
-  then white noise, one Gaussian draw per component and sample
-  (:func:`osl_noise_std`).
+  about minus body weight along y at the socket in single support. An axial cell
+  reads the same tared y component. The randomization adds a per-episode bias, the
+  residual of an imperfect tare and of thermal drift, then white noise, one
+  Gaussian draw per channel and sample (:func:`osl_noise_std`); an axial channel
+  takes the force channels' bounds and stds.
 
   Params: ``entity_name``; ``ankle`` and ``socket`` (include that cell; at least one
-  must be on); ``randomize`` (draw
-  the biases at every reset and add the noise); ``force_bias`` (N) and
-  ``torque_bias`` (N m), uniform per component; and the noise stds ``force_noise``
-  and ``torque_noise``. Bounds and stds the params leave out take
-  :class:`OslObsCfg`'s.
+  must be on); ``ankle_axial`` and ``socket_axial`` (that cell's axial force alone;
+  its cell must be on); ``randomize`` (draw the biases at every reset and add the
+  noise); ``force_bias`` (N) and ``torque_bias`` (N m), uniform per channel; and the
+  noise stds ``force_noise`` and ``torque_noise``. Bounds and stds the params leave
+  out take :class:`OslObsCfg`'s.
 
   Attributes:
-    tare: (D,) the subtracted static readings.
-    bias: (B, D) the per-episode biases, zero when not randomized.
-    noise_std: (D,) the white noise's std per component, added only when
+    tare: (3 S,) the static readings subtracted from the S sensors read
+      (:func:`load_cell_sensor_names`), every component of each.
+    bias: (B, D) the per-episode bias of each of the D channels, zero when not
       randomized.
+    noise_std: (D,) the white noise's std per channel, added only when randomized.
   """
 
   def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedRlEnv):
@@ -560,7 +681,8 @@ class osl_load_cells(ManagerTermBase):
     defaults = OslObsCfg()
     entity = params.get("entity_name", "robot")
     self._randomize = bool(params.get("randomize", False))
-    names = load_cell_sensor_names(params)
+    channels = load_cell_channels(params)
+    names = list(dict.fromkeys(sensor for sensor, _ in channels))
     self._sensors = [env.scene[scene_sensor_name(name, entity)] for name in names]
     tare = static_load_cell_tare(env.sim.mj_model, prefix=f"{entity}/")
     self.tare = torch.as_tensor(
@@ -568,13 +690,22 @@ class osl_load_cells(ManagerTermBase):
       dtype=torch.float32,
       device=self.device,
     )
+    # Each channel's column among the tared readings; None when every column is a
+    # channel, in order (no axial cell).
+    columns = [3 * names.index(sensor) + axis for sensor, axis in channels]
+    self._columns = (
+      None
+      if columns == list(range(len(self.tare)))
+      else torch.tensor(columns, dtype=torch.long, device=self.device)
+    )
     force = float(params.get("force_bias", defaults.force_bias))
     torque = float(params.get("torque_bias", defaults.torque_bias))
-    bounds = [force] * 3 + [torque] * 3
     self._bias_bound = torch.tensor(
-      bounds * (len(names) // 2), dtype=torch.float32, device=self.device
+      [force if sensor in _LOAD_CELL_FORCES else torque for sensor, _ in channels],
+      dtype=torch.float32,
+      device=self.device,
     )
-    self.bias = torch.zeros(self.num_envs, len(self.tare), device=self.device)
+    self.bias = torch.zeros(self.num_envs, len(channels), device=self.device)
     self.noise_std = _noise_std("loadcell", params, self.device)
     self._noisy = self._randomize and bool(self.noise_std.any())
     self.reset(None)
@@ -586,12 +717,16 @@ class osl_load_cells(ManagerTermBase):
     n = int(rows.numel())
     if n == 0:
       return
-    self.bias[rows] = _uniform((n, len(self.tare)), 1.0, self.device) * self._bias_bound
+    draws = _uniform((n, self.bias.shape[1]), 1.0, self.device)
+    self.bias[rows] = draws * self._bias_bound
 
   def __call__(self, env: ManagerBasedRlEnv, **params: Any) -> torch.Tensor:
     del env, params  # Resolved in __init__.
     readings = torch.cat([s.data for s in self._sensors], dim=-1)
-    out = readings - self.tare + self.bias
+    tared = readings - self.tare
+    if self._columns is not None:
+      tared = tared[:, self._columns]
+    out = tared + self.bias
     if self._noisy:
       out = out + self.noise_std * torch.randn_like(out)
     return out
@@ -803,6 +938,8 @@ def _training_group(cfg: OslObsCfg) -> ObservationGroupCfg:
         "entity_name": "robot",
         "ankle": cfg.ankle_load_cell,
         "socket": cfg.socket_load_cell,
+        "ankle_axial": cfg.ankle_load_cell_axial,
+        "socket_axial": cfg.socket_load_cell_axial,
         "randomize": True,
         "force_bias": cfg.force_bias,
         "torque_bias": cfg.torque_bias,
@@ -838,8 +975,10 @@ def osl_sensor_group(group: ObservationGroupCfg) -> ObservationGroupCfg:
   with a new terms dict otherwise.
 
   Raises:
-    ValueError: For a term that is not one of :data:`OSL_OBS_TERMS`, or a group
-      left without a sensor term.
+    ValueError: For a term that is not one of :data:`OSL_OBS_TERMS`, an axial
+      switch on a load cell that is off (:func:`check_axial_switches`, even when
+      both cells are off and the term is dropped), or a group left without a
+      sensor term.
   """
   unknown = [name for name in group.terms if name not in OSL_OBS_TERMS]
   if unknown:
@@ -847,6 +986,9 @@ def osl_sensor_group(group: ObservationGroupCfg) -> ObservationGroupCfg:
       f"Unknown osl observation terms {unknown}; the OSL actor's are "
       f"{list(OSL_OBS_TERMS)}."
     )
+  loadcell = group.terms.get("loadcell")
+  if loadcell is not None:
+    check_axial_switches(loadcell.params)
   terms = {
     name: term
     for name, term in group.terms.items()
@@ -904,6 +1046,12 @@ TERM_FUNCS: Mapping[str, Any] = MappingProxyType(
 FLAG_PREFIX = "--env.observations.osl"
 _EXTRAS = ("projected_gravity", "applied_torque")
 """The actpack switches that add channels."""
+
+
+def _param_flag(term: str, param: str) -> str:
+  """The train flag that sets an ``osl`` term's param (tyro spells a dict key with
+  hyphens, and takes underscores too)."""
+  return f"{FLAG_PREFIX}.terms.{term}.params.{param.replace('_', '-')}"
 
 
 class OslTermLayout(NamedTuple):
@@ -1014,7 +1162,10 @@ def osl_layout_dim(layout: tuple[OslTermLayout, ...]) -> int:
 
 def osl_sensor_set(group: ObservationGroupCfg | Mapping[str, Any]) -> dict[str, bool]:
   """Which of the leg's sensors a group or record reads (the bundle manifest's
-  ``sensor_set``)."""
+  ``sensor_set``). When a load cell reads its axial force alone, the axial fields
+  (:data:`AXIAL_FIELDS`, ``ankle_load_cell_axial`` and ``socket_load_cell_axial``)
+  join, both; a set without them reads every cell's six axes, as every set before
+  them did, so sets without an axial cell keep their old summary."""
   terms = {
     name: term["params"]
     for name, term in _as_record(group)["terms"].items()
@@ -1024,7 +1175,7 @@ def osl_sensor_set(group: ObservationGroupCfg | Mapping[str, Any]) -> dict[str, 
   def on(term: str, switch: str) -> bool:
     return term in terms and osl_switch(terms[term], switch)
 
-  return {
+  sensors = {
     "encoders": "actpack" in terms,
     "imu": "actpack" in terms,
     "ankle_load_cell": on("loadcell", "ankle"),
@@ -1032,6 +1183,13 @@ def osl_sensor_set(group: ObservationGroupCfg | Mapping[str, Any]) -> dict[str, 
     "heel_contact": on("contact", "heel"),
     "toe_contact": on("contact", "toe"),
   }
+  axial = {
+    field: on(term, switch) and on(term, _AXIAL_CELLS[switch])
+    for (term, switch), field in AXIAL_FIELDS.items()
+  }
+  if any(axial.values()):
+    sensors.update(axial)
+  return sensors
 
 
 def describe_osl_sensors(group: ObservationGroupCfg | Mapping[str, Any]) -> str:
@@ -1048,7 +1206,11 @@ def describe_osl_sensors(group: ObservationGroupCfg | Mapping[str, Any]) -> str:
   layout = osl_obs_layout(group)
   histories = sorted({term.history for term in layout})
   frames = "/".join(str(h) for h in histories)
-  on = ", ".join(names[key] for key, value in sensors.items() if value)
+  on = ", ".join(
+    names[key] + (" (axial)" if sensors.get(f"{key}_axial") else "")
+    for key, value in sensors.items()
+    if value and key in names
+  )
   return f"{on}; {frames} frames, {osl_layout_dim(layout)} inputs"
 
 
@@ -1056,12 +1218,14 @@ def osl_sensor_flags(
   record: ObservationGroupCfg | Mapping[str, Any],
   default: ObservationGroupCfg | Mapping[str, Any] | None = None,
 ) -> str:
-  """The train flags that rebuild a record's input layout (sensors, extras,
-  history) from the default group, e.g. a two-cell run without contacts:
+  """The train flags that rebuild a record's input layout (sensors, axial cells,
+  extras, history) from the default group, e.g. a two-cell run without contacts:
   ``--env.observations.osl.terms.loadcell.params.socket True
   --env.observations.osl.terms.contact.params.heel False
-  --env.observations.osl.terms.contact.params.toe False``. Empty for the default
-  set. Lags, errors and noise are not part of the layout.
+  --env.observations.osl.terms.contact.params.toe False``, or the socket cell's
+  axial force alone with the contacts: ``...loadcell.params.ankle False
+  ...loadcell.params.socket True ...loadcell.params.socket-axial True``. Empty for
+  the default set. Lags, errors and noise are not part of the layout.
 
   Args:
     record: A group or record (:func:`osl_group_record`, or an env.yaml's).
@@ -1079,13 +1243,13 @@ def osl_sensor_flags(
 
   flags: list[str] = []
   unreachable: list[str] = []
-  for (term, switch), _ in SWITCH_FIELDS.items():
+  for term, switch in (*SWITCH_FIELDS, *AXIAL_FIELDS):
     want, have = params(wanted, term), params(base, term)
     on = want is not None and osl_switch(want, switch)
     if on != (have is not None and osl_switch(have, switch)):
       if have is None:
         unreachable.append(term)
-      flags.append(f"{FLAG_PREFIX}.terms.{term}.params.{switch} {on}")
+      flags.append(f"{_param_flag(term, switch)} {on}")
   want, have = params(wanted, "actpack") or {}, params(base, "actpack") or {}
   for extra in _EXTRAS:
     if osl_switch(want, extra) != osl_switch(have, extra):
