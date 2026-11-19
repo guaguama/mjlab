@@ -97,7 +97,8 @@ def osl_gait_library_runner_cfg(
 
 
 def apply_unicycle_msk_recipe(cfg: GaitLibraryRunnerCfg) -> None:
-  """Set the stage-1 recipe's PPO schedule, env stages and validation cadence."""
+  """Set the stage-1 recipe's PPO schedule and validation cadence, and add its env
+  stages to the config's own (the CLF tasks' reward ramps)."""
   alg = cfg.algorithm
   assert isinstance(alg, MuscleMimicPpoCfg)
   assert cfg.actor.distribution_cfg is not None
@@ -114,4 +115,4 @@ def apply_unicycle_msk_recipe(cfg: GaitLibraryRunnerCfg) -> None:
   cfg.validation.interval = UNICYCLE_MSK_VALIDATION_INTERVAL
   cfg.validation.stress_interval = UNICYCLE_MSK_STRESS_INTERVAL
   cfg.validation.stress_inference = ("mean", "expected")
-  cfg.env_stages = UNICYCLE_MSK_ENV_STAGES
+  cfg.env_stages = (*cfg.env_stages, *UNICYCLE_MSK_ENV_STAGES)

@@ -33,7 +33,18 @@ stage-1 imitation reward, apart from the owner penalty split
   human's 339 muscles would otherwise drown the OSL's two rows, and the OSL would
   be charged for muscle commands it cannot change;
 * each channel's penalty is floored at -1 on its own, and its CLF violation is
-  subtracted outside the floor, as stage 1 does.
+  subtracted outside the floor, as stage 1 does;
+* the regularizers (``osl_mimic``'s ``RegularizerCfg``) go to their owners, inside
+  each channel's floor: the OSL action rate and the OSL joints' limit excess to the
+  OSL channel; the servo action rate, the human joints' limit excess and the servo
+  torque terms to the human channel.
+
+Under the CLF's ``"paper"`` decrease condition each channel differences its own V
+over the V-dot window (``ClfCfg.vdot_window`` steps). It keeps the window's
+per-group quadratic-form sums, which do not depend on the weights, and recombines
+both ends' sums with the *current* weights: the OSL channel's weights anneal every
+iteration, and a stored channel V would put a spurious Vdot at every rollout
+boundary while they do.
 
 The additive terms (the twist reward) are separate manager terms; the runner adds
 them to the channels.
@@ -60,6 +71,7 @@ from mjlab.tasks.osl_mimic.mdp.rewards import (
   CLF_GROUPS,
   MIMIC_EXPS,
   ClfCfg,
+  RegularizerCfg,
   mimic_reward,
 )
 from mjlab.tasks.osl_split.config.sensors import LEG_CONTACT_SENSOR
@@ -77,6 +89,14 @@ GROUPS: tuple[str, str, str] = ("human", "osl_sites", "osl_joints")
 """The coordinate groups a channel weighs."""
 OSL_SITE_PREFIX = "OSL_KA_L1_"
 """Mimic sites on bodies with this prefix belong to ``osl_sites``."""
+REGULARIZER_OWNERS: dict[str, tuple[str, ...]] = {
+  "human": ("servo_action_rate", "servo_torque", "servo_saturation"),
+  "osl": ("osl_action_rate",),
+}
+"""The channel each single-owner regularizer goes to (``RegularizerCfg``): the
+servo rows belong to the human actor, the OSL rows to the OSL actor. The joint
+limits split by joint: the OSL knee and ankle to the OSL channel, every other
+watched joint to the human's."""
 
 SITE_KERNELS = ("rpos", "rquat", "rvel_rot", "rvel_lin")
 """MimicReward's site kernels: per-site means over the axes, then the weighted mean
@@ -97,9 +117,19 @@ SPLIT_CLF_DIAGNOSTICS: tuple[str, ...] = (
   "split_qform_human",
   "split_qform_osl_sites",
   "split_qform_osl_joints",
+  "split_vdot_fd_human",
+  "split_vdot_fd_osl",
+  "split_violation_saturated_human",
+  "split_violation_saturated_osl",
+  "split_clipped_recovering_human",
+  "split_clipped_recovering_osl",
 )
 """The CLF-only diagnostics. ``split_qform_<group>`` is the group's mean quadratic
-form per coordinate in V_max units: the V_norm it would have alone."""
+form per coordinate in V_max units: the V_norm it would have alone.
+``split_vdot_fd_<channel>`` is the channel V's finite-difference rate (at the
+current weights), ``split_violation_saturated_<channel>`` 1 where the violation is
+at its cap and ``split_clipped_recovering_<channel>`` 1 where the channel's reward
+is clipped at 0 while its V falls."""
 SPLIT_DIAGNOSTICS: tuple[str, ...] = (
   "split_reward_human",
   "split_reward_osl",
@@ -111,11 +141,19 @@ SPLIT_DIAGNOSTICS: tuple[str, ...] = (
   "split_penalty_osl",
   "split_err_osl_knee",
   "split_err_osl_ankle",
+  "split_regularizers_human",
+  "split_regularizers_osl",
+  "split_reg_joint_limits_human",
+  "split_reg_joint_limits_osl",
   *SPLIT_CLF_DIAGNOSTICS,
 )
 """Every key :class:`split_mimic_reward` adds to ``components``, (B,) each, read by
-``osl_mimic.mdp.mimic_component``. The penalties include the CLF violation, as
-stage 1's ``penalty_total`` does; ``split_err_osl_*`` are ``|q - q_ref|`` in rad."""
+``osl_mimic.mdp.mimic_component``. The penalties include the CLF violation and the
+regularizers, as stage 1's ``penalty_total`` does; ``split_err_osl_*`` are ``|q -
+q_ref|`` in rad. ``split_regularizers_<channel>`` is the scaled regularizer cost
+inside the channel's floor (the team's for both channels without owner penalties),
+``split_reg_joint_limits_<channel>`` the channel's joints' limit cost at its
+coefficient, before the scale."""
 SPLIT_CONTACT_DIAGNOSTICS: tuple[str, ...] = (
   "split_leg_contact",
   "split_leg_contact_force",
@@ -257,6 +295,15 @@ class split_mimic_reward(mimic_reward):
         [i for i, j in enumerate(torque) if j in OSL_TORQUE_JOINTS], device
       ),
     }
+    limits = getattr(self, "_limit_joints", ())
+    self._limit_index = {
+      "human": _index(
+        [i for i, j in enumerate(limits) if j not in OSL_TORQUE_JOINTS], device
+      ),
+      "osl": _index(
+        [i for i, j in enumerate(limits) if j in OSL_TORQUE_JOINTS], device
+      ),
+    }
 
     # Coordinates per group in each kernel that mixes groups.
     n_sites = {"human": len(human_sites), "osl_sites": len(osl_sites), "osl_joints": 0}
@@ -317,6 +364,14 @@ class split_mimic_reward(mimic_reward):
       env.num_envs, len(OSL_TORQUE_JOINTS), device=env.device
     )
     self._clf_joint: dict[str, torch.Tensor] = {}
+    # The V-dot window's quadratic-form sums per group (weight-independent), oldest
+    # first, and per env the fresh steps since its last episode start or reference
+    # jump, for the channels' finite-difference V-dot.
+    self._q_hist = {
+      group: torch.zeros(env.num_envs, self._vdot_window, device=env.device)
+      for group in GROUPS
+    }
+    self._q_since = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
 
   ##
   # Group weights.
@@ -432,6 +487,7 @@ class split_mimic_reward(mimic_reward):
     action_out_of_bounds_coeff: float = 0.01,
     joint_torque_weights: dict[str, float] | None = None,
     clf: ClfCfg | None = None,
+    regularizers: RegularizerCfg | None = None,
     channels: SplitRewardCfg | dict[str, Any] | None = None,
   ) -> torch.Tensor:
     del channels  # Read once, in __init__.
@@ -442,6 +498,7 @@ class split_mimic_reward(mimic_reward):
       action_out_of_bounds_coeff,
       joint_torque_weights,
       clf,
+      regularizers,
     )
     self._compute_channels(team)
     return team
@@ -478,15 +535,17 @@ class split_mimic_reward(mimic_reward):
       for channel in CHANNELS:
         totals[channel] = self._mimic_total(sums, self._group_weights[channel])
 
-    penalties = self._penalties()
+    penalties, regularized = self._penalties()
     diagnostics: dict[str, torch.Tensor] = {}
+    clf_channels: dict[str, dict[str, torch.Tensor]] = {}
     if self._clf is not None:
       clf_channels = self._clf_channels(diagnostics)
+      pen_w = self._clf.pen_scale * self._clf.pen_w
       for channel in CHANNELS:
         terms = clf_channels[channel]
         totals[channel] = totals[channel] + self._clf.w * terms["level"]
         # Outside the -1 floor, as in stage 1.
-        penalties[channel] = penalties[channel] - self._clf.pen_w * terms["violation"]
+        penalties[channel] = penalties[channel] - pen_w * terms["violation"]
 
     rewards = []
     for channel in CHANNELS:
@@ -496,11 +555,26 @@ class split_mimic_reward(mimic_reward):
       diagnostics[f"split_preclip_{channel}"] = preclip
       diagnostics[f"split_clipped_{channel}"] = (preclip < 0.0).float()
       diagnostics[f"split_penalty_{channel}"] = penalties[channel]
+      if clf_channels:
+        falling = clf_channels[channel]["vdot_fd"] < 0.0
+        recovering = ((preclip < 0.0) & falling).float()
+        diagnostics[f"split_clipped_recovering_{channel}"] = recovering
     self.channel_rewards = torch.stack(rewards, dim=-1)
 
     osl_err = self._stash("joint_q_err").index_select(-1, self._osl_joint_ids).abs()
     diagnostics["split_err_osl_knee"] = osl_err[:, 0]
     diagnostics["split_err_osl_ankle"] = osl_err[:, 1]
+    zeros = torch.zeros_like(team)
+    limits = self._reg_cache.get("joint_limits")
+    for channel in CHANNELS:
+      cost = regularized[channel]
+      diagnostics[f"split_regularizers_{channel}"] = zeros if cost is None else cost
+      index = self._limit_index[channel]
+      diagnostics[f"split_reg_joint_limits_{channel}"] = (
+        limits.index_select(-1, index).sum(-1)
+        if limits is not None and index.numel()
+        else zeros
+      )
     if self._leg_contact is not None:
       diagnostics.update(leg_contact_diagnostics(self._leg_contact.data))
     self.components.update(diagnostics)
@@ -609,26 +683,48 @@ class split_mimic_reward(mimic_reward):
 
     q_sums = _group_sums(qform(e, ed), self._clf_index)
     q_sums["osl_joints"] = qform(e_j, ed_j).sum(-1)
-    d_sums = _group_sums(qform_rate(e, ed, edd), self._clf_index)
-    d_sums["osl_joints"] = qform_rate(e_j, ed_j, edd_j).sum(-1)
+    paper = self._clf.decay_form == "paper"
+    d_sums: dict[str, torch.Tensor] = {}
+    if not paper:
+      d_sums = _group_sums(qform_rate(e, ed, edd), self._clf_index)
+      d_sums["osl_joints"] = qform_rate(e_j, ed_j, edd_j).sum(-1)
+    # Both ends of the window at this step's weights: V_t - V_{t-w} of one channel
+    # V, none until the window holds w fresh steps after a first step, a reference
+    # jump or the term's first call.
+    window = self._vdot_window
+    since = self._fresh_steps(first | (valid == 0.0), self._q_since)
+    fresh = since >= window
+    q_diff = {group: q_sums[group] - self._q_hist[group][:, 0] for group in q_sums}
+    self._q_hist = {
+      group: torch.cat(
+        [self._q_hist[group][:, 1:].to(q.dtype), q.detach()[:, None]], dim=-1
+      )
+      for group, q in q_sums.items()
+    }
+    self._q_since = since
 
     out: dict[str, dict[str, torch.Tensor]] = {}
     for channel in CHANNELS:
       weights = self._group_weights[channel]
       v = self._weighted_mean("clf", q_sums, weights).clamp(min=0.0)
-      vdot = 2.0 * self._weighted_mean("clf", d_sums, weights)
-      violation = ((vdot + self._alpha * v - self._eps_dead) / self._viol_norm).clamp(
-        0, 1
-      )
+      vdot_fd = self._weighted_mean("clf", q_diff, weights) / (window * self._clf_dt)
+      vdot_fd = torch.where(fresh, vdot_fd, torch.zeros_like(vdot_fd))
+      vdot = None if paper else 2.0 * self._weighted_mean("clf", d_sums, weights)
+      violation = self._violation(v, vdot_fd, vdot)
       violation = violation * (~first).float() * valid
+      if paper and window > 1:
+        violation = violation * fresh.float()
       v_norm = v / self._v_max
       level = torch.where(
         torch.isfinite(v_norm), torch.exp(-v_norm.clamp(max=5.0)), torch.zeros_like(v)
       )
-      out[channel] = {"level": level, "violation": violation}
+      out[channel] = {"level": level, "violation": violation, "vdot_fd": vdot_fd}
       diagnostics[f"split_V_norm_{channel}"] = v_norm
       diagnostics[f"split_level_{channel}"] = level
       diagnostics[f"split_violation_{channel}"] = violation
+      diagnostics[f"split_vdot_fd_{channel}"] = vdot_fd
+      saturated = (violation >= 1.0).float()
+      diagnostics[f"split_violation_saturated_{channel}"] = saturated
 
     counts = self._kernel_counts["clf"]
     for group in GROUPS:
@@ -644,16 +740,25 @@ class split_mimic_reward(mimic_reward):
   # Penalties.
   ##
 
-  def _penalties(self) -> dict[str, torch.Tensor]:
-    """Per channel, the action penalties before the CLF violation, floored at -1."""
+  def _penalties(
+    self,
+  ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | None]]:
+    """Per channel, the action penalties and the channel's regularizers before the
+    CLF violation, floored at -1; and per channel the scaled regularizer cost
+    inside that floor (None without one)."""
     if not self._split.owner_penalties:
       team = self._stash("penalty")
-      return {channel: team for channel in CHANNELS}
+      reg = self.components.get("reg_total")
+      return (
+        {channel: team for channel in CHANNELS},
+        {channel: reg for channel in CHANNELS},
+      )
     action = self._stash("action")
     excess = (-1.0 - action).clamp(min=0.0) + (action - 1.0).clamp(min=0.0)
     squared = excess.square()
     qfrc = self._cache["qfrc"]
     torque = None if qfrc is None else self._torque_weights * qfrc.square()
+    regularized = self._channel_regularizers()
     out: dict[str, torch.Tensor] = {}
     for agent in AGENTS:
       rows = squared.index_select(-1, self._action_rows[agent]).sum(-1)
@@ -661,7 +766,31 @@ class split_mimic_reward(mimic_reward):
       index = self._torque_index[agent]
       if torque is not None and index.numel():
         penalty = penalty - torque.index_select(-1, index).sum(-1)
+      cost = regularized[agent]
+      if cost is not None:
+        penalty = penalty - cost
       out[agent] = penalty.clamp(min=-1.0)
+    return out, regularized
+
+  def _channel_regularizers(self) -> dict[str, torch.Tensor | None]:
+    """Per channel, its regularizers' cost times ``scale`` (None without one): the
+    stage-1 term's costs (``_reg_cache``) by owner (:data:`REGULARIZER_OWNERS`), the
+    joint limits by joint."""
+    out: dict[str, torch.Tensor | None] = dict.fromkeys(CHANNELS)
+    cfg, costs = self._regularizers, self._reg_cache
+    if cfg is None or not costs or float(cfg.scale) == 0.0:
+      return out
+    limits = costs.get("joint_limits")
+    for channel in CHANNELS:
+      parts = [costs[name] for name in REGULARIZER_OWNERS[channel] if name in costs]
+      index = self._limit_index[channel]
+      if limits is not None and index.numel():
+        parts.append(limits.index_select(-1, index).sum(-1))
+      if parts:
+        total = parts[0]
+        for part in parts[1:]:
+          total = total + part
+        out[channel] = float(cfg.scale) * total
     return out
 
 

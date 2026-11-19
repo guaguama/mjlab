@@ -13,9 +13,9 @@ from .env_cfgs import NUM_ENVS, Reward
 
 NUM_STEPS = 80
 TOTAL_TIMESTEPS = 1_000_000_000
-NUM_UPDATES = (
-  TOTAL_TIMESTEPS // NUM_STEPS // NUM_ENVS
-)  # 6103, as musclemimic computes it.
+# musclemimic's formula; at 4096 envs that is 3051 updates, half of musclemimic's
+# 6103 at its 2048 envs.
+NUM_UPDATES = TOTAL_TIMESTEPS // NUM_STEPS // NUM_ENVS
 NUM_VALIDATIONS = 100
 HIDDEN_DIMS = (1024,) * 12 + (2048,) * 3 + (1024,)
 INIT_STD = {"robot": 0.2, "msk": 3.0}
@@ -96,7 +96,8 @@ class OslMimicValidationCfg:
   """In-training validation; see :mod:`mjlab.tasks.osl_mimic.rl.runner`."""
 
   interval: int = NUM_UPDATES // NUM_VALIDATIONS
-  """Iterations between validations (61). 0 disables validation."""
+  """Iterations between validations (30 at 4096 envs; musclemimic's 61 at 2048). 0
+  disables validation."""
   num_envs: int = 100
   num_steps: int = 0
   """Steps per validation; 0 runs one clip length."""
@@ -151,6 +152,18 @@ class OslMimicVideoCfg:
   plays the same command sequence. Training's random state is left untouched."""
 
 
+CLF_ENV_STAGES: tuple[tuple[int, str, float], ...] = (
+  (500, "rewards.mimic.params.clf.pen_scale", 0.0),
+  (1000, "rewards.mimic.params.clf.pen_scale", 0.5),
+  (500, "rewards.mimic.params.regularizers.scale", 0.0),
+  (1000, "rewards.mimic.params.regularizers.scale", 0.5),
+)
+"""Every CLF task's ramps: the CLF decrease condition (``pen_scale``) and the
+regularizers (``scale``) off until update 500, at half until 1000, then whole.
+Early in training the CLF level is about 0.1 and the reward's clip at 0 binds: the
+decrease condition's level part alone outweighs the level above V_norm ~2.1."""
+
+
 @dataclass
 class OslMimicRunnerCfg(RslRlOnPolicyRunnerCfg):
   validation: OslMimicValidationCfg = field(default_factory=OslMimicValidationCfg)
@@ -159,10 +172,20 @@ class OslMimicRunnerCfg(RslRlOnPolicyRunnerCfg):
   """Training-env settings staged by PPO update. Each ``(until_update, path, value)``
   runs ``value`` before update ``until_update`` and the env config's own value from
   then on; where two stages of one path overlap, the earlier-ending one holds.
-  ``path`` is ``rewards.<term>.weight`` or ``terminations.<term>.<param>``. The
-  update count is the algorithm's, which checkpoints carry, so a resumed run starts
-  in the right stage. On the command line, e.g.
-  ``--agent.env-stages "((1500,'terminations.root_deviation.threshold',1.0),)"``."""
+  ``path`` is ``rewards.<term>.weight``, ``rewards.<term>.params.<param>``,
+  ``rewards.<term>.params.<param>.<field>`` (a field of a config-object param, such
+  as ``rewards.mimic.params.clf.pen_scale``) or ``terminations.<term>.<param>``.
+  The update count is the algorithm's, which checkpoints carry, so a resumed run
+  starts in the right stage. The CLF tasks default to :data:`CLF_ENV_STAGES`. On the
+  command line, e.g.
+  ``--agent.env-stages "((1500,'terminations.root_deviation.threshold',1.0),)"``;
+  ``--agent.env-stages "()"`` turns every stage off."""
+  allow_reward_mismatch: bool = False
+  """Resume (``--agent.resume``) a checkpoint whose run trained another reward than
+  this config's (another CLF decrease condition or regularizers, or other env
+  stages for them); refused otherwise, naming the flags that rebuild the run's
+  reward. The checkpoint's critic and return statistics then value another
+  reward."""
 
 
 def osl_mimic_runner_cfg(
@@ -197,4 +220,5 @@ def osl_mimic_runner_cfg(
     # state); musclemimic keeps 10.
     save_interval=610,
     wandb_tags=("osl_fullbody", model, reward),
+    env_stages=CLF_ENV_STAGES if reward == "clf" else (),
   )

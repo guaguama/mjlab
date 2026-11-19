@@ -15,7 +15,17 @@ from .observations import touch as touch
 from .reference import MimicLookahead as MimicLookahead
 from .reference import MimicReference as MimicReference
 from .reference import MimicReferenceSource as MimicReferenceSource
+from .rewards import ACTIVATION_DIAGNOSTIC as ACTIVATION_DIAGNOSTIC
+from .rewards import CLF_EXTRA_DIAGNOSTICS as CLF_EXTRA_DIAGNOSTICS
+from .rewards import LIMIT_JOINTS as LIMIT_JOINTS
+from .rewards import REGULARIZER_DIAGNOSTICS as REGULARIZER_DIAGNOSTICS
+from .rewards import REGULARIZERS as REGULARIZERS
+from .rewards import ROBOT_VDOT_WINDOW as ROBOT_VDOT_WINDOW
+from .rewards import SERVO_LOG_DIAGNOSTICS as SERVO_LOG_DIAGNOSTICS
 from .rewards import ClfCfg as ClfCfg
+from .rewards import RegularizerCfg as RegularizerCfg
+from .rewards import clf_cfg as clf_cfg
+from .rewards import clf_regularizers as clf_regularizers
 from .rewards import mimic_component as mimic_component
 from .rewards import mimic_reward as mimic_reward
 from .terminations import mean_site_deviation as mean_site_deviation

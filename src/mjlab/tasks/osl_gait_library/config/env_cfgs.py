@@ -111,10 +111,13 @@ UNICYCLE_MSK_TWIST_WEIGHT = 0.2
 """The twist term's weight (``TWIST_WEIGHT`` elsewhere). Curved walks that fail turn
 too slowly and fall inward; 0.2 cut forward and tight-arc failures and the yaw-rate
 error, with stress survival unchanged."""
-UNICYCLE_MSK_CLF_PEN_W = 0.0
-"""The CLF decrease-condition penalty (0.25 elsewhere). It saturated at a constant
--0.22 that, with the reward clipped at 0, zeroed the reward of every state far from
-the reference; without it training led on every metric from iteration 50."""
+# The CLF decrease condition is osl_mimic's default here too: the graded "paper"
+# form at pen_w 0.5, ramped in by the runner's env stages. Until 2026-11-18 these
+# tasks set musclemimic's form to pen_w 0, because that form saturated at a constant
+# -0.22 which, with the reward clipped at 0, zeroed the reward of every state far
+# from the reference. Reproduce those runs with
+# --env.rewards.mimic.params.clf.decay-form musclemimic
+# --env.rewards.mimic.params.clf.pen-w 0 and the regularizers at 0.
 
 
 def osl_gait_library_env_cfg(
@@ -179,9 +182,6 @@ def osl_gait_library_env_cfg(
 
   if variant == "unicycle" and model == "msk":
     cfg.rewards["twist"].weight = UNICYCLE_MSK_TWIST_WEIGHT
-    clf = cfg.rewards["mimic"].params["clf"]
-    if clf is not None:
-      clf.pen_w = UNICYCLE_MSK_CLF_PEN_W
     if "root_deviation" in cfg.terminations:  # Training mode only.
       root = cfg.terminations["root_deviation"]
       root.params = {**root.params, "threshold": UNICYCLE_MSK_ROOT_DEVIATION}

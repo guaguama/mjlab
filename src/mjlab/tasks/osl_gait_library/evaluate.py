@@ -158,6 +158,9 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
   env_cfg.scene.num_envs = 2  # The runner needs a training env; the evals own theirs.
 
   agent_cfg = asdict(load_rl_cfg(task_id))
+  # It loads the whole checkpoint but trains nothing: the resume's reward check (the
+  # run's reward vs this task's) does not apply.
+  agent_cfg["allow_reward_mismatch"] = True
   agent_cfg["logger"] = "tensorboard"
   agent_cfg["video"] = {**agent_cfg.get("video", {}), "enabled": False}
   # The checkpoint's own std, untouched by any training-time bound.

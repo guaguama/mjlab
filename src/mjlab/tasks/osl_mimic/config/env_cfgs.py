@@ -15,6 +15,22 @@ What carries over unchanged:
 * starts: the exact reference state at a uniformly random frame, with no noise,
   pushes or randomization; episodes end at the clip's last frame;
 * observations, actions, reward and terminations, term for term (see ``mdp``).
+
+The CLF tasks add CLF-RL's decrease condition and regularizers to musclemimic's
+reward (``mdp.clf_cfg``: ``decay_form="paper"``, ``pen_w`` 0.5, and a 10-step V-dot
+window on the robot; ``mdp.clf_regularizers``: the OSL action rate and the leg and
+OSL joint limits, plus the servos' action rate on the robot, which also logs its
+servo torque costs), ramped in by the runner's env stages (``config/rl_cfg.py``).
+musclemimic's ``CLFReward`` comes back with all of
+``--env.rewards.mimic.params.clf.decay-form musclemimic``,
+``--env.rewards.mimic.params.clf.pen-w 0.25``, every regularizer at 0
+(``--env.rewards.mimic.params.regularizers.<name> 0``) and the old env stages:
+``--agent.env-stages "()"`` here. Without that last flag the ramps still scale
+``pen_w`` (0, then 0.125, until update 1000). The gait-library unicycle MSK tasks
+take ``pen-w 0`` and keep their recipe's own stages instead (its
+``UNICYCLE_MSK_ENV_STAGES`` as the ``--agent.env-stages`` literal); stage 2 takes
+``--agent.env-stages "()"``. The MimicReward tasks keep musclemimic's reward: every
+regularizer is 0 there.
 """
 
 from __future__ import annotations
@@ -105,7 +121,21 @@ DIAGNOSTICS = (
   "err_site_abs",
   "err_rpos",
 )
-CLF_DIAGNOSTICS = ("clf_V", "clf_V_norm", "clf_violation", "clf_level", "clf_vdot")
+CLF_DIAGNOSTICS = (
+  "clf_V",
+  "clf_V_norm",
+  "clf_violation",
+  "clf_level",
+  "clf_vdot",
+  *mdp.CLF_EXTRA_DIAGNOSTICS,
+)
+SERVO_REGULARIZER_DIAGNOSTICS = (
+  "reg_servo_action_rate",
+  "reg_servo_torque",
+  "reg_servo_saturation",
+)
+"""The robot model's servo regularizers, always 0 on the musculoskeletal model,
+whose metrics leave them out."""
 
 
 @lru_cache(maxsize=1)
@@ -258,11 +288,22 @@ def osl_mimic_env_cfg(
         "weights": CLF_WEIGHTS if clf else MIMIC_WEIGHTS,
         "action_out_of_bounds_coeff": 0.01,
         "joint_torque_weights": OSL_TORQUE_WEIGHTS,
-        "clf": mdp.ClfCfg() if clf else None,
+        "clf": mdp.clf_cfg(model) if clf else None,
+        # Always present (all 0 under MimicReward), so the command line reaches it.
+        "regularizers": (mdp.clf_regularizers(model) if clf else mdp.RegularizerCfg()),
       },
     )
   }
   names = DIAGNOSTICS + (CLF_DIAGNOSTICS if clf else ())
+  names += tuple(
+    name
+    for name in mdp.REGULARIZER_DIAGNOSTICS
+    if model == "robot" or name not in SERVO_REGULARIZER_DIAGNOSTICS
+  )
+  if model == "msk":
+    names += (mdp.ACTIVATION_DIAGNOSTIC,)
+  elif clf:  # clf_regularizers logs the robot's servo costs.
+    names += mdp.SERVO_LOG_DIAGNOSTICS
   metrics = {
     name: MetricsTermCfg(func=mdp.mimic_component, params={"name": name})
     for name in names

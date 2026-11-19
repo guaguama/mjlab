@@ -212,12 +212,8 @@ def test_env_is_stairs_stage1_through_the_split_stage(model: str) -> None:
     assert mimic.func is split_mimic_reward and mimic.weight == 1.0
     params = dict(mimic.params)
     assert params.pop("channels") == SplitRewardCfg()
-    clf = params.pop("clf")
-    stage1_params = dict(stage1_mimic.params)
-    stage1_clf = stage1_params.pop("clf")
-    assert params == stage1_params
-    assert clf.pen_w == (0.0 if model == "msk" else stage1_clf.pen_w)
-    assert replace(clf, pen_w=stage1_clf.pen_w) == stage1_clf
+    # Stairs stage 1's reward, the CLF and its regularizers included.
+    assert params == dict(stage1_mimic.params)
 
     split = {name for name in unicycle.metrics if name.startswith("split_")}
     assert split and set(cfg.metrics) == set(stage1.metrics) | split
@@ -458,7 +454,7 @@ def _stage1_checkpoint() -> dict[str, Any]:
 
 
 def _stage1_run(
-  root: Path, clip: Path, kind: str = "stairs", pen_w: float = 0.0
+  root: Path, clip: Path, kind: str = "stairs", pen_w: float = 0.5
 ) -> Path:
   """A stage-1 run as ``train`` writes it: ``kind`` ``"stairs"`` (stairs stage
   1 on ``clip``, its terrain copied), ``"flat"`` (osl_mimic on ``clip``, flat
@@ -467,6 +463,9 @@ def _stage1_run(
   agent = osl_stairs_runner_cfg("msk", "compliant", "clf", STAGE1_EXPERIMENT)
   agent.actor.hidden_dims = HIDDEN
   agent.critic.hidden_dims = HIDDEN
+  # A short run standing for a finished one: no reward ramp still in force at its
+  # end (the lineage records the ramps' values there).
+  agent.env_stages = ()
   dump_yaml(run_dir / "params" / "agent.yaml", asdict(agent))
   env_yaml = run_dir / "params" / "env.yaml"
   if kind == "library":
@@ -508,7 +507,7 @@ def test_warm_start_from_a_stairs_stage1_run(
   assert lineage["variant"] is None and lineage["library_dir"] is None
   assert lineage["library_release"] is None
   assert lineage["experiment_name"] == STAGE1_EXPERIMENT
-  assert lineage["stage1_env"]["clf_pen_w"] == 0.0
+  assert lineage["stage1_env"]["clf_pen_w"] == 0.5
   assert lineage["stage1_env"]["root_deviation"] == 1.0
   assert lineage["stage1_env"]["twist_weight"] is None
   assert lineage_touch_sites(lineage) == "feet_extended"
@@ -529,7 +528,7 @@ def test_warm_start_refuses_another_pen_w(tmp_path: Path) -> None:
   train = _training_cfg(tmp_path)
   run = _stage1_run(tmp_path, tmp_path / "clip.npz", pen_w=0.25)
   runner = _runner(train)
-  with pytest.raises(ValueError, match="pen_w 0.25; stage 2's is 0"):
+  with pytest.raises(ValueError, match="pen_w x pen_scale 0.25 vs 0.5"):
     runner.warm_start(build_warm_start(run))
   assert not runner._ready
 
@@ -651,8 +650,8 @@ def test_stairs_stage2_smoke(tmp_path: Path) -> None:
   agent.validation.stress_num_envs = 4
   agent.validation.stress_num_steps = 20
   agent.warm_start.path = str(ws_path)
-  # Any stairs stage-1 run will do for plumbing, whatever its CLF penalty weight.
-  agent.warm_start.allow_pen_w_mismatch = True
+  # Any stairs stage-1 run will do for plumbing, whatever its reward settings.
+  agent.warm_start.allow_reward_mismatch = True
 
   env = make_env(play=False, num_envs=8)
   log_dir = tmp_path / "run"

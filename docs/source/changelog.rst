@@ -184,6 +184,46 @@ Added
   alone with ``components`` ``{sensor: [1]}``, and its ``sensor_set`` adds
   ``ankle_load_cell_axial`` and ``socket_load_cell_axial``. Sets without an axial
   cell, and every older run, record and bundle, rebuild and export as before.
+- The OSL imitation reward (``mimic_reward``) can impose CLF-RL's (Olkin et al.,
+  arXiv 2603.25902) graded, rate-based CLF decrease condition: with
+  ``ClfCfg.decay_form="paper"`` the violation is ``clip(max(Vdot + decay_rate V, 0)
+  / (decay_norm_rate V_max), 0, 1)`` (lambda 0.5/s, normalizer 4.5/s) with a
+  finite-difference ``Vdot`` over ``ClfCfg.vdot_window`` steps, ``(V_t - V_{t-w}) /
+  (w dt)`` (default 1, the one-step form); the violation is 0 until ``w`` steps
+  follow an episode's start or a reference jump. ``"musclemimic"`` keeps
+  ``CLFReward``'s form, whose ``alpha V`` alone saturates it away from the
+  reference, and ignores the window. ``ClfCfg.pen_scale`` multiplies ``pen_w`` for
+  env stages. Stage 2 differences each reward channel's V over the window's
+  per-group sums at the current group weights, so the OSL channel's anneal adds no
+  V-dot.
+- Regularizers inside the OSL imitation reward's clip at 0, with their own
+  coefficients (``--env.rewards.mimic.params.regularizers.<name>``,
+  ``RegularizerCfg``): the action rate of the OSL motors (``osl_action_rate``) and
+  of the robot model's servos (``servo_action_rate``), each the mean squared change
+  of the clipped action over its own rows, 0 on an episode's first step; the hard
+  joint-limit excess (``joint_limits``, rad, over ``joint_limit_joints``: both
+  hips, the intact knee and ankle and the OSL knee and ankle); and the robot
+  servos' normalized torque (``servo_torque``) and PD-demand saturation from the
+  applied target (``servo_saturation``). They are subtracted with the action
+  penalties inside the -1 floor, times ``scale``; in stage 2 each goes to its owner
+  (the OSL rows and joints to the OSL channel, the servos and the human joints to
+  the human channel). New diagnostics: ``clf_vdot_fd``,
+  ``clf_violation_saturated``, ``clf_clipped_recovering``, ``reg_<name>``,
+  ``reg_total``, their ``split_*_<channel>`` counterparts and, on the
+  musculoskeletal model, the metric ``activation_energy`` (``mean(act^2)``, never
+  rewarded). With ``RegularizerCfg.log_servo_terms`` the robot servos' torque and
+  saturation costs are logged every step, unweighted, as ``servo_torque_cost`` and
+  ``servo_saturation_cost``, whatever their coefficients; they never reach the
+  reward.
+- Env stages can stage reward-term parameters, also fields of config-object
+  parameters (``rewards.<term>.params.<param>[.<field>]``, e.g.
+  ``rewards.mimic.params.clf.pen_scale``), and the stage-2 split runner takes env
+  stages (``--agent.env-stages``) keyed on the stage-local iteration, kept with the
+  curriculum a checkpoint records. A class reward term can be staged only in the
+  params it reads every step (its ``LIVE_PARAMS``; ``mimic``'s are ``clf.w``,
+  ``pen_w``, ``pen_scale``, ``tau``, ``decay_rate``, ``decay_norm_rate`` and the
+  regularizers' ``scale`` and coefficients); staging any other is refused, as is a
+  value that is not a number.
 - ``osl_fullbody`` to the asset zoo: a full-body model of a right transfemoral
   amputee with an Open-Source Leg prosthesis, in four variants. ``get_osl_robot_cfg``
   is the joint-actuated twin (27 position servos and the 2 OSL torque motors) and
@@ -333,6 +373,42 @@ Changed
   contact sensors (``mjSENS_TOUCH``) only when observed. Stage 1.5 keeps the
   two-cell set for its clean group.
 
+- Every OSL CLF task (single-clip, gait-library unicycle and stairs stage 1, the
+  stage-2 split and stage-1.5 FSM tasks; both models) trains with the CLF-RL reward
+  by default: the paper-form decrease condition at ``pen_w`` 0.5 (the paper's 10:-5
+  to the level term), with ``Vdot`` over 10 steps on the robot model and over 1 on
+  the musculoskeletal model (``vdot_window``); the OSL action rate and the joint
+  limits at 1 and, on the robot model, the servo action rate at 1; the servo torque
+  terms stay 0, and the robot model logs them (``log_servo_terms``). Env stages ramp
+  them in: in stage 1 ``pen_scale`` and the regularizers' ``scale`` are 0 until
+  update 500 and 0.5 until 1000; in stage 2 ``pen_scale`` is 0 until k = 160 and the
+  regularizers' ``scale`` 0 until k = 100. The musculoskeletal unicycle and stairs
+  stage-2 tasks no longer set ``pen_w`` 0. The MimicReward tasks keep musclemimic's
+  reward. The old reward is reachable bit for bit:
+  ``--env.rewards.mimic.params.clf.decay-form musclemimic``, the old ``pen_w``
+  (``--env.rewards.mimic.params.clf.pen-w``: 0 for the musculoskeletal unicycle
+  tasks and everything built on them, 0.25 elsewhere), every regularizer at 0
+  (``--env.rewards.mimic.params.regularizers.osl-action-rate 0``,
+  ``...servo-action-rate 0``, ``...joint-limits 0``) and the old env stages
+  (``--agent.env-stages``: stage 1's recipe stages alone, ``"()"`` in stage 2); the
+  V-dot window and the servo-cost log leave that reward untouched.
+- The stage-2 warm start records stage 1's reward settings (the CLF decrease
+  condition's form, rates, ``pen_w`` and ``pen_scale``, the regularizers'
+  coefficients, scale and joints) and refuses a stage-1 run whose reward differs
+  from stage 2's unless ``--agent.warm-start.allow-reward-mismatch True``
+  (``--agent.warm-start.allow-pen-w-mismatch`` still works). A stage-1 run from
+  before this change counts as musclemimic's decrease condition with no
+  regularizers, so warm-starting the default stage 2 from it needs the flag. The
+  V-dot window is compared only where both rewards impose the paper form.
+- Resuming an OSL training run (the stage-1 and the stage-2 runner) refuses a
+  checkpoint whose run trained on another reward than the resumed config's, unless
+  ``--agent.allow-reward-mismatch True``, and names the flags that rebuild the run's
+  reward. It compares the settings the warm start compares, once every env stage
+  has ended and at the update the resume trains first. Every checkpoint now records
+  them (``reward_settings``); for an older checkpoint they come from its run's
+  ``params/env.yaml`` and ``agent.yaml``. ``play.py``'s actor-only load is not
+  checked, and the gait-library evaluation only warns.
+
 - Bumped ``rsl-rl-lib`` from 5.5.0 to 5.5.1. This removes the need for capping
   ``wandb`` below 0.29.
 
@@ -343,6 +419,14 @@ Changed
 Fixed
 ^^^^^
 
+- The gait-library reference serves the relative site velocity ``rvel`` at the
+  anchor's heading. It was computed once at each clip's own heading and served
+  unturned, while the positions and other velocities turned with the anchor, so a
+  perfect tracker lost up to 0.086 reward per step at turned headings in the
+  MimicReward gait-library, split and FSM tasks. Under the CLF the reward is
+  unchanged; its rvel diagnostics change at turned headings: ``reward_rvel_rot`` and
+  ``reward_rvel_lin`` (training metrics) and ``dist_rel_site_vel`` (validation).
+  Observations and exports are unaffected.
 - The OSL stairs tasks reset an environment whose physics state turns NaN
   (``nan_detection`` termination) instead of crashing the run. mujoco_warp's
   convex collision can return NaN when a fall drives a 2 mm finger ellipsoid

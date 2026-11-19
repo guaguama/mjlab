@@ -12,10 +12,10 @@ the leg-contact sensor, no ``critic`` group, the ``osl`` group from the same bui
 defaults), and the split reward with its metrics. Stairs has no twist term, so each
 agent trains on its own reward channel alone.
 
-One default differs from stairs stage 1's: the musculoskeletal model's CLF penalty
-weight ``pen_w`` is unicycle stage 2's (0, not osl_mimic's 0.25). The warm start
-refuses a stage-1 run trained with another (``--env.rewards.mimic.params.clf.pen-w``
-sets it).
+The reward is stairs stage 1's (osl_mimic's, which unicycle stage 2 shares): under
+the CLF the graded decrease condition at ``pen_w`` 0.5 and the regularizers. The
+warm start refuses a stage-1 run trained with other reward settings
+(``--agent.warm-start.allow-reward-mismatch True`` starts anyway).
 
 :class:`OslSplitStairsEnvCfg` is both packages' config class at once: whenever it is
 constructed, which tyro does after applying the command line, it builds the touch
@@ -31,12 +31,10 @@ from dataclasses import dataclass, fields
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
 from mjlab.tasks.osl_gait_library.config.dr import OslDrCfg
-from mjlab.tasks.osl_gait_library.config.env_cfgs import UNICYCLE_MSK_CLF_PEN_W
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward
 from mjlab.tasks.osl_split import mdp
 from mjlab.tasks.osl_split.config.env_cfgs import (
   PERCEPTION_DR_REFUSAL,
-  REWARD_NAME,
   OslSplitEnvCfg,
   apply_split_stage,
 )
@@ -79,9 +77,5 @@ def osl_split_stairs_env_cfg(
   if dr_cfg is not None and (dr_cfg.encoder_bias or dr_cfg.obs_noise):
     raise ValueError(PERCEPTION_DR_REFUSAL)
   cfg = osl_stairs_env_cfg(model, socket, reward, mode, dr_cfg)
-  if model == "msk":
-    clf = cfg.rewards[REWARD_NAME].params["clf"]
-    if clf is not None:
-      clf.pen_w = UNICYCLE_MSK_CLF_PEN_W
   apply_split_stage(cfg, reward, mode, osl_obs)
   return OslSplitStairsEnvCfg(**{f.name: getattr(cfg, f.name) for f in fields(cfg)})

@@ -30,8 +30,13 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket, Tou
 from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_cfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward, _actions
-from mjlab.tasks.osl_mimic.config.rl_cfg import MuscleMimicPpoCfg
-from mjlab.tasks.osl_mimic.mdp.rewards import ClfCfg
+from mjlab.tasks.osl_mimic.config.rl_cfg import CLF_ENV_STAGES, MuscleMimicPpoCfg
+from mjlab.tasks.osl_mimic.mdp.rewards import (
+  LIMIT_JOINTS,
+  ClfCfg,
+  RegularizerCfg,
+  clf_regularizers,
+)
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_mimic.rl.muon import MuonAdam
 from mjlab.tasks.osl_mimic.rl.ppo import MuscleMimicPPO
@@ -50,6 +55,7 @@ from mjlab.tasks.osl_split.rl.warmstart import (
   compare_library_releases,
   default_output_path,
   env_cfg_settings,
+  env_stage_setting,
   env_stages_in_force,
   find_wandb_run_id,
   library_release,
@@ -59,6 +65,8 @@ from mjlab.tasks.osl_split.rl.warmstart import (
   load_warm_start,
   provenance_lines,
   resolve_stage1_checkpoint,
+  reward_mismatches,
+  reward_settings,
   stage1_env_settings,
   stage1_learning_rate,
   stage1_std_cap,
@@ -360,13 +368,16 @@ def test_lineage(tmp_path: Path, model: Model) -> None:
   fraction = 1.0 - 12 / algorithm.lr_schedule_updates
   assert lineage["stage1_lr"] == pytest.approx(4e-4 * (final + (1 - final) * fraction))
   assert lineage["stage1_std_cap"] == (1.0 if model == "msk" else None)
-  stages = (
-    {"terminations.root_deviation.threshold": 1.0, "rewards.twist.weight": 0.06}
-    if model == "msk"
-    else {}
-  )
+  # The CLF ramps are in force at update 12, and on the MSK model the recipe's.
+  stages = {path: 0.0 for _, path, _ in CLF_ENV_STAGES}
+  if model == "msk":
+    stages.update(
+      {"terminations.root_deviation.threshold": 1.0, "rewards.twist.weight": 0.06}
+    )
   assert lineage["stage1_env"] == {
-    "clf_pen_w": None,
+    **reward_settings(None, None),  # This env.yaml records no reward.
+    "clf_pen_scale": 0.0,
+    "reg_scale": 0.0,
     "twist_weight": stages.get("rewards.twist.weight"),
     "root_deviation": stages.get("terminations.root_deviation.threshold"),
     "env_stages_in_force": stages,
@@ -776,8 +787,9 @@ def test_stage1_rate_and_cap_follow_muscle_mimic_ppo(algorithm: dict) -> None:
 
 
 def test_stage1_env_settings(tmp_path: Path) -> None:
-  """The env settings of stage 1's last update: env.yaml's final values, with the
-  env stages still in force at that update on top."""
+  """The env settings of stage 1's last update: env.yaml's final values (the reward
+  settings among them), with the env stages still in force at that update on
+  top."""
   env_cfg = osl_gait_library_env_cfg("msk", "compliant", "clf", "train", "unicycle")
   clf = env_cfg.rewards["mimic"].params["clf"]
   assert isinstance(clf, ClfCfg)
@@ -785,33 +797,144 @@ def test_stage1_env_settings(tmp_path: Path) -> None:
   dump_yaml(tmp_path / "params" / "env.yaml", asdict(env_cfg))
   agent = {
     "env_stages": (
+      *CLF_ENV_STAGES,
       (1500, "terminations.root_deviation.threshold", 1.0),
       (3000, "rewards.twist.weight", 0.06),
     )
   }
+  reward = {
+    "clf_pen_w": 0.25,
+    "clf_pen_scale": 1.0,
+    "clf_decay_form": "paper",
+    "clf_decay_rate": 0.5,
+    "clf_decay_norm_rate": 4.5,
+    "clf_vdot_window": 1,  # The musculoskeletal model's one-step V-dot.
+    "reg_scale": 1.0,
+    "reg_osl_action_rate": 1.0,
+    "reg_servo_action_rate": 0.0,
+    "reg_joint_limits": 1.0,
+    "reg_servo_torque": 0.0,
+    "reg_servo_saturation": 0.0,
+    "reg_joint_limit_joints": list(LIMIT_JOINTS),
+  }
   settings = stage1_env_settings(tmp_path, agent, num_updates_done=2000)
   assert settings == {
-    "clf_pen_w": 0.25,
+    **reward,
     "twist_weight": 0.06,  # Staged until update 3000.
     "root_deviation": 2.0,  # The env config's own from update 1500.
     "env_stages_in_force": {"rewards.twist.weight": 0.06},
   }
   done = stage1_env_settings(tmp_path, agent, num_updates_done=4500)
   assert done is not None and done["twist_weight"] == 0.2
+  # A run stopped during the ramps trained with the scales then in force.
+  early = stage1_env_settings(tmp_path, agent, num_updates_done=700)
+  assert early is not None
+  assert early["clf_pen_scale"] == early["reg_scale"] == 0.5
   # The live config reads alike; validation has no root-deviation limit.
   assert env_cfg_settings(env_cfg) == {
-    "clf_pen_w": 0.25,
+    **reward,
     "twist_weight": 0.2,
     "root_deviation": 2.0,
   }
   validation = osl_gait_library_env_cfg("msk", "compliant", "mimic", "validation")
   assert env_cfg_settings(validation)["clf_pen_w"] is None
   assert env_cfg_settings(validation)["root_deviation"] is None
+  assert env_cfg_settings(validation)["reg_osl_action_rate"] == 0.0
   assert stage1_env_settings(tmp_path / "missing", agent, 10) is None
   assert env_stages_in_force(agent["env_stages"], 1499) == {
     "terminations.root_deviation.threshold": 1.0,
     "rewards.twist.weight": 0.06,
   }
+
+
+ROUND6_CLF = {
+  "w": 1.0,
+  "pen_w": 0.0,
+  "tau": 0.1,
+  "q_pos": 1.0,
+  "q_vel": 1.0,
+  "r": 0.1,
+  "alpha": None,
+  "alpha_safety": 0.5,
+  "c_viol": 0.1,
+  "eps_dead": 0.01,
+  "scales": {"rpos": 0.05, "rangles": 0.2, "root_pos": 0.1, "root_ori": 0.2},
+}
+"""The round-6 seed-7 teacher's ``clf`` block, as its env.yaml records it."""
+
+
+def test_reward_settings_of_old_runs_and_their_mismatches() -> None:
+  """A run from before 2026-11-18 (no decrease-condition form, no regularizers)
+  trained with musclemimic's condition and no regularizers. Settings differ where
+  the reward does: the effective CLF penalty and regularizers, the condition's
+  form and rates only where both penalize it, the joints only where both
+  penalize limits."""
+  legacy = reward_settings(ROUND6_CLF, None)
+  assert legacy["clf_decay_form"] == "musclemimic" and legacy["clf_pen_scale"] == 1.0
+  assert legacy["reg_osl_action_rate"] == legacy["reg_joint_limits"] == 0.0
+  new = reward_settings(ClfCfg(), clf_regularizers("msk"))
+  lines = [
+    "CLF penalty pen_w x pen_scale 0 vs 0.5",
+    "regularizer osl_action_rate (x scale) 0 vs 1",
+    "regularizer joint_limits (x scale) 0 vs 1",
+  ]
+  assert reward_mismatches(legacy, new) == lines
+  # A lineage converted before the reward settings were recorded reads the same.
+  old_lineage = {"clf_pen_w": 0.0, "twist_weight": 0.2, "root_deviation": 2.0}
+  assert reward_mismatches(old_lineage, new) == lines
+  robot = reward_settings(ClfCfg(), clf_regularizers("robot"))
+  assert "regularizer servo_action_rate (x scale) 0 vs 1" in reward_mismatches(
+    legacy, robot
+  )
+  assert reward_mismatches(new, new) == []
+  # With the condition off on both sides its form does not count.
+  assert reward_mismatches(legacy, reward_settings(ClfCfg(pen_w=0.0), None)) == []
+  on = reward_settings({**ROUND6_CLF, "pen_w": 0.5}, None)
+  assert reward_mismatches(on, reward_settings(ClfCfg(), None)) == [
+    "CLF decay form 'musclemimic' vs 'paper'"
+  ]
+  faster = reward_settings(ClfCfg(decay_rate=1.0), None)
+  assert reward_mismatches(faster, reward_settings(ClfCfg(), None)) == [
+    "CLF decay_rate 1.0 vs 0.5"
+  ]
+  assert legacy["clf_vdot_window"] == 1  # Before 2026-11-19: one step.
+  wide = reward_settings(ClfCfg(vdot_window=10), None)
+  assert reward_mismatches(wide, reward_settings(ClfCfg(), None)) == [
+    "CLF vdot_window 10 vs 1"
+  ]
+  # The window counts only where both penalize the paper form's violation.
+  off = reward_settings(ClfCfg(vdot_window=10, pen_w=0.0), None)
+  assert reward_mismatches(off, reward_settings(ClfCfg(pen_w=0.0), None)) == []
+  musclemimic = {"decay_form": "musclemimic", "pen_w": 0.25}
+  assert (
+    reward_mismatches(
+      reward_settings({**musclemimic, "vdot_window": 10}, None),
+      reward_settings(musclemimic, None),
+    )
+    == []
+  )
+  # The effective regularizer counts, whatever scale reaches it.
+  half = RegularizerCfg(scale=0.5, osl_action_rate=2.0, joint_limits=2.0)
+  assert reward_mismatches(reward_settings(ClfCfg(), half), new) == []
+  knee = RegularizerCfg(joint_limits=1.0, osl_action_rate=1.0)
+  knee.joint_limit_joints = ("knee_angle_l",)
+  assert reward_mismatches(reward_settings(ClfCfg(), knee), new) == [
+    f"joint_limit_joints ['knee_angle_l'] vs {sorted(LIMIT_JOINTS)}"
+  ]
+  # MimicReward on both sides: only the regularizers compare.
+  mimic = reward_settings(None, RegularizerCfg())
+  assert mimic["clf_pen_w"] is None and reward_mismatches(mimic, mimic) == []
+  assert env_stage_setting("rewards.mimic.params.clf.pen_scale") == "clf_pen_scale"
+  assert env_stage_setting("rewards.mimic.params.regularizers.scale") == "reg_scale"
+  assert env_stage_setting("rewards.twist.weight") == "twist_weight"
+  assert env_stage_setting("rewards.mimic.params.clf.tau") is None
+  # Provenance prints what stage 1 trained with.
+  lineage = {
+    "stage1_env": {**legacy, "twist_weight": 0.2},
+    "osl_touch_sites": "feet_extended",
+  }
+  text = "\n".join(provenance_lines(lineage))
+  assert "CLF decay form musclemimic, pen_w 0 x pen_scale 1; no regularizers" in text
 
 
 def test_library_release(tmp_path: Path) -> None:

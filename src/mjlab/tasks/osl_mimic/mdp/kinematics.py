@@ -61,10 +61,30 @@ def relative_site_quantities(
   main_mat = mat[..., :1, :, :]
   rel_rot = main_mat.transpose(-1, -2) @ mat[..., 1:, :, :]
   rangles = rotvec_from_matrix(rel_rot)
+  return rpos, rangles, _relative_rvel(main_mat, rel_rot, ang_vel, lin_vel)
+
+
+def relative_site_rvel(
+  mat: torch.Tensor, ang_vel: torch.Tensor, lin_vel: torch.Tensor
+) -> torch.Tensor:
+  """The ``rvel`` of :func:`relative_site_quantities` alone, by the same operations
+  (so bit for bit the same), for callers that need neither ``rpos`` nor
+  ``rangles``. Arguments as there; returns (..., K, 6)."""
+  main_mat = mat[..., :1, :, :]
+  rel_rot = main_mat.transpose(-1, -2) @ mat[..., 1:, :, :]
+  return _relative_rvel(main_mat, rel_rot, ang_vel, lin_vel)
+
+
+def _relative_rvel(
+  main_mat: torch.Tensor,
+  rel_rot: torch.Tensor,
+  ang_vel: torch.Tensor,
+  lin_vel: torch.Tensor,
+) -> torch.Tensor:
   ang = (rel_rot.transpose(-1, -2) @ ang_vel[..., 1:, :, None]).squeeze(-1)
   ang = ang - ang_vel[..., :1, :]
   lin = (main_mat @ (lin_vel[..., :1, :] - lin_vel[..., 1:, :])[..., None]).squeeze(-1)
-  return rpos, rangles, torch.cat([ang, lin], dim=-1)
+  return torch.cat([ang, lin], dim=-1)
 
 
 def relative_site_velocities(
@@ -112,7 +132,7 @@ def exact_decay_rate(q_pos: float, q_vel: float, r: float) -> float:
   p11, p12, p22 = di_care_block(q_pos, q_vel, r)
   q_cl = np.array([[2.0 * q_pos, p11], [p11, 2.0 * q_vel + 2.0 * p12]])
   p = np.array([[p11, p12], [p12, p22]])
-  return float(np.min(np.linalg.eigvals(np.linalg.solve(p, q_cl)).real))
+  return float(np.min(np.real(np.linalg.eigvals(np.linalg.solve(p, q_cl)))))
 
 
 def v_max_unit(p11: float, p12: float, p22: float) -> float:

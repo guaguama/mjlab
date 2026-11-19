@@ -58,9 +58,13 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
 )
 from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_cfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
+from mjlab.tasks.osl_mimic.mdp.rewards import ClfCfg, clf_regularizers, mimic_reward
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_mimic.rl.muon import MuonAdam
-from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
+from mjlab.tasks.osl_split.config.rl_cfg import (
+  SPLIT_CLF_ENV_STAGES,
+  osl_split_runner_cfg,
+)
 from mjlab.tasks.osl_split.mdp import OslObsCfg, osl_observation_group
 from mjlab.tasks.osl_split.mdp.rewards import CHANNELS, GROUPS, stage1_channel_weights
 from mjlab.tasks.osl_split.rl.policy import std_parameter
@@ -171,6 +175,8 @@ class _SplitTerm:
   """What the runner reads and sets of ``split_mimic_reward``: the channels, the
   components and the group weights, with shares as under the CLF alone."""
 
+  LIVE_PARAMS = mimic_reward.LIVE_PARAMS  # What the env stages may set.
+
   def __init__(self, num_envs: int) -> None:
     self.channel_rewards = torch.zeros(num_envs, 2)
     self.components: dict[str, torch.Tensor] = {}
@@ -200,8 +206,10 @@ class _RewardManager:
   def __init__(self, num_envs: int) -> None:
     self.mimic = _SplitTerm(num_envs)
     twist = SimpleNamespace(components={})
+    # The params stage 2's env stages set (the CLF tasks' ramps).
+    params = {"clf": ClfCfg(), "regularizers": clf_regularizers("msk")}
     self._cfgs = {
-      "mimic": SimpleNamespace(func=self.mimic, weight=1.0),
+      "mimic": SimpleNamespace(func=self.mimic, weight=1.0, params=params),
       "twist": SimpleNamespace(func=twist, weight=TWIST_WEIGHT),
     }
     self._step_reward = torch.zeros(num_envs, len(self._cfgs))
@@ -691,6 +699,7 @@ def test_stage2_end_to_end(tmp_path: Path, model: Model, osl_critic_obs: str) ->
       "anneal_iterations": ANNEAL,
     },
     "additive_term_weights": {"twist": list(TWIST_SPLIT)},
+    "env_stages": [list(stage) for stage in SPLIT_CLF_ENV_STAGES],
   }
   assert checkpoint["infos"]["env_state"] == {
     "common_step_counter": env.common_step_counter

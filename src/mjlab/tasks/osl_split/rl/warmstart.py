@@ -25,10 +25,11 @@ nothing else needs surgery. A :class:`WarmStart` holds:
 * ``lineage``: where it came from, as plain types (also written as YAML): the run,
   checkpoint, iteration and step counters, the task, the action layout, both
   architectures, the stds and the W&B run, and stage 1's state at its end: its last
-  learning rate and std cap, the env settings it trained with (CLF penalty weight,
-  twist weight, root-deviation limit, with the env stages then in force), the
+  learning rate and std cap, the env settings it trained with (the reward settings:
+  the CLF penalty weight and decrease condition and the regularizers; the twist
+  weight and the root-deviation limit; with the env stages then in force), the
   library release and whether the run had finished. Stage 2 compares them with its
-  own settings when it starts (warnings, and a refusal for another ``pen_w``).
+  own settings when it starts (warnings, and a refusal for other reward settings).
 
 What is *not* carried: the optimizer state and its update counter. Stage 1 runs one
 MuonAdam over actor and critic on its own schedule (the recipe decays to 10% of the
@@ -74,6 +75,35 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
 )
 from mjlab.tasks.osl_gait_library.export import read_config
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward, _actions
+from mjlab.tasks.osl_mimic.reward_settings import (
+  CLF_SETTINGS as CLF_SETTINGS,
+)
+from mjlab.tasks.osl_mimic.reward_settings import (
+  LEGACY_DECAY_FORM as LEGACY_DECAY_FORM,
+)
+from mjlab.tasks.osl_mimic.reward_settings import (
+  REGULARIZER_SETTINGS as REGULARIZER_SETTINGS,
+)
+from mjlab.tasks.osl_mimic.reward_settings import (
+  REWARD_SETTING_KEYS as REWARD_SETTING_KEYS,
+)
+from mjlab.tasks.osl_mimic.reward_settings import (
+  describe_reward_settings as describe_reward_settings,
+)
+from mjlab.tasks.osl_mimic.reward_settings import (
+  env_reward_settings,
+  reward_stage_setting,
+  saved_reward_settings,
+)
+from mjlab.tasks.osl_mimic.reward_settings import (
+  env_stages_in_force as env_stages_in_force,
+)
+from mjlab.tasks.osl_mimic.reward_settings import (
+  reward_mismatches as reward_mismatches,
+)
+from mjlab.tasks.osl_mimic.reward_settings import (
+  reward_settings as reward_settings,
+)
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_mimic.rl.ppo import geometric_schedule
 from mjlab.tasks.osl_mimic.touch_sites import (
@@ -147,7 +177,8 @@ ENV_STAGE_SETTINGS = {
   "rewards.twist.weight": "twist_weight",
   "terminations.root_deviation.threshold": "root_deviation",
 }
-"""Stage-1 env-stage paths and the ``stage1_env`` setting each overrides."""
+"""Stage-1 env-stage paths and the ``stage1_env`` setting each overrides (the reward
+settings' paths too, :func:`env_stage_setting`)."""
 VERIFY_ATOL = 1e-5
 """Bound on the split's deviation from the unified actor. The split is exact up to
 float32 summation order in the output layer (1.2e-6 on the MSK-CLF-compliant run's
@@ -775,28 +806,14 @@ def stage1_std_cap(algorithm: Mapping[str, Any], update: int) -> float | None:
   )
 
 
-def env_stages_in_force(
-  stages: Iterable[Sequence[Any]], update: int
-) -> dict[str, float]:
-  """The staged values ``OslMimicOnPolicyRunner.apply_env_stages`` sets for
-  ``update``, by path; a path whose stages have all ended is absent (the env config's
-  own value holds)."""
-  stages = [(int(u), str(path), float(v)) for u, path, v in stages]
-  out: dict[str, float] = {}
-  for path in dict.fromkeys(path for _, path, _ in stages):
-    active = sorted((u, v) for u, p, v in stages if p == path and update < u)
-    if active:
-      out[path] = active[0][1]
-  return out
-
-
 def stage1_env_settings(
   run_dir: Path, agent: Mapping[str, Any], num_updates_done: int
 ) -> dict[str, Any] | None:
-  """The env settings stage 1's last update trained with: ``clf_pen_w`` (None
-  under MimicReward), ``twist_weight`` and ``root_deviation`` (the training
-  limit), from ``params/env.yaml`` with the env stages then in force on top
-  (recorded as ``env_stages_in_force``). None without a readable env.yaml."""
+  """The env settings stage 1's last update trained with: the ``mimic`` term's
+  :func:`reward_settings` (``clf_pen_w`` and the other ``clf_*`` None under
+  MimicReward), ``twist_weight`` and ``root_deviation`` (the training limit), from
+  ``params/env.yaml`` with the env stages then in force on top (recorded as
+  ``env_stages_in_force``). None without a readable env.yaml."""
   try:
     env = read_config(run_dir / "params" / "env.yaml")
   except (OSError, yaml.YAMLError, ValueError):
@@ -804,7 +821,7 @@ def stage1_env_settings(
   if not isinstance(env, Mapping):
     return None
   settings: dict[str, Any] = {
-    "clf_pen_w": _number(_dig(env, "rewards", "mimic", "params", "clf", "pen_w")),
+    **(saved_reward_settings(env) or reward_settings(None, None)),
     "twist_weight": _number(_dig(env, "rewards", "twist", "weight")),
     "root_deviation": _number(
       _dig(env, "terminations", "root_deviation", "params", "threshold")
@@ -812,34 +829,34 @@ def stage1_env_settings(
   }
   stages = env_stages_in_force(agent.get("env_stages") or (), num_updates_done - 1)
   for path, value in stages.items():
-    if path in ENV_STAGE_SETTINGS:
-      settings[ENV_STAGE_SETTINGS[path]] = value
+    key = env_stage_setting(path)
+    if key is not None:
+      settings[key] = value
   settings["env_stages_in_force"] = stages
   return settings
 
 
-def env_cfg_settings(cfg: Any) -> dict[str, float | None]:
+def env_cfg_settings(cfg: Any) -> dict[str, Any]:
   """:func:`stage1_env_settings`' settings of a live env config (None where it
-  has none: a MimicReward ``clf_pen_w``, a mode without the root-deviation
-  limit)."""
+  has none: the ``clf_*`` settings under MimicReward, a mode without the
+  root-deviation limit)."""
 
   def term(section: str, name: str) -> Any:
     terms = getattr(cfg, section, None)
     return terms.get(name) if isinstance(terms, Mapping) else None
 
-  mimic, twist, root = (
-    term("rewards", "mimic"),
-    term("rewards", "twist"),
-    term("terminations", "root_deviation"),
-  )
-  clf = (getattr(mimic, "params", None) or {}).get("clf")
-  pen_w = clf.get("pen_w") if isinstance(clf, Mapping) else getattr(clf, "pen_w", None)
+  twist, root = term("rewards", "twist"), term("terminations", "root_deviation")
   threshold = (getattr(root, "params", None) or {}).get("threshold")
   return {
-    "clf_pen_w": _number(pen_w),
+    **(env_reward_settings(cfg) or reward_settings(None, None)),
     "twist_weight": _number(getattr(twist, "weight", None)),
     "root_deviation": _number(threshold),
   }
+
+
+def env_stage_setting(path: str) -> str | None:
+  """The ``stage1_env`` setting an env-stage path overrides, or None."""
+  return ENV_STAGE_SETTINGS.get(path) or reward_stage_setting(path)
 
 
 def library_release(library_dir: str | Path | None) -> dict[str, str | None] | None:
@@ -945,6 +962,7 @@ def provenance_lines(lineage: Mapping[str, Any]) -> list[str]:
       f"{_shown(env.get('root_deviation'))}"
       + (f" (env stages in force: {stages})" if stages else "")
     )
+    lines.append(f"  stage-1 reward: {describe_reward_settings(env)}")
   release = lineage.get("library_release")
   if release:
     digest = release.get("sha256")

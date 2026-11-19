@@ -393,7 +393,10 @@ def _runner(cls: type, touch_sites: str) -> Any:
     cfg=SimpleNamespace(osl_touch_sites=touch_sites), common_step_counter=24
   )
   runner.env = SimpleNamespace(unwrapped=env)
-  runner.alg = SimpleNamespace(save=lambda: {"actor_state_dict": {"w": 1.0}})
+  runner.alg = SimpleNamespace(
+    save=lambda: {"actor_state_dict": {"w": 1.0}}, num_updates_done=7
+  )
+  runner.env_stages = ()
   runner.current_learning_iteration = 7
   runner.cfg = {"upload_model": True}
   runner.logger = SimpleNamespace(save_model=mock.Mock())

@@ -54,7 +54,12 @@ from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_c
 from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
 from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
-from mjlab.tasks.osl_mimic.mdp.rewards import mimic_reward
+from mjlab.tasks.osl_mimic.mdp.rewards import (
+  REGULARIZERS,
+  ClfCfg,
+  clf_regularizers,
+  mimic_reward,
+)
 from mjlab.tasks.osl_mimic.rl import runner as mimic_runner
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel, RunningMeanStd
 from mjlab.tasks.osl_mimic.touch_sites import set_touch_sites
@@ -67,6 +72,7 @@ from mjlab.tasks.osl_split.config import (
 from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
 from mjlab.tasks.osl_split.config.rl_cfg import (
   OBS_GROUPS,
+  SPLIT_CLF_ENV_STAGES,
   STAGE2_ITERATIONS,
   SplitRunnerCfg,
   WarmStartCfg,
@@ -124,6 +130,7 @@ from mjlab.tasks.osl_split.rl.warmstart import (
   LINEAGE_KEYS,
   WARM_START_FORMAT,
   WarmStart,
+  env_cfg_settings,
   library_release,
   lineage_touch_sites,
   load_warm_start,
@@ -228,6 +235,8 @@ def _observation_manager(osl_obs: OslObsCfg = OSL_OBS) -> Any:
 class _FakeSplitTerm:
   """What the runner reads and sets of ``split_mimic_reward``."""
 
+  LIVE_PARAMS = mimic_reward.LIVE_PARAMS  # What the env stages may set.
+
   def __init__(self, num_envs: int) -> None:
     self.channel_rewards = torch.zeros(num_envs, 2)
     self.components: dict[str, torch.Tensor] = {}
@@ -260,8 +269,10 @@ class _FakeRewardManager:
   def __init__(self, num_envs: int) -> None:
     self.mimic = _FakeSplitTerm(num_envs)
     self.twist = SimpleNamespace(components={})
+    # The params stage 2's env stages set (the CLF tasks' ramps).
+    params = {"clf": ClfCfg(), "regularizers": clf_regularizers("msk")}
     self.cfgs: dict[str, Any] = {
-      "mimic": SimpleNamespace(func=self.mimic, weight=1.0),
+      "mimic": SimpleNamespace(func=self.mimic, weight=1.0, params=params),
       "twist": SimpleNamespace(func=self.twist, weight=TWIST_WEIGHT),
     }
     self._step_reward = torch.zeros(num_envs, 2)
@@ -1994,18 +2005,150 @@ def test_resume_takes_the_config_curriculum(
   assert refrozen.alg.human_actor_frozen
 
 
+def test_env_stages_follow_k_and_survive_a_resume(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """Stage 2's env stages key on the stage-local iteration: each value holds before
+  its k and the env config's own after, logged as ``Stages/<path>``. The
+  checkpoint keeps them with the curriculum: a resume keeps the checkpoint's
+  (reporting the config's), or takes the config's with
+  ``resume_curriculum="config"``; a checkpoint from before them trained with
+  none."""
+  pen, reg = (
+    "rewards.mimic.params.clf.pen_scale",
+    "rewards.mimic.params.regularizers.scale",
+  )
+  stages = ((2, pen, 0.0), (1, reg, 0.25))
+  ws_path = tmp_path / "ws.pt"
+  _write_warm_start(ws_path)
+  cfg = _quick_cfg(ws_path)
+  assert cfg["env_stages"] == SPLIT_CLF_ENV_STAGES  # The CLF task's default.
+  cfg["env_stages"] = stages
+  env = _FakeEnv()
+  runner = _Runner(cast(Any, env), cfg, str(tmp_path / "run"), "cpu")
+  runner.learn(ITERATIONS)
+  logged = _scalars(tmp_path / "run", f"Stages/{pen}", f"Stages/{reg}")
+  its = [STAGE_START + k for k in range(ITERATIONS)]
+  assert logged[f"Stages/{pen}"] == dict(zip(its, (0.0, 0.0, 1.0), strict=True))
+  assert logged[f"Stages/{reg}"] == dict(zip(its, (0.25, 1.0, 1.0), strict=True))
+  params = env.reward_manager.cfgs["mimic"].params
+  assert params["clf"].pen_scale == 1.0 and params["regularizers"].scale == 1.0
+  checkpoint = tmp_path / "run" / f"model_{STAGE_START + ITERATIONS - 1}.pt"
+  split = torch.load(checkpoint, weights_only=False)["infos"]["split"]
+  assert split["env_stages"] == [list(stage) for stage in stages]
+
+  # Resumed with the task's defaults: the checkpoint's stages win, reported.
+  resumed = _Runner(cast(Any, _FakeEnv(seed=1)), _quick_cfg(None), None, "cpu")
+  capsys.readouterr()
+  resumed.load(str(checkpoint))
+  assert resumed.env_stages == stages
+  assert "env_stages: checkpoint" in capsys.readouterr().out
+  assert resumed.apply_env_stages(1) == {pen: 0.0, reg: 1.0}
+  # resume_curriculum="config": the command line's.
+  config = _quick_cfg(None)
+  config["resume_curriculum"] = "config"
+  taken = _Runner(cast(Any, _FakeEnv(seed=2)), config, None, "cpu")
+  taken.load(str(checkpoint))
+  assert taken.env_stages == SPLIT_CLF_ENV_STAGES
+  # A checkpoint from before stage-2 env stages: none, and the config's reported.
+  old = torch.load(checkpoint, weights_only=False)
+  del old["infos"]["split"]["env_stages"]
+  torch.save(old, tmp_path / "old.pt")
+  older = _Runner(cast(Any, _FakeEnv(seed=3)), _quick_cfg(None), None, "cpu")
+  capsys.readouterr()
+  older.load(str(tmp_path / "old.pt"))
+  assert older.env_stages == ()
+  assert "predates stage-2 env stages" in capsys.readouterr().out
+
+
+def _rewarded_env(seed: int = 0, old: bool = False) -> _FakeEnv:
+  """The fake env with the MSK split task's real reward params, which the resume
+  check reads; ``old``: the flags that rebuild a run from before 2026-11-18 at
+  ``pen_w`` 0."""
+  env = _FakeEnv(seed=seed)
+  rewards = osl_split_env_cfg("msk", "compliant", "clf", "train").rewards
+  if old:
+    params = rewards["mimic"].params
+    params["clf"].decay_form = "musclemimic"
+    params["clf"].pen_w = 0.0
+    for name in REGULARIZERS:
+      setattr(params["regularizers"], name, 0.0)
+  env.cfg.rewards = rewards
+  return env
+
+
+def test_a_resume_onto_another_reward_is_refused(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """A stage-2 resume refuses a checkpoint whose run trained another reward,
+  naming the flags that rebuild it, unless ``--agent.allow-reward-mismatch``; with
+  those flags it passes. Checkpoints record their reward; one from before the
+  record is read from its run's params. Play's actor-only load is never checked."""
+  ws_path = tmp_path / "ws.pt"
+  _write_warm_start(ws_path)
+  runner = _Runner(
+    cast(Any, _rewarded_env()), _quick_cfg(ws_path), str(tmp_path / "run"), "cpu"
+  )
+  runner.learn(ITERATIONS)
+  checkpoint = tmp_path / "run" / f"model_{STAGE_START + ITERATIONS - 1}.pt"
+  saved = torch.load(checkpoint, weights_only=False)
+  record = saved["infos"]["reward_settings"]
+  assert record["env_stages"] == [list(stage) for stage in SPLIT_CLF_ENV_STAGES]
+  assert record["config"]["clf_decay_form"] == "paper"
+  same = _Runner(cast(Any, _rewarded_env(seed=1)), _quick_cfg(None), None, "cpu")
+  capsys.readouterr()
+  same.load(str(checkpoint))
+  assert "another reward" not in capsys.readouterr().out
+
+  # A run from before the record (and before stage-2 env stages), at pen_w 0.
+  del saved["infos"]["reward_settings"]
+  del saved["infos"]["split"]["env_stages"]
+  old_dir = tmp_path / "old"
+  old_dir.mkdir()
+  torch.save(saved, old_dir / "model.pt")
+  clf = {"w": 1.0, "pen_w": 0.0, "tau": 0.1, "alpha": None, "c_viol": 0.1}
+  dump_yaml(
+    old_dir / "params" / "env.yaml", {"rewards": {"mimic": {"params": {"clf": clf}}}}
+  )
+  old = str(old_dir / "model.pt")
+  default = _Runner(cast(Any, _rewarded_env(seed=2)), _quick_cfg(None), None, "cpu")
+  with pytest.raises(ValueError, match="trained on another reward") as refused:
+    default.load(old)
+  message = str(refused.value)
+  for text in (
+    "regularizer osl_action_rate (x scale) 0 vs 1",
+    "--env.rewards.mimic.params.clf.decay-form musclemimic",
+    "--env.rewards.mimic.params.clf.pen-w 0 ",
+    '--agent.env-stages "()"',
+    "--agent.allow-reward-mismatch True",
+  ):
+    assert text in message, text
+  default.load(old, load_cfg={"actor": True})  # Play: unchecked.
+  allowed_cfg = _quick_cfg(None)
+  allowed_cfg["allow_reward_mismatch"] = True
+  allowed = _Runner(cast(Any, _rewarded_env(seed=3)), allowed_cfg, None, "cpu")
+  capsys.readouterr()
+  allowed.load(old)
+  assert "[WARN]" in capsys.readouterr().out and allowed._ready
+  # The old reward's flags: silent (the checkpoint's curriculum has no stages).
+  rebuilt = _Runner(
+    cast(Any, _rewarded_env(seed=4, old=True)), _quick_cfg(None), None, "cpu"
+  )
+  capsys.readouterr()
+  rebuilt.load(old)
+  assert rebuilt.env_stages == () and "another reward" not in capsys.readouterr().out
+
+
 def _provenance_lineage(**changes: Any) -> dict[str, Any]:
+  # Stage 1 ended with stage 2's own settings (the default reward included).
+  stage2 = env_cfg_settings(osl_split_env_cfg("msk", "compliant", "clf", "train"))
+  assert (stage2["twist_weight"], stage2["root_deviation"]) == (0.2, 2.0)
   lineage = {
     **_lineage(),
     "human_std": {"min": 0.07, "median": 0.07, "max": 0.07},
     "stage1_lr": 3e-5,
     "stage1_std_cap": 0.07,
-    "stage1_env": {
-      "clf_pen_w": 0.0,
-      "twist_weight": 0.2,
-      "root_deviation": 2.0,
-      "env_stages_in_force": {},
-    },
+    "stage1_env": {**stage2, "env_stages_in_force": {}},
     "stage1_planned_last_iteration": STAGE1_ITER,
     "library_release": {"release": "unicycle_v001", "sha256": "0" * 64},
   }
@@ -2016,9 +2159,9 @@ def _provenance_lineage(**changes: Any) -> dict[str, Any]:
 def test_warm_start_provenance(
   tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-  """Stage 1's recorded end state against stage 2's settings: another CLF penalty
-  weight is refused unless allowed; other env settings, another library, a large
-  human std, an unfinished run and a human rate above stage 1's last are
+  """Stage 1's recorded end state against stage 2's settings: other reward settings
+  are refused unless allowed (either flag); other env settings, another library, a
+  large human std, an unfinished run and a human rate above stage 1's last are
   reported."""
   library = tmp_path / "unicycle_v001"
   library.mkdir()
@@ -2031,11 +2174,12 @@ def test_warm_start_provenance(
   assert isinstance(motion, GaitLibraryCommandCfg)
   motion.library_dir = str(library)
 
-  def runner(allow: bool = False) -> _Runner:
+  def runner(allow: str = "") -> _Runner:
     env = _FakeEnv()
     env.cfg = train  # The real training config, for its env settings.
     cfg = _quick_cfg(None)
-    cfg["warm_start"]["allow_pen_w_mismatch"] = allow
+    if allow:
+      cfg["warm_start"][allow] = True
     return _Runner(cast(Any, env), cfg, None, "cpu")
 
   # A matching warm start reports its end state and the same library release.
@@ -2046,6 +2190,8 @@ def test_warm_start_provenance(
   assert "same library release unicycle_v001" in out
   assert "[WARN]" not in out
 
+  # A stage-1 run from before 2026-11-18 records no decrease-condition form or
+  # regularizers: musclemimic's condition (here at 0.25) and none.
   lineage = _provenance_lineage(
     stage1_env={
       "clf_pen_w": 0.25,
@@ -2057,15 +2203,18 @@ def test_warm_start_provenance(
     human_std={"min": 0.5, "median": 0.8, "max": 1.0},
     stage1_planned_last_iteration=STAGE1_ITER + 100,
   )
-  with pytest.raises(ValueError, match="pen_w 0.25; stage 2's is 0"):
+  with pytest.raises(ValueError, match="pen_w x pen_scale 0.25 vs 0.5; .*osl_action"):
     runner().warm_start(replace(ws, lineage=lineage))
   capsys.readouterr()
-  allowed = runner(allow=True)
+  allowed = runner(allow="allow_reward_mismatch")
   allowed.warm_start(replace(ws, lineage=lineage))
   out = capsys.readouterr().out
   assert allowed._ready
   for text in (
-    "Allowed (warm_start.allow_pen_w_mismatch)",
+    "Allowed (warm_start.allow_reward_mismatch)",
+    "CLF decay form 'musclemimic' vs 'paper'",
+    "stage-1 reward: CLF decay form musclemimic, pen_w 0.25 x pen_scale 1; no "
+    "regularizers",
     "twist weight 0.06; stage 2 uses 0.2",
     "root-deviation limit 1; stage 2 uses 2",
     "unicycle_v001, but their library.json differ",  # Same name, other bytes.
@@ -2074,7 +2223,9 @@ def test_warm_start_provenance(
     f"set to end at {STAGE1_ITER + 100}",
   ):
     assert text in out, text
-  # A reward switch starts the critics fresh: another pen_w is only reported.
+  # The flag's former name still allows it.
+  runner(allow="allow_pen_w_mismatch").warm_start(replace(ws, lineage=lineage))
+  # A reward switch starts the critics fresh: other settings are only reported.
   capsys.readouterr()
   runner().warm_start(replace(ws, lineage={**lineage, "reward": "mimic"}))
   assert "The reward switches" in capsys.readouterr().out

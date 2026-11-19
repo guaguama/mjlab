@@ -44,6 +44,12 @@ looping clips break (their root jumps back one stride at every loop):
   forgiven at each command change, never in between. Height, roll and pitch are never
   re-based.
 
+Under an anchor, every world-frame quantity is served rotated by the anchor's yaw.
+The relative site velocity ``rvel`` (MimicReward's, ``[R_rel^T w_i - w_main,
+R_main (v_main - v_i)]``) mixes frames and is not a rotation of its native-heading
+value, so it is recomputed from the clip's site orientations and velocities
+rotated by the anchor.
+
 Timing is :class:`~mjlab.tasks.osl_mimic.mdp.MimicMotionCommand`'s: ``frame`` is the
 frame the last observation was built at, and rewards compare with ``reference(1)``.
 
@@ -81,6 +87,7 @@ from mjlab.tasks.osl_mimic.mdp import (
   relative_site_quantities,
   relative_site_velocities,
 )
+from mjlab.tasks.osl_mimic.mdp.kinematics import relative_site_rvel
 from mjlab.tasks.tracking.config.osl.mdp import check_motion_fps
 from mjlab.utils.lab_api.math import (
   axis_angle_from_quat,
@@ -408,7 +415,8 @@ class GaitLibraryCommand(CommandTerm):
       site_mat = matrix_from_quat(a["body_quat_w"][:, self.site_body_ids])
       ang = a["body_ang_vel_w"][:, self.site_body_ids]
       lin = a["body_lin_vel_w"][:, self.site_body_ids]
-      rpos, rangles, rvel = relative_site_quantities(site_pos, site_mat, ang, lin)
+      # rvel is served from the anchored sites (``_gather``), not stored.
+      rpos, rangles, _ = relative_site_quantities(site_pos, site_mat, ang, lin)
       v_rel, omega_rel = relative_site_velocities(site_mat, ang, lin)
       clip = {
         "joint_pos": joint_pos,
@@ -419,9 +427,11 @@ class GaitLibraryCommand(CommandTerm):
         "root_ang_vel_w": a["body_ang_vel_w"][:, root],
         "root_ang_vel_b": quat_apply_inverse(quat, a["body_ang_vel_w"][:, root]),
         "site_pos": site_pos,
+        "site_mat": site_mat,
+        "site_ang_w": ang,
+        "site_lin_w": lin,
         "rpos": rpos,
         "rangles": rangles,
-        "rvel": rvel,
         "v_rel": v_rel,
         "omega_rel": omega_rel,
       }
@@ -682,9 +692,12 @@ class GaitLibraryCommand(CommandTerm):
     f: torch.Tensor,
     anchor: torch.Tensor,
     z: torch.Tensor | None = None,
+    rvel: bool = True,
   ) -> Frame:
     """The reference of ``clip`` at unbounded frame ``f >= 0``, loops unrolled, under
-    ``anchor`` and raised by ``z``. Every argument is per env (or per selected env)."""
+    ``anchor`` and raised by ``z``. Every argument is per env (or per selected env).
+    ``rvel`` False leaves out the relative site velocity, which only rewards read and
+    which is recomputed from the anchored sites (see the module docstring)."""
     n = self.num_frames[clip]
     wraps = torch.div(f, n, rounding_mode="floor")
     g = f - wraps * n
@@ -695,7 +708,7 @@ class GaitLibraryCommand(CommandTerm):
     site_pos = _rotate_xy(d["site_pos"][clip, g], cos, sin)
     height = torch.zeros_like(a[:, :1]) if z is None else z[:, None]
     shift = torch.cat([a[:, :2], height], dim=-1)
-    return {
+    frame = {
       "root_pos": root_pos + shift,
       "root_quat": quat_mul(_yaw_quat(a[:, 2]), d["root_quat"][clip, g]),
       "root_lin_vel": _rotate_xy(d["root_lin_vel"][clip, g], cos, sin),
@@ -705,10 +718,18 @@ class GaitLibraryCommand(CommandTerm):
       "site_pos": site_pos + shift[:, None, :],
       "rpos": _rotate_xy(d["rpos"][clip, g], cos, sin),
       "rangles": d["rangles"][clip, g],
-      "rvel": d["rvel"][clip, g],
       "v_rel": _rotate_xy(d["v_rel"][clip, g], cos, sin),
       "omega_rel": d["omega_rel"][clip, g],
     }
+    if rvel:
+      # The sites' orientations (Y @ R, row-wise without a matmul) and velocities,
+      # rotated by the anchor's yaw.
+      mat = d["site_mat"][clip, g].transpose(-1, -2)
+      site_mat = _rotate_xy(mat, cos, sin).transpose(-1, -2)
+      site_ang = _rotate_xy(d["site_ang_w"][clip, g], cos, sin)
+      site_lin = _rotate_xy(d["site_lin_w"][clip, g], cos, sin)
+      frame["rvel"] = relative_site_rvel(site_mat, site_ang, site_lin)
+    return frame
 
   def _unroll(
     self, anchor: torch.Tensor, clip: torch.Tensor, wraps: torch.Tensor
@@ -843,12 +864,12 @@ class GaitLibraryCommand(CommandTerm):
 
   def lookahead(self) -> MimicLookahead:
     """The goal's lookahead, on the current clip (a blend is not looked through)."""
-    now = self._gather(self.clip, self.frame, self.anchor)
+    now = self._gather(self.clip, self.frame, self.anchor, rvel=False)
     deltas, qvel_deltas, rpos = [], [], []
     qvel_now = self._root_qvel(now)
     for i in range(1, self.cfg.lookahead_steps):
       future = self._gather(
-        self.clip, self.frame + i * self.cfg.lookahead_stride, self.anchor
+        self.clip, self.frame + i * self.cfg.lookahead_stride, self.anchor, rvel=False
       )
       deltas.append(future["root_pos"] - now["root_pos"])
       qvel_deltas.append(self._root_qvel(future) - qvel_now)
@@ -1172,8 +1193,8 @@ class GaitLibraryCommand(CommandTerm):
     lo = x.floor().long()
     frac = x - lo.float()
     identity = torch.zeros(clip.shape[0], 3, device=self.device)
-    a = self._gather(clip, lo, identity)
-    b = self._gather(clip, lo + 1, identity)
+    a = self._gather(clip, lo, identity, rvel=False)
+    b = self._gather(clip, lo + 1, identity, rvel=False)
     pa = planar_pose(a["root_pos"], a["root_quat"])
     pb = planar_pose(b["root_pos"], b["root_quat"])
     turn = torch.remainder(pb[:, 2] - pa[:, 2] + math.pi, 2 * math.pi) - math.pi

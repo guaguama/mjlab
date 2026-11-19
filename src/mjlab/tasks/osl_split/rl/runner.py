@@ -12,27 +12,30 @@ wherever one agent did not become two:
   touch-site change would change the human actor's inputs or outputs, so it is
   refused, as is a network built otherwise than the stage-1 one whose weights it
   takes (another activation loads strictly and computes something else). Stage 1's
-  recorded end state is compared with stage 2's settings: another CLF penalty
-  weight is refused (``--agent.warm-start.allow-pen-w-mismatch`` overrides), and
-  another twist weight, root-deviation limit or library release, a large human
-  std, an unfinished stage-1 run or a human rate above stage 1's last one are
-  reported.
+  recorded end state is compared with stage 2's settings: other reward settings
+  (the CLF penalty weight and decrease condition, the regularizers) are refused
+  (``--agent.warm-start.allow-reward-mismatch`` overrides), and another twist
+  weight, root-deviation limit or library release, a large human std, an
+  unfinished stage-1 run or a human rate above stage 1's last one are reported.
 * **Iterations.** Stage 2 continues stage 1's numbering: its first iteration is
   stage 1's last plus one, so W&B and TensorBoard steps run on from stage 1's, and
   ``Train/mean_reward`` (the team reward, which the split reward term keeps equal
   to stage 1's) continues stage 1's curve. Schedules, saves and evaluations count
   *stage-local* iterations ``k`` from 0. A resumed stage-2 run takes its stage
   start and lineage from its checkpoint, and its curriculum (schedule, channels,
-  additive weights) from the checkpoint or, with ``resume_curriculum="config"``,
-  from the command line; it does not replay the checkpoint's own iteration.
+  additive weights, env stages) from the checkpoint or, with
+  ``resume_curriculum="config"``, from the command line; it does not replay the
+  checkpoint's own iteration.
 * **Rewards.** After every step each agent's reward is composed from the reward
   manager (:class:`AgentRewards`): its imitation channel of the split ``mimic``
   term, plus every other (additive) term times its per-agent weight. The env's own
   reward stays the team reward, which the logger receives.
 * **Schedules.** Before every rollout the algorithm takes ``k`` (freeze flags,
-  per-module learning rates, the blend) and the reward term takes the channels'
-  group weights for ``k``. The evaluation envs' reward terms take the same weights
-  before every evaluation.
+  per-module learning rates, the blend), the reward term takes the channels' group
+  weights for ``k``, and the training env takes its env stages for ``k``
+  (``env_stages``, logged as ``Stages/<path>``). The evaluation envs' reward terms
+  take the same group weights before every evaluation; like stage 1's, they score
+  with the env config's own (unstaged) values.
 * **Validation** is stage 1's protocol (one env per library clip, deterministic,
   ending early only on the 0.5 m site check), in families (``validation.inference``,
   see :class:`~..config.rl_cfg.SplitValidationCfg`): ``Validation/`` plays both
@@ -110,6 +113,8 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.osl_gait_library.config.dr import nominal_plant
 from mjlab.tasks.osl_gait_library.mdp import TIGHT_ARC_WZ, GaitLibraryCommandCfg
 from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
+from mjlab.tasks.osl_mimic.reward_settings import CHECKPOINT_KEY as REWARD_KEY
+from mjlab.tasks.osl_mimic.reward_settings import check_resume_reward, reward_record
 from mjlab.tasks.osl_mimic.rl.expected import auto_inference
 from mjlab.tasks.osl_mimic.rl.runner import (
   EvalPurpose,
@@ -159,6 +164,7 @@ from .warmstart import (
   lineage_warnings,
   load_warm_start,
   provenance_lines,
+  reward_mismatches,
 )
 
 OSL_JOINT_LABELS = ("knee", "ankle")
@@ -422,8 +428,8 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
       ValueError: On a model, socket or OSL touch-site change, a warm start whose
         action layout or observation does not match this env, a network that takes
         stage-1 weights but is configured otherwise than stage 1's (the message
-        names the overrides that build stage 1's), or another CLF penalty weight
-        than stage 1's without ``warm_start.allow_pen_w_mismatch``.
+        names the overrides that build stage 1's), or other reward settings than
+        stage 1's without ``warm_start.allow_reward_mismatch``.
     """
     v = self.validation_cfg
     model, socket, reward = v["model"], v["socket"], v["reward"]
@@ -448,7 +454,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
         f"observation has {self.alg.human_actor.obs_dim}."
       )
     _check_architecture(ws.lineage, self.cfg, reward_switch)
-    self._check_pen_w(ws.lineage, reward_switch)
+    self._check_reward_settings(ws.lineage, reward_switch)
     self.alg.apply_warm_start(
       ws,
       reward_switch=reward_switch,
@@ -486,31 +492,42 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
         f"variant; stage 2 trains on {variant!r}."
       )
 
-  def _check_pen_w(self, lineage: Mapping[str, Any], reward_switch: bool) -> None:
-    """Refuse a warm start trained with another CLF penalty weight, whose copied
-    critics and return statistics would value another reward, unless
-    ``warm_start.allow_pen_w_mismatch`` (or the reward switches: the critics then
-    start fresh)."""
-    stage1 = (lineage.get("stage1_env") or {}).get("clf_pen_w")
-    stage2 = env_cfg_settings(getattr(self.env.unwrapped, "cfg", None))["clf_pen_w"]
-    if stage1 is None or stage2 is None or math.isclose(stage1, stage2, abs_tol=1e-12):
+  def _check_reward_settings(
+    self, lineage: Mapping[str, Any], reward_switch: bool
+  ) -> None:
+    """Refuse a warm start trained with other reward settings
+    (:func:`~.warmstart.reward_mismatches`: the CLF penalty and decrease condition,
+    the regularizers), whose copied critics and return statistics would value
+    another reward, unless ``warm_start.allow_reward_mismatch`` (or its former name
+    ``allow_pen_w_mismatch``), or the reward type switches (the critics then start
+    fresh). A lineage without stage 1's env settings is not compared (reported by
+    :meth:`_report_provenance`)."""
+    stage1 = lineage.get("stage1_env")
+    if not stage1:
+      return
+    stage2 = env_cfg_settings(getattr(self.env.unwrapped, "cfg", None))
+    mismatches = reward_mismatches(stage1, stage2)
+    if not mismatches:
       return
     text = (
-      f"Stage 1 trained with the CLF penalty weight pen_w {stage1:g}; stage 2's is "
-      f"{stage2:g}."
+      "Stage 1 trained with other reward settings than stage 2's (stage 1 vs "
+      f"stage 2): {'; '.join(mismatches)}."
     )
     if reward_switch:
       print(f"[WARN] {text} The reward switches, so the critics start fresh anyway.")
       return
-    allowed = bool((self.cfg.get("warm_start") or {}).get("allow_pen_w_mismatch"))
+    warm = self.cfg.get("warm_start") or {}
+    allowed = bool(
+      warm.get("allow_reward_mismatch") or warm.get("allow_pen_w_mismatch")
+    )
     if not allowed:
       raise ValueError(
         f"{text} The copied critics and return statistics would value another "
-        "reward. Train stage 2 with stage 1's pen_w, or pass "
-        "--agent.warm-start.allow-pen-w-mismatch True to start anyway."
+        "reward. Train stage 2 with stage 1's reward settings, or pass "
+        "--agent.warm-start.allow-reward-mismatch True to start anyway."
       )
     print(
-      f"[WARN] {text} Allowed (warm_start.allow_pen_w_mismatch): the copied "
+      f"[WARN] {text} Allowed (warm_start.allow_reward_mismatch): the copied "
       "critics and return statistics value another reward."
     )
 
@@ -536,8 +553,8 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     else:
       lines.append(
         "[WARN] The warm start records no stage-1 env settings (converted before "
-        "they were recorded, or without the run's params/env.yaml): the CLF "
-        "penalty weight, twist weight and root-deviation limit are not compared. "
+        "they were recorded, or without the run's params/env.yaml): the reward "
+        "settings, twist weight and root-deviation limit are not compared. "
         "Convert the stage-1 run again, or pass its run directory to "
         "--agent.warm-start.path."
       )
@@ -618,8 +635,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
 
     With ``resume_curriculum="checkpoint"`` (the default) it is the one the
     checkpoint was trained with: its schedule (stage length, freeze, warm-ups,
-    learning rates, blend), reward switch, channel schedule and additive term
-    weights. A resumed run continues the run it resumes (rsl_rl's resume). Its
+    learning rates, blend), reward switch, channel schedule, additive term weights
+    and env stages (none for a checkpoint that predates them: stage 2 had none).
+    A resumed run continues the run it resumes (rsl_rl's resume). Its
     command line builds the config, and one that does not repeat the run's
     stage-2 flags would otherwise freeze an unfrozen human again or snap the OSL
     channel back to its start weights mid-stage. Every value the current config
@@ -659,10 +677,21 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     config_schedule, config_channels, config_additive, error = (
       self._configured_curriculum(schedule.total_iterations, reward_switch)
     )
-    checkpoint = _curriculum(schedule, channels, additive)
+    config_stages = _env_stages(self.cfg.get("env_stages"))
+    saved_stages = "env_stages" in split
+    stages = _env_stages(split.get("env_stages"))
+    checkpoint = _curriculum(schedule, channels, additive, stages)
+    if not saved_stages:
+      del checkpoint["env_stages"]  # Compared below, with an explanation.
     differences = _curriculum_differences(
-      checkpoint, _curriculum(config_schedule, config_channels, config_additive)
+      checkpoint,
+      _curriculum(config_schedule, config_channels, config_additive, config_stages),
     )
+    if not saved_stages and config_stages:
+      differences.append(
+        "env_stages: the checkpoint predates stage-2 env stages (it trained with "
+        f"none), config {[list(stage) for stage in config_stages]}"
+      )
     if take_config:
       if config_schedule is None:
         raise ValueError(
@@ -676,7 +705,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
         for module in MODULES
       ]
       self._install_curriculum(
-        config_schedule, config_channels, config_additive, reward_switch
+        config_schedule, config_channels, config_additive, reward_switch, config_stages
       )
       print(
         "[INFO] The resumed run takes the config's curriculum "
@@ -692,7 +721,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
       return
     if error is not None:
       differences.insert(0, f"schedule: the config cannot build one ({error})")
-    self._install_curriculum(schedule, channels, additive, reward_switch)
+    self._install_curriculum(schedule, channels, additive, reward_switch, stages)
     if differences:
       print(
         "[WARN] The resumed run keeps its checkpoint's curriculum, which the "
@@ -708,6 +737,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     channels: ChannelSchedule,
     additive: Mapping[str, Sequence[float]],
     reward_switch: bool,
+    env_stages: tuple[tuple[int, str, float], ...],
   ) -> None:
     for weights in (channels.start, channels.end):
       self._rewards.term.check_group_weights(weights)
@@ -717,13 +747,16 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     self._stress_rewards = None
     self._additive_weights = dict(additive)
     self.channel_schedule = channels
+    self.env_stages = env_stages
     self._set_schedule(schedule, reward_switch)
 
-  def _set_stage_iteration(self, k: int) -> None:
-    """Freeze flags, learning rates and the blend for ``k``, and the channels'
-    group weights."""
+  def _set_stage_iteration(self, k: int) -> dict[str, float]:
+    """Freeze flags, learning rates and the blend for ``k``, the channels' group
+    weights, and the training env's stages (``env_stages``); returns each staged
+    path's value now in force."""
     self.alg.set_stage_iteration(k)
     self._rewards.term.set_group_weights(self.channel_schedule.weights(k))
+    return self.apply_env_stages(k)
 
   ##
   # Training loop: stage 1's, for two agents.
@@ -779,7 +812,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     frozen: tuple[bool, bool] | None = None
     for it in range(start_it, total_it):
       k = it - self.stage_start
-      self._set_stage_iteration(k)
+      stages = self._set_stage_iteration(k)
       now = (self.alg.human_actor_frozen, self.alg.osl_actor_frozen)
       if now != frozen:
         learning = [
@@ -832,6 +865,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
         rnd_weight=None,
       )
       self._log_stage(it, k)
+      if writer is not None:
+        for path, value in stages.items():
+          writer.add_scalar(f"Stages/{path}", value, it)
 
       if writer is not None and interval > 0 and (k + 1) % interval == 0:
         self._evaluate("validation", self.validate, it)
@@ -1371,9 +1407,10 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
 
   def save(self, path: str, infos: dict | None = None) -> None:
     """Checkpoint everything (the four networks, optimizers, return statistics and
-    split state, the curriculum included, the OSL touch sites the env simulates and
-    its training ``osl`` group), then export the OSL actor next to it if
-    ``export_osl_onnx``."""
+    split state, the curriculum included, the OSL touch sites the env simulates, its
+    training ``osl`` group and the reward settings it trains with,
+    ``infos["reward_settings"]``, none for an env without a ``mimic`` term), then
+    export the OSL actor next to it if ``export_osl_onnx``."""
     env = self.env.unwrapped
     infos = {
       **(infos or {}),
@@ -1383,9 +1420,14 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
         "lineage": self.lineage,
         "schedule_iterations": self.schedule_iterations,
         "reward_switch": self.reward_switch,
-        **_curriculum(self.schedule, self.channel_schedule, self._additive_weights),
+        **_curriculum(
+          self.schedule, self.channel_schedule, self._additive_weights, self.env_stages
+        ),
       },
     }
+    record = reward_record(getattr(env, "cfg", None), self.env_stages)
+    if record is not None:
+      infos[REWARD_KEY] = record
     saved = self.alg.save()
     saved["iter"] = self.current_learning_iteration
     saved["infos"] = infos
@@ -1423,7 +1465,11 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     ``load_cfg=None`` (``--agent.resume``) restores everything a resumed run trains
     on: every network, optimizer and statistic, the reward switch and the whole
     curriculum (:meth:`_restore_curriculum`). Training resumes at the iteration
-    after the checkpoint's.
+    after the checkpoint's. Such a resume is refused when it would train another
+    reward than the checkpoint's run did, from the stage-local iteration it resumes
+    at under the restored env stages
+    (:func:`~mjlab.tasks.osl_mimic.reward_settings.check_resume_reward`), unless
+    ``allow_reward_mismatch``.
 
     A ``load_cfg`` that asks for neither ``critic`` nor ``optimizer`` (``play.py``'s
     ``{"actor": True}``) loads the two actors and the teacher head only, all
@@ -1441,8 +1487,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
       ValueError: For a stage-1 checkpoint, a warm-start file or anything else
         that is not a stage-2 checkpoint, one trained with other OSL touch sites
         than the env simulates (one that records none trained with ``original``),
-        or one trained on another OSL input layout (the message names the flags
-        that build it).
+        one trained on another OSL input layout (the message names the flags
+        that build it), or a resume onto another reward (naming the flags that
+        rebuild the run's and ``--agent.allow-reward-mismatch``).
     """
     loaded = torch.load(path, map_location=map_location, weights_only=False)
     _check_stage2_checkpoint(loaded, path)
@@ -1464,6 +1511,17 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
       return infos
     self._restore_curriculum(split)
     self.current_learning_iteration = int(loaded["iter"]) + 1
+    # The reward from the stage-local iteration the resume trains first, under the
+    # env stages the curriculum just restored.
+    check_resume_reward(
+      path,
+      infos,
+      getattr(self.env.unwrapped, "cfg", None),
+      self.env_stages,
+      self.current_learning_iteration - self.stage_start,
+      bool(self.cfg.get("allow_reward_mismatch", False)),
+      what="stage-local iteration",
+    )
     self._ready = True
     return infos
 
@@ -1718,13 +1776,20 @@ _UNSET = object()
 """A key one curriculum lacks (:func:`_curriculum_differences`)."""
 
 
+def _env_stages(stages: Any) -> tuple[tuple[int, str, float], ...]:
+  """``env_stages`` (a config's or a checkpoint's) as ``(until_k, path, value)``."""
+  return tuple((int(u), str(path), float(v)) for u, path, v in stages or ())
+
+
 def _curriculum(
   schedule: SplitSchedule | None,
   channels: ChannelSchedule,
   additive: Mapping[str, Sequence[float]],
+  env_stages: Sequence[Sequence[Any]],
 ) -> dict[str, Any]:
   """A curriculum as checkpoints keep it, in plain types: the schedule's fields
-  (absent without one), the channel schedule and the additive term weights."""
+  (absent without one), the channel schedule, the additive term weights and the
+  env stages."""
   curriculum: dict[str, Any] = {}
   if schedule is not None:
     curriculum["schedule"] = asdict(schedule)
@@ -1737,6 +1802,7 @@ def _curriculum(
   curriculum["additive_term_weights"] = {
     name: [float(w) for w in pair] for name, pair in additive.items()
   }
+  curriculum["env_stages"] = [list(stage) for stage in _env_stages(env_stages)]
   return curriculum
 
 

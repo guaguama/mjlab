@@ -10,10 +10,14 @@ keeps its intermediates in ``_cache`` and ``_clf_cache``, and stage-1 training r
 use that code, so it is compared bit for bit with a frozen copy of the class as it
 was before the stash (``_HeadMimicReward`` below, from commit c97e778b1), over first
 steps, normal steps, resets, reference jumps and a non-finite state.
+
+These tests run musclemimic's decrease condition (:data:`CLF`, the old flags); the
+paper form, the regularizers and their channels are ``test_osl_reward_clfrl.py``'s.
 """
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -42,6 +46,7 @@ from mjlab.tasks.osl_mimic.mdp.kinematics import (
 )
 from mjlab.tasks.osl_mimic.mdp.reference import MimicReference, MimicReferenceSource
 from mjlab.tasks.osl_mimic.mdp.rewards import (
+  CLF_EXTRA_DIAGNOSTICS,
   CLF_GROUPS,
   MIMIC_EXPS,
   MIMIC_TERMS,
@@ -88,7 +93,8 @@ LAYOUTS: dict[str, tuple[tuple[str, int], ...]] = {
   "robot": (("servos", 7), ("osl_motors", 2)),
 }
 """The stage-1 action orders (OSL rows 0:2 and 7:9), with few human rows."""
-CLF = ClfCfg()
+CLF = ClfCfg(decay_form="musclemimic", pen_w=0.25)
+"""musclemimic's decrease condition: the old flags, which these tests pin."""
 OSL_END = {"human": 0.5, "osl_sites": 1.0, "osl_joints": 10.0}
 
 
@@ -519,7 +525,7 @@ def _params(reward: str) -> dict[str, Any]:
     "weights": dict(CLF_WEIGHTS if clf else MIMIC_WEIGHTS),
     "action_out_of_bounds_coeff": 0.01,
     "joint_torque_weights": dict(OSL_TORQUE_WEIGHTS),
-    "clf": ClfCfg() if clf else None,
+    "clf": copy.deepcopy(CLF) if clf else None,
   }
 
 
@@ -686,7 +692,10 @@ def test_stash_leaves_stage1_bit_identical(reward: str) -> None:
     got = new(env, **params)
     want = head(env, **params)
     _assert_identical(got, want)
-    assert list(new.components) == list(head.components)
+    # The head's diagnostics first, then the new CLF ones.
+    keys, head_keys = list(new.components), list(head.components)
+    assert keys[: len(head_keys)] == head_keys
+    assert set(keys[len(head_keys) :]) <= set(CLF_EXTRA_DIAGNOSTICS)
     for key, value in head.components.items():
       _assert_identical(new.components[key], value)
     if reward == "clf":

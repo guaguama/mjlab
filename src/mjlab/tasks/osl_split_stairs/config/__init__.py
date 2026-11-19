@@ -16,9 +16,10 @@ start fresh), e.g.::
 where ``<stairs>`` is clipper's ``outputs/mjlab/osl_fullbody/stairs``. The OSL
 actor's sensors are unicycle stage 2's, with the same switches
 (``--env.observations.osl...``; the heel contact needs a stage-1 run on the
-``feet_extended`` or ``heel_extended`` touch sites). The musculoskeletal tasks'
-CLF penalty weight is unicycle stage 2's, 0: the warm start refuses a stage-1 run
-trained with another (``--env.rewards.mimic.params.clf.pen-w``). Stage 2 continues
+``feet_extended`` or ``heel_extended`` touch sites). The reward is stairs stage
+1's: the warm start refuses a stage-1 run trained with other reward settings (the
+CLF decrease condition, the regularizers;
+``--agent.warm-start.allow-reward-mismatch True`` starts anyway). Stage 2 continues
 stage 1's iteration numbers in its own run directory
 (``osl_fullbody_split_stairs[_msk][_clf][_compliant]``). Resume with
 ``--agent.resume``; play a checkpoint, which builds its own touch sites and OSL

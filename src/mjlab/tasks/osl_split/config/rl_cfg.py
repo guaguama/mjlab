@@ -15,6 +15,8 @@ plus what stage 2 adds:
 * ``channels``: the two reward channels' coordinate-group weights over stage 2;
 * ``validation``: the evaluation families, the zero-shot teacher check and the stress
   validation;
+* ``env_stages``: training-env settings staged by stage-local iteration (the CLF
+  tasks ramp their decrease condition and regularizers in);
 * ``resume_curriculum``: whether a resumed run keeps its checkpoint's curriculum or
   takes the command line's.
 
@@ -55,6 +57,18 @@ OSL_INIT_STD = 0.2
 """In normalized action units: 0.2 x 2.88 x 49.4/58.4 = about 28/34 N m of knee/ankle
 torque noise while the fresh actor explores. The unified policy's OSL rows end stage
 1 at 0.04-0.07, which the learned std falls towards."""
+SPLIT_CLF_ENV_STAGES: tuple[tuple[int, str, float], ...] = (
+  (160, "rewards.mimic.params.clf.pen_scale", 0.0),
+  (100, "rewards.mimic.params.regularizers.scale", 0.0),
+)
+"""The CLF tasks' stage-2 ramps, by stage-local iteration: the CLF decrease
+condition off until k = 160, where the OSL channel's anneal ends (the channel's V
+starts far above stage 1's end: V_norm ~2.3 at k = 0), and the regularizers off
+until k = 100 (on a fresh OSL actor's exploration noise, std 0.2, the OSL action
+rate alone costs about 0.08 per step). Fixed iterations: they do not follow a
+changed anneal or warm-up. Stage 1.5 (``osl_fsm``) keeps them on purpose: its human
+channel starts at V_norm ~2.4 and fell below 2.0 near k = 160 in the round-6
+stage-1.5 run."""
 OSL_MIN_STD = 0.05
 """The OSL actor's std floor (rsl_rl's ``std_range``; there is no upper bound and no
 std cap). With no entropy bonus stage 1's OSL std fell to 0.04-0.07 on its own; the
@@ -249,10 +263,15 @@ class WarmStartCfg:
   checkpoint: str = ""
   """Checkpoint file inside a run directory; empty picks the highest-numbered
   ``model_N.pt``."""
+  allow_reward_mismatch: bool = False
+  """Start even though stage 1 trained with other reward settings than stage 2's
+  (the CLF penalty weight and decrease condition, or a regularizer, compared as the
+  runner prints them): the copied critics and return statistics then value another
+  reward. Refused otherwise. A stage-1 run from before 2026-11-18 records none of
+  the new settings and counts as musclemimic's decrease condition with no
+  regularizers, so warm-starting today's default stage 2 from it needs this."""
   allow_pen_w_mismatch: bool = False
-  """Start even though stage 1 trained with another CLF penalty weight (``pen_w``)
-  than stage 2's: the copied critics and return statistics then value another
-  reward. Refused otherwise."""
+  """The former name of ``allow_reward_mismatch``, which it still sets."""
 
 
 @dataclass
@@ -428,11 +447,24 @@ class SplitRunnerCfg(RslRlOnPolicyRunnerCfg):
   freeze: SplitFreezeCfg = field(default_factory=SplitFreezeCfg)
   blend: SplitBlendCfg = field(default_factory=SplitBlendCfg)
   channels: SplitChannelsCfg = field(default_factory=SplitChannelsCfg)
+  env_stages: tuple[tuple[int, str, float], ...] = ()
+  """Training-env settings staged by stage-local iteration ``k``, as stage 1's
+  ``env_stages`` stage them by update: each ``(until_k, path, value)`` runs
+  ``value`` before ``until_k`` and the env config's own value from then on (paths
+  as stage 1's, e.g. ``rewards.mimic.params.clf.pen_scale``). Part of the
+  curriculum a checkpoint keeps (``resume_curriculum``). The CLF tasks default to
+  :data:`SPLIT_CLF_ENV_STAGES`; ``--agent.env-stages "()"`` turns them off."""
+  allow_reward_mismatch: bool = False
+  """Resume (``--agent.resume``) a stage-2 checkpoint whose run trained another
+  reward than this config's (another CLF decrease condition or regularizers, or
+  other env stages for them, compared from the stage-local iteration it resumes
+  at); refused otherwise, naming the flags that rebuild the run's reward. Not the
+  warm start's ``warm_start.allow_reward_mismatch``, which compares stage 1's."""
   resume_curriculum: Literal["checkpoint", "config"] = "checkpoint"
   """On ``--agent.resume``: ``"checkpoint"`` continues on the curriculum the
-  checkpoint trained with (schedule, freeze, blend, channels, additive weights),
-  whatever the command line says, so a resume cannot freeze an unfrozen human again;
-  ``"config"`` takes the command line's, to retune or extend a run (set
+  checkpoint trained with (schedule, freeze, blend, channels, additive weights, env
+  stages), whatever the command line says, so a resume cannot freeze an unfrozen
+  human again; ``"config"`` takes the command line's, to retune or extend a run (set
   ``--agent.algorithm.schedule-iterations`` to lengthen the schedule; 0 keeps the
   checkpoint's). Either way the differences are printed."""
   export_osl_onnx: bool = True
@@ -449,10 +481,12 @@ def osl_split_runner_cfg(
     f.name: getattr(base, f.name)
     for f in fields(base)
     # Stage 2 starts where stage 1 ended, on the env config's final values, so it
-    # takes none of stage 1's env stages.
+    # takes none of stage 1's env stages; it has its own.
     if f.name not in {"algorithm", "validation", "env_stages"}
   }
-  cfg = SplitRunnerCfg(**shared)
+  cfg = SplitRunnerCfg(
+    **shared, env_stages=SPLIT_CLF_ENV_STAGES if reward == "clf" else ()
+  )
   assert isinstance(base.algorithm, MuscleMimicPpoCfg)
   cfg.algorithm = SplitPpoCfg(
     **{name: getattr(base.algorithm, name) for name in INHERITED_PPO_FIELDS}

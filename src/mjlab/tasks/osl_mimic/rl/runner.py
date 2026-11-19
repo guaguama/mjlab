@@ -43,9 +43,10 @@ Beyond musclemimic's:
 
 from __future__ import annotations
 
+import inspect
 import os
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -63,6 +64,8 @@ from mjlab.envs.mdp.actions import TendonEffortAction
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.osl_mimic.mdp import MimicMotionCommandCfg, mimic_reward
+from mjlab.tasks.osl_mimic.reward_settings import CHECKPOINT_KEY as REWARD_KEY
+from mjlab.tasks.osl_mimic.reward_settings import check_resume_reward, reward_record
 from mjlab.tasks.osl_mimic.touch_sites import (
   CHECKPOINT_KEY,
   check_checkpoint_file,
@@ -142,25 +145,88 @@ def drives_muscles(env: ManagerBasedRlEnv) -> bool:
 def stage_accessors(
   env: ManagerBasedRlEnv, path: str
 ) -> tuple[Callable[[], float], Callable[[float], None]]:
-  """Getter and setter of a staged env setting: ``rewards.<term>.weight`` or
-  ``terminations.<term>.<param>``. The managers read both every step."""
-  section, term, key = (path.split(".", 2) + ["", ""])[:3]
-  if section == "rewards" and key == "weight":
+  """Getter and setter of a staged env setting: ``rewards.<term>.weight``,
+  ``rewards.<term>.params.<param>``, ``rewards.<term>.params.<param>.<field>`` (a
+  field of a config-object param, e.g. ``rewards.mimic.params.clf.pen_scale``) or
+  ``terminations.<term>.<param>``.
+
+  They act on the managers' own term configs, which the managers read every step:
+  a reward term's params are passed to it on every call, and a class term holds the
+  same config objects (the reward manager copies the env config once, at build).
+  A param must be one the term reads on every step: any param of a function term
+  (passed on every call), and of a class term only those its ``LIVE_PARAMS`` names
+  (``mimic_reward``'s CLF weights and rates and its regularizers); a class term
+  reads every other param once, at build, so staging it would do nothing and is
+  refused. The staged value must be a number.
+  """
+  parts = path.split(".")
+  section, term = (parts + ["", ""])[:2]
+  if section == "rewards" and parts[2:] == ["weight"]:
     reward = env.reward_manager.get_term_cfg(term)
     return (lambda: reward.weight), (lambda v: setattr(reward, "weight", v))
-  if section == "terminations" and key:
+  if section == "rewards" and len(parts) in (4, 5) and parts[2] == "params":
+    term_cfg = env.reward_manager.get_term_cfg(term)
+    live = _live_params(term_cfg.func)
+    name = ".".join(parts[3:])
+    if live is not None and name not in live:
+      raise ValueError(
+        f"Env stage {path!r}: the {term!r} reward term reads {name!r} once, when it "
+        "is built, so a staged value would do nothing. It reads these on every step: "
+        f"{sorted(live) or 'none'}."
+      )
+    params = term_cfg.params
+    key = parts[3]
+    if key not in params:
+      raise KeyError(f"Reward {term!r} has no param {key!r} (env stage {path!r}).")
+    if len(parts) == 4:
+      _check_staged_number(params[key], path)
+      return (lambda: params[key]), (lambda v: params.__setitem__(key, v))
+    owner, name = params[key], parts[4]
+    if owner is None or isinstance(owner, Mapping) or not hasattr(owner, name):
+      raise KeyError(
+        f"Reward {term!r} param {key!r} has no field {name!r} (env stage {path!r})."
+      )
+    _check_staged_number(getattr(owner, name), path)
+    return (lambda: getattr(owner, name)), (lambda v: setattr(owner, name, v))
+  if section == "terminations" and len(parts) == 3:
     params = env.termination_manager.get_term_cfg(term).params
+    key = parts[2]
     if key not in params:
       raise KeyError(f"Termination {term!r} has no param {key!r} (env stage {path!r}).")
     return (lambda: params[key]), (lambda v: params.__setitem__(key, v))
   raise ValueError(
-    f"Unsupported env stage path {path!r}: use 'rewards.<term>.weight' or "
-    "'terminations.<term>.<param>'."
+    f"Unsupported env stage path {path!r}: use 'rewards.<term>.weight', "
+    "'rewards.<term>.params.<param>[.<field>]' or 'terminations.<term>.<param>'."
   )
 
 
+def _live_params(func: Any) -> frozenset[str] | None:
+  """The params a reward term reads on every step: its ``LIVE_PARAMS`` (a class
+  term's, or its instance's), None for a function term (all of them, passed on
+  every call), and none for a class term that declares none."""
+  live = getattr(func, "LIVE_PARAMS", None)
+  if live is not None:
+    return frozenset(live)
+  if inspect.isfunction(func) or inspect.ismethod(func):
+    return None
+  return frozenset()
+
+
+def resumes_training(load_cfg: Mapping[str, Any] | None) -> bool:
+  """Whether rsl_rl's ``load_cfg`` asks for a training resume: everything (None),
+  or the critic or the optimizer (not ``play.py``'s ``{"actor": True}``)."""
+  if load_cfg is None:
+    return True
+  return bool(load_cfg.get("critic") or load_cfg.get("optimizer"))
+
+
+def _check_staged_number(value: Any, path: str) -> None:
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    raise TypeError(f"Env stage {path!r} sets {value!r}, which is not a number.")
+
+
 class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
-  alg: MuscleMimicPPO
+  alg: MuscleMimicPPO  # pyright: ignore[reportIncompatibleVariableOverride]
 
   validation_group_keys: tuple[str, ...] = ()
   """Diagnostics also reported per validation group (``<key>/<group>``), next to
@@ -271,13 +337,15 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
       self.close_video_env()
       self.logger.stop_logging_writer()
 
-  def apply_env_stages(self) -> dict[str, float]:
-    """Set every staged training-env value (``OslMimicRunnerCfg.env_stages``) for the
-    algorithm's update count; returns each staged path's value now in force."""
+  def apply_env_stages(self, update: int | None = None) -> dict[str, float]:
+    """Set every staged training-env value (``OslMimicRunnerCfg.env_stages``) for
+    ``update``, by default the algorithm's update count; returns each staged path's
+    value now in force."""
     if not self.env_stages:
       return {}
     env = self.env.unwrapped
-    update = self.alg.num_updates_done
+    if update is None:
+      update = self.alg.num_updates_done
     current: dict[str, float] = {}
     for path in dict.fromkeys(path for _, path, _ in self.env_stages):
       get, put = stage_accessors(env, path)
@@ -293,12 +361,18 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
 
   def save(self, path: str, infos: dict | None = None) -> None:
     """mjlab's checkpoint (``MjlabOnPolicyRunner.save``) plus the OSL touch-site
-    version the env simulates, under :data:`~..touch_sites.CHECKPOINT_KEY`."""
+    version the env simulates, under :data:`~..touch_sites.CHECKPOINT_KEY`, and the
+    reward settings it trains with and their env stages (``infos["reward_settings"]``,
+    :func:`~..reward_settings.reward_record`), which a resume checks; an env without
+    a ``mimic`` term records none."""
     env = self.env.unwrapped
     infos = {
       **(infos or {}),
       "env_state": {"common_step_counter": env.common_step_counter},
     }
+    record = reward_record(getattr(env, "cfg", None), self.env_stages)
+    if record is not None:
+      infos[REWARD_KEY] = record
     saved = self.alg.save()
     saved["iter"] = self.current_learning_iteration
     saved["infos"] = infos
@@ -315,14 +389,30 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     map_location: str | None = None,
   ) -> dict:
     """mjlab's load, after refusing a checkpoint trained with other OSL touch sites
-    than the env simulates (one that records none trained with ``original``).
+    than the env simulates (one that records none trained with ``original``). A
+    training resume (``load_cfg`` None, or one with the critic or optimizer) is also
+    refused when it would train another reward than the checkpoint's run did
+    (:func:`~..reward_settings.check_resume_reward`, from the update the checkpoint
+    resumes at), unless ``allow_reward_mismatch``.
 
     Raises:
-      ValueError: On that mismatch, naming the ``--env.osl-touch-sites`` value that
-        fixes it.
+      ValueError: On a touch-site mismatch, naming the ``--env.osl-touch-sites``
+        value that fixes it, or a reward mismatch, naming the flags that rebuild the
+        run's reward and ``--agent.allow-reward-mismatch``.
     """
-    check_checkpoint_file(path, self.env.unwrapped)
-    return super().load(path, load_cfg, strict, map_location)
+    env = self.env.unwrapped
+    check_checkpoint_file(path, env)
+    infos = super().load(path, load_cfg, strict, map_location)
+    if resumes_training(load_cfg):
+      check_resume_reward(
+        path,
+        infos,
+        getattr(env, "cfg", None),
+        self.env_stages,
+        int(self.alg.num_updates_done),
+        bool(self.cfg.get("allow_reward_mismatch", False)),
+      )
+    return infos
 
   @classmethod
   def configure_env_for_checkpoint(

@@ -45,7 +45,6 @@ from mjlab.tasks.osl_gait_library.config.env_cfgs import (
   TWIST_WEIGHT,
   UNICYCLE_BCK_ARC_REGIONS,
   UNICYCLE_FWD_ARC_REGIONS,
-  UNICYCLE_MSK_CLF_PEN_W,
   UNICYCLE_MSK_ROOT_DEVIATION,
   UNICYCLE_MSK_TWIST_WEIGHT,
   UNICYCLE_TWIST_METRIC_WEIGHTS,
@@ -81,12 +80,21 @@ from mjlab.tasks.osl_gait_library.rl.runner import (
   slow_clips,
 )
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
-from mjlab.tasks.osl_mimic.config.rl_cfg import MuscleMimicPpoCfg, OslMimicRunnerCfg
+from mjlab.tasks.osl_mimic.config.rl_cfg import (
+  CLF_ENV_STAGES,
+  MuscleMimicPpoCfg,
+  OslMimicRunnerCfg,
+)
+from mjlab.tasks.osl_mimic.mdp import REGULARIZERS, RegularizerCfg, clf_regularizers
+from mjlab.tasks.osl_mimic.mdp.kinematics import relative_site_quantities
+from mjlab.tasks.osl_mimic.reward_settings import env_reward_settings
 from mjlab.tasks.osl_mimic.rl.runner import stage_accessors
 from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
 from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
 from mjlab.tasks.osl_split.mdp import LEGACY_OSL_SENSORS, OslObsCfg
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
+from mjlab.utils.lab_api.math import matrix_from_quat
+from mjlab.utils.os import dump_yaml
 from mjlab.viewer.native.visualizer import MujocoNativeDebugVisualizer
 
 # task id -> (model, socket, reward)
@@ -229,10 +237,17 @@ def test_unicycle_task_contract(task: str) -> None:
   assert rl.experiment_name.startswith("osl_fullbody_unicycle")
   assert "unicycle" in rl.wandb_tags
 
-  # The MSK tasks' stage-1 recipe; the robot tasks keep osl_mimic's settings.
+  # The MSK tasks' stage-1 recipe; the robot tasks keep osl_mimic's settings. Every
+  # CLF task has the paper-form decrease condition and the regularizers, ramped in
+  # by env stages; MimicReward has neither.
   msk = model == "msk"
   clf = cfg.rewards["mimic"].params["clf"]
-  assert clf is None or clf.pen_w == (UNICYCLE_MSK_CLF_PEN_W if msk else 0.25)
+  regularizers = cfg.rewards["mimic"].params["regularizers"]
+  if clf is None:
+    assert regularizers == RegularizerCfg()
+  else:
+    assert (clf.decay_form, clf.pen_w, clf.pen_scale) == ("paper", 0.5, 1.0)
+    assert regularizers == clf_regularizers(model)
   assert (
     validation.rewards["twist"].weight
     == cfg.rewards["twist"].weight
@@ -253,8 +268,10 @@ def test_unicycle_task_contract(task: str) -> None:
     assert rl.max_iterations == UNICYCLE_MSK_ITERATIONS
     assert v.stress_interval == UNICYCLE_MSK_STRESS_INTERVAL
     assert v.stress_inference == ("mean", "expected")
-    # Every staged path names a setting of the training config.
-    assert rl.env_stages == UNICYCLE_MSK_ENV_STAGES
+    # The recipe's stages come after the CLF ramps; every staged path names a
+    # setting of the training config.
+    ramps = CLF_ENV_STAGES if clf is not None else ()
+    assert rl.env_stages == (*ramps, *UNICYCLE_MSK_ENV_STAGES)
     env = SimpleNamespace(
       reward_manager=SimpleNamespace(get_term_cfg=lambda n: cfg.rewards[n]),
       termination_manager=SimpleNamespace(get_term_cfg=lambda n: cfg.terminations[n]),
@@ -263,13 +280,15 @@ def test_unicycle_task_contract(task: str) -> None:
       path: stage_accessors(cast(Any, env), path)[0]() for _, path, _ in rl.env_stages
     }
     assert finals == {
+      **({path: 1.0 for _, path, _ in CLF_ENV_STAGES} if clf is not None else {}),
       "terminations.root_deviation.threshold": UNICYCLE_MSK_ROOT_DEVIATION,
       "rewards.twist.weight": UNICYCLE_MSK_TWIST_WEIGHT,
     }
   else:
     assert rl.actor.distribution_cfg["init_std"] == 0.2
     assert alg.std_cap_start == 0.0 and not alg.init_std_terms
-    assert v.stress_interval == 0 and rl.env_stages == ()
+    assert v.stress_interval == 0
+    assert rl.env_stages == (CLF_ENV_STAGES if clf is not None else ())
 
 
 def test_perception_switches() -> None:
@@ -330,7 +349,9 @@ def test_heading_twist_uses_body_minus_y_forward() -> None:
 
 
 def _synthetic_clip(period: int, speed: float, phase0: float = 0.0) -> dict:
-  """A walker moving at ``speed`` along +x whose two joints swing once per stride."""
+  """A walker moving at ``speed`` along +x whose two joints swing once per stride.
+  Its second site (a foot) pitches against the root, so its relative site velocity
+  ``rvel`` depends on the heading."""
   t = torch.arange(period, dtype=torch.float32)
   w = 2 * math.pi / (period * DT)
   ang = w * t * DT + phase0
@@ -345,6 +366,20 @@ def _synthetic_clip(period: int, speed: float, phase0: float = 0.0) -> dict:
   v_rel = torch.stack([0.2 * w * torch.cos(ang), 0 * t, 0 * t], -1)[:, None, :]
   zeros3 = torch.zeros(period, 1, 3)
   site_pos = torch.stack([root_pos, root_pos + rpos[:, 0]], dim=1)
+  pitch = 0.5 * torch.sin(ang)
+  foot_rel = torch.stack(
+    [torch.cos(pitch / 2), torch.sin(pitch / 2), 0 * t, 0 * t], -1
+  )  # About the root's x axis.
+  foot_quat = torch.stack(
+    [
+      root_quat[:, 0] * foot_rel[:, 0] - root_quat[:, 3] * foot_rel[:, 3],
+      root_quat[:, 0] * foot_rel[:, 1] - root_quat[:, 3] * foot_rel[:, 2],
+      root_quat[:, 0] * foot_rel[:, 2] + root_quat[:, 3] * foot_rel[:, 1],
+      root_quat[:, 3] * foot_rel[:, 0] + root_quat[:, 0] * foot_rel[:, 3],
+    ],
+    -1,
+  )
+  pitch_rate = torch.stack([0.5 * w * torch.cos(ang), 0 * t, 0 * t], -1)
   return {
     "joint_pos": joint_pos,
     "joint_vel": joint_vel,
@@ -354,9 +389,11 @@ def _synthetic_clip(period: int, speed: float, phase0: float = 0.0) -> dict:
     "root_ang_vel_w": root_ang,
     "root_ang_vel_b": root_ang,
     "site_pos": site_pos,
+    "site_mat": matrix_from_quat(torch.stack([root_quat, foot_quat], dim=1)),
+    "site_ang_w": torch.stack([root_ang, root_ang + pitch_rate], dim=1),
+    "site_lin_w": torch.stack([root_lin, root_lin + v_rel[:, 0]], dim=1),
     "rpos": rpos,
     "rangles": zeros3,
-    "rvel": torch.zeros(period, 1, 6),
     "v_rel": v_rel,
     "omega_rel": zeros3,
   }
@@ -386,7 +423,15 @@ def _fake_command(num_envs: int = 4) -> GaitLibraryCommand:
   cmd._step_dt = DT
   clips = [_synthetic_clip(100, 1.0), _synthetic_clip(80, 1.3, 0.2)]
   idle = {k: v[:1].expand(50, *v.shape[1:]).clone() for k, v in clips[0].items()}
-  for k in ("joint_vel", "root_lin_vel", "root_ang_vel_w", "root_ang_vel_b", "v_rel"):
+  for k in (
+    "joint_vel",
+    "root_lin_vel",
+    "root_ang_vel_w",
+    "root_ang_vel_b",
+    "v_rel",
+    "site_ang_w",
+    "site_lin_w",
+  ):
     idle[k] = torch.zeros_like(idle[k])
   clips.append(idle)
   lengths = [100, 80, 50]
@@ -505,6 +550,66 @@ def test_blended_velocities_are_derivatives_of_blended_positions() -> None:
   ):
     fd = (getattr(after, pos) - getattr(before, pos)) / (2 * DT)
     torch.testing.assert_close(getattr(mid, vel), fd, atol=2e-2, rtol=2e-2)
+
+
+def _rotated_rvel(
+  cmd: GaitLibraryCommand, clip: torch.Tensor, frame: torch.Tensor, yaw: torch.Tensor
+) -> torch.Tensor:
+  """(B, K, 6) the rvel of each env's clip frame with the clip turned by ``yaw``
+  about z (float64): ``relative_site_quantities`` of the rotated sites."""
+  c, s = torch.cos(yaw.double()), torch.sin(yaw.double())
+  rot = torch.zeros(len(yaw), 1, 3, 3, dtype=torch.float64)
+  rot[:, 0, 0, 0], rot[:, 0, 0, 1], rot[:, 0, 1, 0], rot[:, 0, 1, 1] = c, -s, s, c
+  rot[:, 0, 2, 2] = 1.0
+  d = cmd.data
+  mat = rot @ d["site_mat"][clip, frame].double()
+  ang = (rot @ d["site_ang_w"][clip, frame].double()[..., None]).squeeze(-1)
+  lin = (rot @ d["site_lin_w"][clip, frame].double()[..., None]).squeeze(-1)
+  pos = d["site_pos"][clip, frame].double()
+  return relative_site_quantities(pos, mat, ang, lin)[2]
+
+
+def test_rvel_is_served_at_the_anchor_heading() -> None:
+  """The relative site velocity is not invariant to a turn of the clip, so it is
+  served from the anchored sites: at every anchor yaw, and mixed through a blend,
+  it is ``relative_site_quantities`` of the turned clip. MimicReward's rvel kernels
+  read it; the CLF reward does not (only its rvel diagnostics do)."""
+  cmd = _fake_command()
+  cmd.frame[:] = torch.tensor([10, 45, 70, 90])
+  yaw = torch.tensor([0.0, 0.5 * math.pi, math.pi, -2.0])
+  cmd.anchor[:, 2] = yaw
+  served = cmd.reference(0).rvel
+  expected = _rotated_rvel(cmd, cmd.clip, cmd.frame, yaw)
+  torch.testing.assert_close(served.double(), expected, rtol=0.0, atol=1e-6)
+  # Not vacuous: the clip's own heading serves another rvel at a turned anchor.
+  native = _rotated_rvel(cmd, cmd.clip, cmd.frame, torch.zeros(4))
+  assert float((native - expected)[1:].abs().amax()) > 0.1
+
+  # Mid-blend: the outgoing clip (on its own clock, velocities at its rate) and
+  # the new one, each recomputed at its own anchor, then mixed.
+  cmd._sample_twist = lambda n: torch.tensor([[1.3, 0.0, 0.0]]).repeat(n, 1)  # type: ignore[method-assign]
+  cmd._switch(torch.arange(4))
+  for _ in range(5):
+    cmd._update_command(None)
+  alpha = cmd.alpha
+  assert bool(((alpha > 0) & (alpha < 1)).all())
+  x = cmd.frame_prev
+  lo = x.floor().long()
+  frac = (x - lo.float()).double()[:, None, None]
+  n = cmd.num_frames[cmd.clip_prev]
+  old_yaw = cmd.anchor_prev[:, 2]
+  assert bool((lo + 1 < n).all())  # No loop to unroll.
+  old = (
+    torch.lerp(
+      _rotated_rvel(cmd, cmd.clip_prev, lo, old_yaw),
+      _rotated_rvel(cmd, cmd.clip_prev, lo + 1, old_yaw),
+      frac,
+    )
+    * cmd.rate_prev.double()[:, None, None]
+  )
+  new = _rotated_rvel(cmd, cmd.clip, cmd.frame, cmd.anchor[:, 2])
+  mixed = torch.lerp(old, new, alpha.double()[:, None, None])
+  torch.testing.assert_close(cmd.reference(0).rvel.double(), mixed, rtol=0.0, atol=1e-6)
 
 
 def test_blend_accelerates_without_overshoot() -> None:
@@ -1002,6 +1107,132 @@ def test_the_final_checkpoint_is_validated_once(
   ]
   if iterations:
     assert (tmp_path / f"model_{iterations - 1}.pt").is_file()
+
+
+ROUND6_CLF = {
+  "w": 1.0,
+  "pen_w": 0.0,
+  "tau": 0.1,
+  "q_pos": 1.0,
+  "q_vel": 1.0,
+  "r": 0.1,
+  "alpha": None,
+  "alpha_safety": 0.5,
+  "c_viol": 0.1,
+  "eps_dead": 0.01,
+  "scales": {"rpos": 0.05, "rangles": 0.2, "root_pos": 0.1, "root_ori": 0.2},
+}
+"""A round-6 MSK unicycle run's ``clf`` block, as its env.yaml records it: no decay
+form, ``pen_w`` 0, and no ``regularizers`` beside it."""
+
+
+def _reward_env(old: bool = False) -> _FakeEnv:
+  """The fake env with the MSK unicycle task's real reward params, which the resume
+  check reads; ``old``: the flags that rebuild a round-6 run's reward."""
+  env = _FakeEnv()
+  rewards = osl_gait_library_env_cfg("msk", "compliant", "clf", "train", "unicycle")
+  if old:
+    params = rewards.rewards["mimic"].params
+    params["clf"].decay_form = "musclemimic"
+    params["clf"].pen_w = 0.0
+    for name in REGULARIZERS:
+      setattr(params["regularizers"], name, 0.0)
+  env.cfg.rewards = rewards.rewards
+  return env
+
+
+def _resume_cfg(**changes: Any) -> dict[str, Any]:
+  cfg = _stage1_cfg()
+  cfg["validation"].update(interval=0, stress_interval=0)
+  cfg.update(changes)
+  return cfg
+
+
+def test_a_resume_onto_another_reward_is_refused(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """A training resume refuses a checkpoint whose run trained another reward,
+  naming the flags that rebuild it, unless allowed; with those flags it passes.
+  Checkpoints record their reward; one from before the record (a round-6 run) is
+  read from its run's params. Play's actor-only load is never checked."""
+  run = GaitLibraryOnPolicyRunner(
+    cast(Any, _reward_env()), _resume_cfg(), str(tmp_path / "new"), "cpu"
+  )
+  run.learn(1)
+  checkpoint = tmp_path / "new" / "model_0.pt"
+  saved = torch.load(checkpoint, weights_only=False)
+  record = saved["infos"]["reward_settings"]
+  assert record == {
+    "config": env_reward_settings(_reward_env().cfg),
+    "env_stages": [],
+  }
+  # A run of today's reward resumes silently.
+  same = GaitLibraryOnPolicyRunner(cast(Any, _reward_env()), _resume_cfg(), None, "cpu")
+  capsys.readouterr()
+  same.load(str(checkpoint))
+  assert "another reward" not in capsys.readouterr().out
+
+  # A round-6 run: no record, its reward in its params (and its recipe's stages).
+  old_dir = tmp_path / "r6"
+  del saved["infos"]["reward_settings"]
+  old_dir.mkdir()
+  torch.save(saved, old_dir / "model_0.pt")
+  old_env = {"rewards": {"mimic": {"params": {"clf": ROUND6_CLF}}}}
+  dump_yaml(old_dir / "params" / "env.yaml", old_env)
+  dump_yaml(old_dir / "params" / "agent.yaml", {"env_stages": UNICYCLE_MSK_ENV_STAGES})
+  old = str(old_dir / "model_0.pt")
+  default = GaitLibraryOnPolicyRunner(
+    cast(Any, _reward_env()), _resume_cfg(), None, "cpu"
+  )
+  with pytest.raises(ValueError, match="trained on another reward") as refused:
+    default.load(old)
+  message = str(refused.value)
+  for text in (
+    "its run's params (it predates the record)",
+    "CLF penalty pen_w x pen_scale 0 vs 0.5",
+    "--env.rewards.mimic.params.clf.decay-form musclemimic",
+    "--env.rewards.mimic.params.clf.pen-w 0 ",
+    "--env.rewards.mimic.params.regularizers.osl-action-rate 0 ",
+    "--env.rewards.mimic.params.regularizers.joint-limits 0 ",
+    "--agent.env-stages \"((1500, 'terminations.root_deviation.threshold', 1.0), "
+    "(3000, 'rewards.twist.weight', 0.06))\"",
+    "--agent.allow-reward-mismatch True",
+  ):
+    assert text in message, text
+  # Play loads the actor alone, unchecked.
+  default.load(old, load_cfg={"actor": True})
+  # The override: a warning.
+  allowed = GaitLibraryOnPolicyRunner(
+    cast(Any, _reward_env()), _resume_cfg(allow_reward_mismatch=True), None, "cpu"
+  )
+  capsys.readouterr()
+  allowed.load(old)
+  assert "[WARN]" in capsys.readouterr().out
+  # The flags that rebuild the run's reward: silent.
+  rebuilt = GaitLibraryOnPolicyRunner(
+    cast(Any, _reward_env(old=True)),
+    _resume_cfg(env_stages=UNICYCLE_MSK_ENV_STAGES),
+    None,
+    "cpu",
+  )
+  capsys.readouterr()
+  rebuilt.load(old)
+  assert "another reward" not in capsys.readouterr().out
+  # The ramps in force at the update the run resumes at count too.
+  ramped = GaitLibraryOnPolicyRunner(
+    cast(Any, _reward_env(old=True)),
+    _resume_cfg(env_stages=((5, "rewards.mimic.params.clf.pen_scale", 0.0),)),
+    None,
+    "cpu",
+  )
+  # pen_w 0 either way: a pen_scale stage changes nothing, so it passes.
+  ramped.load(old)
+  # Without its params the run's reward cannot be read: refused.
+  bare = tmp_path / "bare"
+  bare.mkdir()
+  torch.save(saved, bare / "model_0.pt")
+  with pytest.raises(ValueError, match="records no reward settings"):
+    default.load(str(bare / "model_0.pt"))
 
 
 LEGACY_FAKE_OSL = OslObsCfg(**LEGACY_OSL_SENSORS, history_length=2)
