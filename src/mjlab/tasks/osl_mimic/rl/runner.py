@@ -213,8 +213,10 @@ def _live_params(func: Any) -> frozenset[str] | None:
 
 
 def resumes_training(load_cfg: Mapping[str, Any] | None) -> bool:
-  """Whether rsl_rl's ``load_cfg`` asks for a training resume: everything (None),
-  or the critic or the optimizer (not ``play.py``'s ``{"actor": True}``)."""
+  """Whether rsl_rl's ``load_cfg`` loads what a training resume needs: everything
+  (None), or the critic or the optimizer (not ``play.py``'s ``{"actor": True}``).
+  Evaluations load everything too: the reward check waits for training
+  (:meth:`OslMimicOnPolicyRunner.check_resume`)."""
   if load_cfg is None:
     return True
   return bool(load_cfg.get("critic") or load_cfg.get("optimizer"))
@@ -248,6 +250,7 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
       (int(u), str(path), float(v)) for u, path, v in train_cfg.get("env_stages") or ()
     )
     self._stage_defaults: dict[str, float] = {}
+    self._resumed: tuple[str, dict] | None = None
     self._validation_env: RslRlVecEnvWrapper | None = None
     self._stress_env: RslRlVecEnvWrapper | None = None
     self._video_env: RslRlVecEnvWrapper | None = None
@@ -260,6 +263,7 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     self, num_learning_iterations: int, init_at_random_ep_len: bool = False
   ) -> None:
     del init_at_random_ep_len  # musclemimic never randomizes episode lengths.
+    self.check_resume()
     obs = self.env.get_observations().to(self.device)
     self.alg.train_mode()
     if self.is_distributed:
@@ -390,29 +394,51 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
   ) -> dict:
     """mjlab's load, after refusing a checkpoint trained with other OSL touch sites
     than the env simulates (one that records none trained with ``original``). A
-    training resume (``load_cfg`` None, or one with the critic or optimizer) is also
-    refused when it would train another reward than the checkpoint's run did
-    (:func:`~..reward_settings.check_resume_reward`, from the update the checkpoint
-    resumes at), unless ``allow_reward_mismatch``.
+    load of what a training resume needs (``load_cfg`` None, or one with the critic
+    or optimizer) is noted for :meth:`check_resume`, which :meth:`learn` runs: an
+    evaluation loads the whole checkpoint too, and trains nothing.
 
     Raises:
       ValueError: On a touch-site mismatch, naming the ``--env.osl-touch-sites``
-        value that fixes it, or a reward mismatch, naming the flags that rebuild the
-        run's reward and ``--agent.allow-reward-mismatch``.
+        value that fixes it.
     """
     env = self.env.unwrapped
     check_checkpoint_file(path, env)
     infos = super().load(path, load_cfg, strict, map_location)
-    if resumes_training(load_cfg):
-      check_resume_reward(
-        path,
-        infos,
-        getattr(env, "cfg", None),
-        self.env_stages,
-        int(self.alg.num_updates_done),
-        bool(self.cfg.get("allow_reward_mismatch", False)),
-      )
+    self._resumed = (path, infos) if resumes_training(load_cfg) else None
     return infos
+
+  def check_resume(self) -> None:
+    """Refuse to train on from the checkpoint :meth:`load` restored when its run
+    trained another reward than this config's
+    (:func:`~..reward_settings.check_resume_reward`: from the update the run resumes
+    at, :meth:`_resume_point`), unless ``allow_reward_mismatch``. :meth:`learn`
+    calls it before it trains; once per load, and nothing without one.
+
+    Raises:
+      ValueError: On a reward mismatch, naming the flags that rebuild the run's
+        reward and ``--agent.allow-reward-mismatch``, or when the run's reward
+        cannot be read.
+    """
+    resumed, self._resumed = getattr(self, "_resumed", None), None
+    if resumed is None:
+      return
+    path, infos = resumed
+    update, what = self._resume_point()
+    check_resume_reward(
+      path,
+      infos,
+      getattr(self.env.unwrapped, "cfg", None),
+      self.env_stages,
+      update,
+      bool(self.cfg.get("allow_reward_mismatch", False)),
+      what=what,
+    )
+
+  def _resume_point(self) -> tuple[int, str]:
+    """Where a resumed run trains first, for its env stages: the PPO update count,
+    which checkpoints carry."""
+    return int(self.alg.num_updates_done), "update"
 
   @classmethod
   def configure_env_for_checkpoint(

@@ -70,7 +70,8 @@ _ENV_YAML_LINE = re.compile(rf"^{ENV_FIELD}:[ \t]*['\"]?(\w+)['\"]?[ \t]*$", re.
 @dataclass(kw_only=True)
 class OslEnvCfg(ManagerBasedRlEnvCfg):
   """The env config of every OSL full-body task: its robot entity builds the OSL
-  foot's touch zones that ``osl_touch_sites`` names."""
+  foot's touch zones that ``osl_touch_sites`` names, and its metrics log the servo
+  costs its ``mimic`` term's ``regularizers.log_servo_terms`` asks for."""
 
   osl_touch_sites: TouchSites = DEFAULT_TOUCH_SITES
   """The foot touch-sensor zones. ``feet_extended`` (the default) extends the OSL
@@ -83,8 +84,12 @@ class OslEnvCfg(ManagerBasedRlEnvCfg):
 
   def __post_init__(self) -> None:
     # tyro builds the config after applying the command line, so this sees the
-    # final value.
+    # final values.
     sync_touch_sites(self)
+    # Local: the reward module's imports lead back here (mdp.commands -> tracking).
+    from .mdp.rewards import sync_servo_log_metrics
+
+    sync_servo_log_metrics(self)
 
 
 def sync_touch_sites(cfg: OslEnvCfg) -> None:

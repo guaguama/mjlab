@@ -35,8 +35,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast, get_args
 import mujoco
 import torch
 
-from mjlab.actuator.xml_actuator import XmlActuator
+from mjlab.actuator.xml_actuator import XmlActuator, XmlActuatorCfg
 from mjlab.managers.manager_base import ManagerTermBase
+from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply_inverse
 
@@ -877,3 +878,35 @@ def mimic_component(
   if name in components:
     return components[name]
   return torch.zeros(env.num_envs, device=env.device)
+
+
+def sync_servo_log_metrics(cfg: Any) -> None:
+  """Register the servo-cost metrics (:data:`SERVO_LOG_DIAGNOSTICS`) exactly when
+  the config's ``mimic`` term logs them: its ``regularizers.log_servo_terms`` on a
+  robot with position servos (an ``XmlActuatorCfg`` of command field
+  ``"position"``, which the term reads at build). An OSL env config calls it from
+  ``__post_init__``, after the command line (``OslEnvCfg``).
+
+  In place, with a new metrics dict when they change, rather than an edited one:
+  the field-copying constructions share it between configs. A config without a
+  ``mimic`` term (the G1-style tracking tasks) gets none."""
+  rewards = getattr(cfg, "rewards", None)
+  mimic = rewards.get("mimic") if isinstance(rewards, dict) else None
+  params = getattr(mimic, "params", None) or {}
+  regularizers = params.get("regularizers") if isinstance(params, dict) else None
+  robot = cfg.scene.entities.get("robot")
+  actuators = getattr(getattr(robot, "articulation", None), "actuators", None) or ()
+  servos = any(
+    isinstance(act, XmlActuatorCfg) and act.command_field == "position"
+    for act in actuators
+  )
+  log = servos and bool(getattr(regularizers, "log_servo_terms", False))
+  names = set(SERVO_LOG_DIAGNOSTICS)
+  metrics = {name: m for name, m in cfg.metrics.items() if name not in names}
+  if log:
+    for name in SERVO_LOG_DIAGNOSTICS:
+      metrics[name] = cfg.metrics.get(name) or MetricsTermCfg(
+        func=mimic_component, params={"name": name}
+      )
+  if set(metrics) != set(cfg.metrics):
+    cfg.metrics = metrics

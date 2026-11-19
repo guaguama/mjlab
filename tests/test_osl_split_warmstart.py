@@ -874,16 +874,16 @@ def test_reward_settings_of_old_runs_and_their_mismatches() -> None:
   assert legacy["reg_osl_action_rate"] == legacy["reg_joint_limits"] == 0.0
   new = reward_settings(ClfCfg(), clf_regularizers("msk"))
   lines = [
-    "CLF penalty pen_w x pen_scale 0 vs 0.5",
-    "regularizer osl_action_rate (x scale) 0 vs 1",
-    "regularizer joint_limits (x scale) 0 vs 1",
+    "CLF penalty pen_w x pen_scale 0.0 vs 0.5",
+    "regularizer osl_action_rate (x scale) 0.0 vs 1.0",
+    "regularizer joint_limits (x scale) 0.0 vs 1.0",
   ]
   assert reward_mismatches(legacy, new) == lines
   # A lineage converted before the reward settings were recorded reads the same.
   old_lineage = {"clf_pen_w": 0.0, "twist_weight": 0.2, "root_deviation": 2.0}
   assert reward_mismatches(old_lineage, new) == lines
   robot = reward_settings(ClfCfg(), clf_regularizers("robot"))
-  assert "regularizer servo_action_rate (x scale) 0 vs 1" in reward_mismatches(
+  assert "regularizer servo_action_rate (x scale) 0.0 vs 1.0" in reward_mismatches(
     legacy, robot
   )
   assert reward_mismatches(new, new) == []

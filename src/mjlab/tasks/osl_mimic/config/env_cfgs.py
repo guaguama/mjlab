@@ -302,8 +302,7 @@ def osl_mimic_env_cfg(
   )
   if model == "msk":
     names += (mdp.ACTIVATION_DIAGNOSTIC,)
-  elif clf:  # clf_regularizers logs the robot's servo costs.
-    names += mdp.SERVO_LOG_DIAGNOSTICS
+  # The servo-cost metrics follow regularizers.log_servo_terms in OslEnvCfg.
   metrics = {
     name: MetricsTermCfg(func=mdp.mimic_component, params={"name": name})
     for name in names

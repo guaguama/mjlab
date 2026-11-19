@@ -214,7 +214,9 @@ Added
   rewarded). With ``RegularizerCfg.log_servo_terms`` the robot servos' torque and
   saturation costs are logged every step, unweighted, as ``servo_torque_cost`` and
   ``servo_saturation_cost``, whatever their coefficients; they never reach the
-  reward.
+  reward. The two metrics follow the final config (the command line's
+  ``--env.rewards.mimic.params.regularizers.log-servo-terms`` included, on any
+  robot task), and the musculoskeletal model, which has no servos, logs none.
 - Env stages can stage reward-term parameters, also fields of config-object
   parameters (``rewards.<term>.params.<param>[.<field>]``, e.g.
   ``rewards.mimic.params.clf.pen_scale``), and the stage-2 split runner takes env
@@ -400,14 +402,20 @@ Changed
   before this change counts as musclemimic's decrease condition with no
   regularizers, so warm-starting the default stage 2 from it needs the flag. The
   V-dot window is compared only where both rewards impose the paper form.
-- Resuming an OSL training run (the stage-1 and the stage-2 runner) refuses a
-  checkpoint whose run trained on another reward than the resumed config's, unless
-  ``--agent.allow-reward-mismatch True``, and names the flags that rebuild the run's
-  reward. It compares the settings the warm start compares, once every env stage
-  has ended and at the update the resume trains first. Every checkpoint now records
-  them (``reward_settings``); for an older checkpoint they come from its run's
-  ``params/env.yaml`` and ``agent.yaml``. ``play.py``'s actor-only load is not
-  checked, and the gait-library evaluation only warns.
+- A resumed OSL training run (the stage-1 and the stage-2 runner) refuses to train
+  on a checkpoint whose run trained another reward than the resumed config's,
+  unless ``--agent.allow-reward-mismatch True``, and names the flags that rebuild
+  the run's reward (written exactly, so they parse back to the run's values). It
+  compares the settings the warm start compares, and whether each uses the CLF at
+  all (a MimicReward run under a -CLF task, or the reverse, is told which task to
+  resume it under), once every env stage has ended and on every update from the
+  one the resume trains first, under both runs' env stages. The check runs when
+  training starts: loading a checkpoint alone, as ``play.py`` and evaluation
+  scripts do, is never refused. Every checkpoint now records the settings
+  (``reward_settings``); for an older checkpoint they come from its run's
+  ``params/env.yaml`` and ``agent.yaml``, and one without them (a W&B download, say)
+  is refused as unreadable unless allowed, with the ways on. The gait-library
+  evaluation scores a checkpoint under its run's reward, read the same way.
 
 - Bumped ``rsl-rl-lib`` from 5.5.0 to 5.5.1. This removes the need for capping
   ``wandb`` below 0.29.

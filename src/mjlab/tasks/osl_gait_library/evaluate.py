@@ -10,8 +10,10 @@
 
 The run's ``params/agent.yaml`` names its model, socket, reward and variant; the
 task is rebuilt from code (as the exporter does), with the OSL foot touch sites the
-checkpoint was trained with (``touch_sites.run_touch_sites``), the checkpoint is
-loaded into the task's runner, and the runner's passes run once per inference mode:
+checkpoint was trained with (``touch_sites.run_touch_sites``) and its run's reward
+settings (``reward_settings.checkpoint_reward_record``: a run from before 2026-11-18
+scores under its own reward, not today's defaults), the checkpoint is loaded into
+the task's runner, and the runner's passes run once per inference mode:
 
 * validation (``Validation*/``): every library clip in its own env from phase 0 at
   its own twist, on the nominal plant with mid-range actuator delays, for one 20 s
@@ -41,6 +43,12 @@ from typing import Any
 import torch
 import tyro
 
+from mjlab.tasks.osl_mimic.reward_settings import (
+  apply_reward_settings,
+  checkpoint_reward_record,
+  describe_reward_settings,
+  env_reward_settings,
+)
 from mjlab.tasks.osl_mimic.touch_sites import run_touch_sites, set_touch_sites
 
 from .export import config_mismatches, read_config, run_spec
@@ -144,6 +152,7 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
   touch = run_touch_sites(checkpoint, saved_env=saved)
   set_touch_sites(env_cfg, touch.value)
   print(f"[INFO] OSL touch sites: {touch.value} (from {touch.source}).")
+  apply_run_reward(env_cfg, checkpoint)
   if cfg.legacy_contacts:
     use_legacy_contacts(env_cfg)
   if cfg.solver_iterations is not None:
@@ -158,9 +167,6 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
   env_cfg.scene.num_envs = 2  # The runner needs a training env; the evals own theirs.
 
   agent_cfg = asdict(load_rl_cfg(task_id))
-  # It loads the whole checkpoint but trains nothing: the resume's reward check (the
-  # run's reward vs this task's) does not apply.
-  agent_cfg["allow_reward_mismatch"] = True
   agent_cfg["logger"] = "tensorboard"
   agent_cfg["video"] = {**agent_cfg.get("video", {}), "enabled": False}
   # The checkpoint's own std, untouched by any training-time bound.
@@ -195,6 +201,24 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
     runner.close()
     vec.close()
   return results
+
+
+def apply_run_reward(env_cfg: Any, checkpoint: Path) -> None:
+  """Score under the reward the checkpoint's run trained with (its record, else its
+  run's ``params/``), at the config's values without env stages, as validation
+  scores in training. A run whose reward cannot be read keeps the task's, with a
+  warning."""
+  record, source = checkpoint_reward_record(checkpoint)
+  if record is None:
+    print(
+      f"[WARN] {checkpoint} records no reward settings and its run's params/ gives "
+      "none: scored under this task's reward, "
+      f"{describe_reward_settings(env_reward_settings(env_cfg) or {})}.",
+      file=sys.stderr,
+    )
+    return
+  apply_reward_settings(env_cfg, record["config"])
+  print(f"[INFO] Reward: {describe_reward_settings(record['config'])} (from {source}).")
 
 
 def main() -> None:

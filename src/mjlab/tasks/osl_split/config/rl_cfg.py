@@ -455,11 +455,12 @@ class SplitRunnerCfg(RslRlOnPolicyRunnerCfg):
   curriculum a checkpoint keeps (``resume_curriculum``). The CLF tasks default to
   :data:`SPLIT_CLF_ENV_STAGES`; ``--agent.env-stages "()"`` turns them off."""
   allow_reward_mismatch: bool = False
-  """Resume (``--agent.resume``) a stage-2 checkpoint whose run trained another
-  reward than this config's (another CLF decrease condition or regularizers, or
-  other env stages for them, compared from the stage-local iteration it resumes
-  at); refused otherwise, naming the flags that rebuild the run's reward. Not the
-  warm start's ``warm_start.allow_reward_mismatch``, which compares stage 1's."""
+  """Train on (``--agent.resume``) from a stage-2 checkpoint whose run trained
+  another reward than this config's (the CLF or not, another CLF decrease condition
+  or regularizers, or env stages that set them otherwise on any stage-local
+  iteration from the one it resumes at); refused otherwise when training starts,
+  naming the flags that rebuild the run's reward. Not the warm start's
+  ``warm_start.allow_reward_mismatch``, which compares stage 1's."""
   resume_curriculum: Literal["checkpoint", "config"] = "checkpoint"
   """On ``--agent.resume``: ``"checkpoint"`` continues on the curriculum the
   checkpoint trained with (schedule, freeze, blend, channels, additive weights, env

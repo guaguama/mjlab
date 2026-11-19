@@ -1151,10 +1151,11 @@ def _resume_cfg(**changes: Any) -> dict[str, Any]:
 def test_a_resume_onto_another_reward_is_refused(
   tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-  """A training resume refuses a checkpoint whose run trained another reward,
-  naming the flags that rebuild it, unless allowed; with those flags it passes.
-  Checkpoints record their reward; one from before the record (a round-6 run) is
-  read from its run's params. Play's actor-only load is never checked."""
+  """A resumed run refuses to train on a checkpoint whose run trained another
+  reward, naming the flags that rebuild it, unless allowed; with those flags it
+  passes. Checkpoints record their reward; one from before the record (a round-6
+  run) is read from its run's params. The check runs when training starts: a load
+  alone (an evaluation's, play's actor-only one) is never refused."""
   run = GaitLibraryOnPolicyRunner(
     cast(Any, _reward_env()), _resume_cfg(), str(tmp_path / "new"), "cpu"
   )
@@ -1166,10 +1167,11 @@ def test_a_resume_onto_another_reward_is_refused(
     "config": env_reward_settings(_reward_env().cfg),
     "env_stages": [],
   }
-  # A run of today's reward resumes silently.
+  # A run of today's reward trains on silently.
   same = GaitLibraryOnPolicyRunner(cast(Any, _reward_env()), _resume_cfg(), None, "cpu")
   capsys.readouterr()
   same.load(str(checkpoint))
+  same.learn(1)
   assert "another reward" not in capsys.readouterr().out
 
   # A round-6 run: no record, its reward in its params (and its recipe's stages).
@@ -1184,29 +1186,34 @@ def test_a_resume_onto_another_reward_is_refused(
   default = GaitLibraryOnPolicyRunner(
     cast(Any, _reward_env()), _resume_cfg(), None, "cpu"
   )
+  default.load(old)  # A load alone, as an evaluation's: nothing is checked.
+  updates = default.alg.num_updates_done
   with pytest.raises(ValueError, match="trained on another reward") as refused:
-    default.load(old)
+    default.learn(1)
+  assert default.alg.num_updates_done == updates  # Refused before it trained.
   message = str(refused.value)
   for text in (
-    "its run's params (it predates the record)",
-    "CLF penalty pen_w x pen_scale 0 vs 0.5",
+    "its run's params/ (it predates the record)",
+    "CLF penalty pen_w x pen_scale 0.0 vs 0.5",
     "--env.rewards.mimic.params.clf.decay-form musclemimic",
-    "--env.rewards.mimic.params.clf.pen-w 0 ",
-    "--env.rewards.mimic.params.regularizers.osl-action-rate 0 ",
-    "--env.rewards.mimic.params.regularizers.joint-limits 0 ",
+    "--env.rewards.mimic.params.clf.pen-w 0.0 ",
+    "--env.rewards.mimic.params.regularizers.osl-action-rate 0.0 ",
+    "--env.rewards.mimic.params.regularizers.joint-limits 0.0 ",
     "--agent.env-stages \"((1500, 'terminations.root_deviation.threshold', 1.0), "
     "(3000, 'rewards.twist.weight', 0.06))\"",
     "--agent.allow-reward-mismatch True",
   ):
     assert text in message, text
-  # Play loads the actor alone, unchecked.
+  # Play loads the actor alone: nothing to check when it trains.
   default.load(old, load_cfg={"actor": True})
+  default.check_resume()
   # The override: a warning.
   allowed = GaitLibraryOnPolicyRunner(
     cast(Any, _reward_env()), _resume_cfg(allow_reward_mismatch=True), None, "cpu"
   )
   capsys.readouterr()
   allowed.load(old)
+  allowed.check_resume()
   assert "[WARN]" in capsys.readouterr().out
   # The flags that rebuild the run's reward: silent.
   rebuilt = GaitLibraryOnPolicyRunner(
@@ -1217,8 +1224,9 @@ def test_a_resume_onto_another_reward_is_refused(
   )
   capsys.readouterr()
   rebuilt.load(old)
+  rebuilt.check_resume()
   assert "another reward" not in capsys.readouterr().out
-  # The ramps in force at the update the run resumes at count too.
+  # The ramps in force from the update the run resumes at count too.
   ramped = GaitLibraryOnPolicyRunner(
     cast(Any, _reward_env(old=True)),
     _resume_cfg(env_stages=((5, "rewards.mimic.params.clf.pen_scale", 0.0),)),
@@ -1227,12 +1235,67 @@ def test_a_resume_onto_another_reward_is_refused(
   )
   # pen_w 0 either way: a pen_scale stage changes nothing, so it passes.
   ramped.load(old)
-  # Without its params the run's reward cannot be read: refused.
+  ramped.check_resume()
+  # Without its params the run's reward cannot be read: refused, whatever the flags
+  # (nothing to compare them with), with the ways on.
   bare = tmp_path / "bare"
   bare.mkdir()
   torch.save(saved, bare / "model_0.pt")
-  with pytest.raises(ValueError, match="records no reward settings"):
-    default.load(str(bare / "model_0.pt"))
+  for runner in (default, rebuilt):
+    runner.load(str(bare / "model_0.pt"))
+    with pytest.raises(ValueError, match="cannot be read") as unreadable:
+      runner.check_resume()
+    message = str(unreadable.value)
+    assert f"to {bare / 'params'}" in message and "allow-reward-mismatch" in message
+    assert "another reward" not in message and "Resume with" not in message
+
+
+def test_a_mid_ramp_resume_compares_every_staged_update(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """The resume check compares the rewards both runs' env stages give on every
+  update from the one the run resumes at: a checkpoint in the middle of the CLF
+  ramps (update 700) trains on with its own stages, is refused without them, and a
+  schedule that agrees at 700 and after the ramps but not in between is refused
+  where they part; at the ramps' end (1000) the configs alone count."""
+  run = GaitLibraryOnPolicyRunner(
+    cast(Any, _reward_env()), _resume_cfg(), str(tmp_path / "new"), "cpu"
+  )
+  run.learn(1)
+  saved = torch.load(tmp_path / "new" / "model_0.pt", weights_only=False)
+  saved["infos"]["reward_settings"]["env_stages"] = [list(s) for s in CLF_ENV_STAGES]
+  pen, reg = (
+    "rewards.mimic.params.clf.pen_scale",
+    "rewards.mimic.params.regularizers.scale",
+  )
+  # 0.5 until 800, then the configs' 1.0; the run held 0.5 until 1000.
+  parting = ((800, pen, 0.5), (800, reg, 0.5))
+
+  def resumed(update: int, stages: Any) -> GaitLibraryOnPolicyRunner:
+    saved["muscle_mimic_state"]["num_updates_done"] = update
+    path = tmp_path / f"model_{update}.pt"
+    torch.save(saved, path)
+    runner = GaitLibraryOnPolicyRunner(
+      cast(Any, _reward_env()), _resume_cfg(env_stages=stages), None, "cpu"
+    )
+    runner.load(str(path))
+    return runner
+
+  capsys.readouterr()
+  resumed(700, CLF_ENV_STAGES).check_resume()
+  with pytest.raises(
+    ValueError,
+    match=re.escape(
+      "at update 700, with the env stages: CLF penalty pen_w x pen_scale 0.25 vs 0.5"
+    ),
+  ):
+    resumed(700, ()).check_resume()
+  with pytest.raises(ValueError, match="at update 800, with the env stages") as gap:
+    resumed(700, parting).check_resume()
+  assert "at update 700" not in str(gap.value)
+  for stages in (CLF_ENV_STAGES, ()):
+    resumed(1000, stages).check_resume()
+  assert "another reward" not in capsys.readouterr().out
 
 
 LEGACY_FAKE_OSL = OslObsCfg(**LEGACY_OSL_SENSORS, history_length=2)

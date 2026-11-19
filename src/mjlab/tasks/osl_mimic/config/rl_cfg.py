@@ -181,11 +181,12 @@ class OslMimicRunnerCfg(RslRlOnPolicyRunnerCfg):
   ``--agent.env-stages "((1500,'terminations.root_deviation.threshold',1.0),)"``;
   ``--agent.env-stages "()"`` turns every stage off."""
   allow_reward_mismatch: bool = False
-  """Resume (``--agent.resume``) a checkpoint whose run trained another reward than
-  this config's (another CLF decrease condition or regularizers, or other env
-  stages for them); refused otherwise, naming the flags that rebuild the run's
-  reward. The checkpoint's critic and return statistics then value another
-  reward."""
+  """Train on (``--agent.resume``) from a checkpoint whose run trained another
+  reward than this config's: the CLF or not, another CLF decrease condition or
+  regularizers, or env stages that set them otherwise on any update from the one
+  the run resumes at. Refused otherwise when training starts, naming the flags that
+  rebuild the run's reward (a load to evaluate is not checked). The checkpoint's
+  critic and return statistics then value another reward."""
 
 
 def osl_mimic_runner_cfg(

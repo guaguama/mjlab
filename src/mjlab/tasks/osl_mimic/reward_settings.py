@@ -7,8 +7,9 @@ This module reads those settings from a live env config, from a run's saved
 ``params/env.yaml`` and from a checkpoint (:data:`CHECKPOINT_KEY`), compares them
 (:func:`reward_mismatches`), and turns them back into the command line that rebuilds
 them (:func:`reward_flags`). The stage-2 warm start compares stage 1's with its own;
-both runners refuse a training resume whose reward would differ from its run's
-(:func:`check_resume_reward`).
+both runners refuse to train on from a checkpoint whose run's reward differs
+(:func:`check_resume_reward`), and an evaluation scores a checkpoint under its run's
+reward (:func:`checkpoint_reward_record`, :func:`apply_reward_settings`).
 
 A run that records none of them (every run before 2026-11-18) trained with
 musclemimic's decrease condition (:data:`LEGACY_DECAY_FORM`), ``pen_scale`` 1 and no
@@ -19,12 +20,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
 import yaml
 
 from .mdp.rewards import REGULARIZERS
+from .touch_sites import load_checkpoint
 
 CHECKPOINT_KEY = "reward_settings"
 """Every checkpoint's ``infos`` entry: ``{"config": <the env config's settings>,
@@ -159,16 +162,22 @@ def _with_legacy(settings: Mapping[str, Any]) -> dict[str, Any]:
   return out
 
 
-def reward_mismatches(a: Mapping[str, Any], b: Mapping[str, Any]) -> list[str]:
+def reward_mismatches(
+  a: Mapping[str, Any], b: Mapping[str, Any], clf_presence: bool = True
+) -> list[str]:
   """How two reward settings (:func:`reward_settings`, or a lineage's
   ``stage1_env``) differ, one ``"<setting> <a> vs <b>"`` per difference, on what
-  the reward computes: the CLF penalty ``pen_w x pen_scale`` (when both use the CLF),
-  the decrease condition's form (and the paper form's rates) where both penalize
-  it, each regularizer times ``scale``, and the joints where both penalize joint
-  limits. A record without these settings (from before 2026-11-18) counts as what
-  it trained with."""
+  the reward computes: whether each uses the CLF at all (unless ``clf_presence`` is
+  False: the warm start's reward switch handles that), the CLF penalty ``pen_w x
+  pen_scale`` (when both use the CLF), the decrease condition's form (and the paper
+  form's rates) where both penalize it, each regularizer times ``scale``, and the
+  joints where both penalize joint limits. A record without these settings (from
+  before 2026-11-18) counts as what it trained with. Numbers print exactly, as
+  :func:`reward_flags` writes them."""
   a, b = _with_legacy(a), _with_legacy(b)
   lines: list[str] = []
+  if clf_presence and (a["clf_pen_w"] is None) != (b["clf_pen_w"] is None):
+    lines.append(f"reward {_reward_kind(a)} vs {_reward_kind(b)}")
 
   def differs(x: Any, y: Any) -> bool:
     if isinstance(x, (int, float)) and isinstance(y, (int, float)):
@@ -181,7 +190,9 @@ def reward_mismatches(a: Mapping[str, Any], b: Mapping[str, Any]) -> list[str]:
   if a["clf_pen_w"] is not None and b["clf_pen_w"] is not None:
     pen = [s["clf_pen_w"] * scale(s["clf_pen_scale"]) for s in (a, b)]
     if differs(*pen):
-      lines.append(f"CLF penalty pen_w x pen_scale {pen[0]:g} vs {pen[1]:g}")
+      lines.append(
+        f"CLF penalty pen_w x pen_scale {_exact(pen[0])} vs {_exact(pen[1])}"
+      )
     if pen[0] > 0.0 and pen[1] > 0.0:
       forms = (a["clf_decay_form"], b["clf_decay_form"])
       if forms[0] != forms[1]:
@@ -190,13 +201,15 @@ def reward_mismatches(a: Mapping[str, Any], b: Mapping[str, Any]) -> list[str]:
         for name in ("decay_rate", "decay_norm_rate", "vdot_window"):
           x, y = a[f"clf_{name}"], b[f"clf_{name}"]
           if differs(x, y):
-            lines.append(f"CLF {name} {x} vs {y}")
+            lines.append(f"CLF {name} {_exact(x, name)} vs {_exact(y, name)}")
   effective = {}
   for name in REGULARIZERS:
     pair = [(s[f"reg_{name}"] or 0.0) * scale(s["reg_scale"]) for s in (a, b)]
     effective[name] = pair
     if differs(*pair):
-      lines.append(f"regularizer {name} (x scale) {pair[0]:g} vs {pair[1]:g}")
+      lines.append(
+        f"regularizer {name} (x scale) {_exact(pair[0])} vs {_exact(pair[1])}"
+      )
   if min(effective["joint_limits"]) > 0.0:
     joints = [sorted(s["reg_joint_limit_joints"] or ()) for s in (a, b)]
     if joints[0] != joints[1]:
@@ -234,22 +247,26 @@ def reward_flags(
   settings: Mapping[str, Any], env_stages: Sequence[Sequence[Any]] | None = None
 ) -> list[str]:
   """The command line that gives a run these reward settings (and, given, these env
-  stages): every setting, so a resume rebuilds exactly the run's reward."""
+  stages): every setting, so a resume rebuilds exactly the run's reward. Numbers
+  are written exactly (``repr``), so they parse back to the recorded values. A
+  setting with no CLF (MimicReward) writes no CLF flag: the task decides that."""
   s = _with_legacy(settings)
   flags: list[str] = []
   if s["clf_pen_w"] is not None:
     flags += [
       f"{_PARAMS}.clf.decay-form {s['clf_decay_form']}",
-      f"{_PARAMS}.clf.pen-w {s['clf_pen_w']:g}",
-      f"{_PARAMS}.clf.pen-scale {_shown_g(s['clf_pen_scale'], 1.0)}",
+      f"{_PARAMS}.clf.pen-w {_exact(s['clf_pen_w'])}",
+      f"{_PARAMS}.clf.pen-scale {_exact(_or(s['clf_pen_scale'], 1.0))}",
     ]
     if s["clf_decay_form"] == "paper":
       for name in ("decay_rate", "decay_norm_rate", "vdot_window"):
         if s[f"clf_{name}"] is not None:
-          flags.append(f"{_PARAMS}.clf.{_flag(name)} {s[f'clf_{name}']:g}")
-  flags.append(f"{_PARAMS}.regularizers.scale {_shown_g(s['reg_scale'], 1.0)}")
+          value = _exact(s[f"clf_{name}"], name)
+          flags.append(f"{_PARAMS}.clf.{_flag(name)} {value}")
+  flags.append(f"{_PARAMS}.regularizers.scale {_exact(_or(s['reg_scale'], 1.0))}")
   for name in REGULARIZERS:
-    flags.append(f"{_PARAMS}.regularizers.{_flag(name)} {s[f'reg_{name}'] or 0.0:g}")
+    value = _exact(s[f"reg_{name}"] or 0.0)
+    flags.append(f"{_PARAMS}.regularizers.{_flag(name)} {value}")
   joints = s["reg_joint_limit_joints"]
   if s["reg_joint_limits"] and joints:
     flags.append(f'{_PARAMS}.regularizers.joint-limit-joints "{tuple(joints)!r}"')
@@ -283,6 +300,71 @@ def run_reward_record(checkpoint: str | Path) -> dict | None:
   return {"config": config, "env_stages": [list(s) for s in stages or ()]}
 
 
+def checkpoint_reward_record(
+  checkpoint: str | Path, infos: Mapping[str, Any] | None = None
+) -> tuple[dict | None, str]:
+  """A checkpoint's reward record (:func:`reward_record`) and where it comes from:
+  its own (``infos[CHECKPOINT_KEY]``; ``infos`` is read from the checkpoint when
+  not given), else its run's ``params/`` (:func:`run_reward_record`) for one written
+  before 2026-11-18; ``(None, "")`` when neither is there."""
+  if infos is None:
+    infos = load_checkpoint(checkpoint).get("infos")
+  record = (infos or {}).get(CHECKPOINT_KEY)
+  if record is not None:
+    return dict(record), "its record"
+  record = run_reward_record(checkpoint)
+  if record is not None:
+    return record, "its run's params/ (it predates the record)"
+  return None, ""
+
+
+def apply_reward_settings(cfg: Any, settings: Mapping[str, Any]) -> None:
+  """Give a live env config's ``mimic`` term these reward settings (a record's
+  ``config``), the inverse of :func:`env_reward_settings` on what the reward
+  computes; one a record lacks counts as what that run trained with (before
+  2026-11-18: musclemimic's decrease condition, no regularizers). The term gets new
+  config objects, never edited shared ones; ``log_servo_terms``, a diagnostic, stays
+  the config's.
+
+  Raises:
+    ValueError: For a config without a ``mimic`` term, or when one of the two uses
+      the CLF and the other not.
+  """
+  s = _with_legacy(settings)
+  rewards = getattr(cfg, "rewards", None)
+  if not isinstance(rewards, Mapping) or rewards.get("mimic") is None:
+    raise ValueError("The env config has no 'mimic' reward term.")
+  mimic = rewards["mimic"]
+  params = dict(mimic.params)
+  clf = params.get("clf")
+  if (clf is None) != (s["clf_pen_w"] is None):
+    raise ValueError(
+      f"Cannot give a {'MimicReward' if clf is None else 'CLF'} task the reward "
+      f"settings of a {_reward_kind(s)} run."
+    )
+  if clf is not None:
+    changes: dict[str, Any] = {
+      "pen_w": float(s["clf_pen_w"]),
+      "pen_scale": _or(s["clf_pen_scale"], 1.0),
+      "decay_form": str(s["clf_decay_form"]),
+      "vdot_window": int(s["clf_vdot_window"] or 1),
+    }
+    for name in ("decay_rate", "decay_norm_rate"):
+      if s[f"clf_{name}"] is not None:
+        changes[name] = float(s[f"clf_{name}"])
+    params["clf"] = replace(clf, **changes)
+  regs = params.get("regularizers")
+  if regs is not None:
+    changes = {name: float(s[f"reg_{name}"] or 0.0) for name in REGULARIZERS}
+    changes["scale"] = _or(s["reg_scale"], 1.0)
+    if s["reg_joint_limit_joints"]:
+      changes["joint_limit_joints"] = tuple(s["reg_joint_limit_joints"])
+    params["regularizers"] = replace(regs, **changes)
+  elif any(s[f"reg_{name}"] for name in REGULARIZERS):
+    raise ValueError("The env config's 'mimic' term has no regularizers to set.")
+  cfg.rewards = {**rewards, "mimic": replace(mimic, params=params)}
+
+
 def resume_reward_mismatches(
   saved: Mapping[str, Any],
   live: Mapping[str, Any],
@@ -291,19 +373,33 @@ def resume_reward_mismatches(
   what: str = "update",
 ) -> list[str]:
   """How a resumed run's reward would differ from its run's (a
-  :func:`reward_record`): once every env stage has ended (the env configs), and at
-  the ``update`` the resumed run trains first, where both runs' env stages in force
-  there apply (stage 1 counts PPO updates, stage 2 its stage-local iteration)."""
+  :func:`reward_record`): once every env stage has ended (the env configs), and on
+  every update the resumed run trains from ``update`` on, where both runs' env
+  stages apply (stage 1 counts PPO updates, stage 2 its stage-local iteration).
+  Staged values hold from one stage end to the next, so they are compared at
+  ``update`` and at every later end of either run's reward stages. Each difference
+  is reported once, where it first shows."""
   saved_config = saved["config"]
   saved_stages = list(saved.get("env_stages") or ())
   live_stages = list(live_stages)
   lines = reward_mismatches(saved_config, live)
-  now = reward_mismatches(
-    staged_reward_settings(saved_config, saved_stages, update),
-    staged_reward_settings(live, live_stages, update),
-  )
-  lines += [f"at {what} {update}, with the env stages: {line}" for line in now]
-  return list(dict.fromkeys(lines))
+  shown = set(lines)
+  ends = {
+    int(u)
+    for u, path, _ in (*saved_stages, *live_stages)
+    if int(u) > update and reward_stage_setting(str(path)) is not None
+  }
+  for point in sorted({int(update)} | ends):
+    now = reward_mismatches(
+      staged_reward_settings(saved_config, saved_stages, point),
+      staged_reward_settings(live, live_stages, point),
+      clf_presence=False,
+    )
+    for line in now:
+      if line not in shown:
+        shown.add(line)
+        lines.append(f"at {what} {point}, with the env stages: {line}")
+  return lines
 
 
 def check_resume_reward(
@@ -315,39 +411,32 @@ def check_resume_reward(
   allowed: bool,
   what: str = "update",
 ) -> None:
-  """Refuse a training resume of checkpoint ``path`` that would train another reward
-  than its run did, unless ``allowed`` (:data:`RESUME_FLAG`), which only warns.
+  """Refuse to train on from checkpoint ``path`` with another reward than its run
+  trained, unless ``allowed`` (:data:`RESUME_FLAG`), which only warns. The runners
+  call it when a resumed run starts to train, never on a load alone (evaluations
+  load whole checkpoints too).
 
-  The run's reward is the checkpoint's :data:`CHECKPOINT_KEY` record, else its run's
-  ``params`` (:func:`run_reward_record`); the resumed run's is ``cfg``'s with its
-  ``env_stages``, from ``update`` on. An env without a ``mimic`` term is not checked.
+  The run's reward is :func:`checkpoint_reward_record`'s; the resumed run's is
+  ``cfg``'s with its ``env_stages``, from ``update`` on
+  (:func:`resume_reward_mismatches`). An env without a ``mimic`` term is not
+  checked. A checkpoint from before the record whose run's ``params/`` is not
+  beside it (a W&B download, say) gives nothing to compare: it is refused unless
+  allowed, since its reward cannot be read.
 
   Raises:
-    ValueError: On a difference, or when the run's reward cannot be read, naming
-      the flags that rebuild the run's reward and :data:`RESUME_FLAG`.
+    ValueError: On a difference, naming the flags that rebuild the run's reward (and
+      the task to resume it under, when only one side uses the CLF) and
+      :data:`RESUME_FLAG`; or when the run's reward cannot be read, naming the ways
+      on.
   """
   live = env_reward_settings(cfg)
   if live is None:
     return
-  record = (infos or {}).get(CHECKPOINT_KEY)
-  source = "its record"
+  record, source = checkpoint_reward_record(path, infos or {})
   if record is None:
-    record = run_reward_record(path)
-    source = "its run's params (it predates the record)"
-  if record is None:
-    lines = [
-      "the checkpoint records no reward settings and its run's params/env.yaml is "
-      "not beside it"
-    ]
-    rebuild = (
-      "Resume with the run's own reward flags (before 2026-11-18: "
-      f"{_PARAMS}.clf.decay-form musclemimic, the run's pen-w, every regularizer 0 "
-      "and its env stages)"
-    )
-  else:
-    lines = resume_reward_mismatches(record, live, env_stages, update, what)
-    flags = reward_flags(record["config"], record.get("env_stages") or ())
-    rebuild = "Resume with the run's reward: " + " ".join(flags)
+    _refuse_unreadable_reward(path, allowed)
+    return
+  lines = resume_reward_mismatches(record, live, env_stages, update, what)
   if not lines:
     return
   text = (
@@ -356,13 +445,55 @@ def check_resume_reward(
   )
   if not allowed:
     raise ValueError(
-      f"{text} A resume would train on another reward. {rebuild}; or pass "
-      f"{RESUME_FLAG} True to train on with this config's reward, which the "
+      f"{text} A resume would train on another reward. {_rebuild(record, live)}; "
+      f"or pass {RESUME_FLAG} True to train on with this config's reward, which the "
       "checkpoint's critic and return statistics do not value."
     )
   print(
-    f"[WARN] {text} Allowed ({RESUME_FLAG}): trained on, the checkpoint's critic "
-    "and return statistics value another reward.",
+    f"[WARN] {text} Allowed ({RESUME_FLAG}): training on with this config's reward, "
+    "which the checkpoint's critic and return statistics do not value.",
+    flush=True,
+  )
+
+
+def _rebuild(record: Mapping[str, Any], live: Mapping[str, Any]) -> str:
+  """How to resume a run on its own reward: the flags, and the task when only one
+  of the run and this config uses the CLF (a MimicReward run under a -CLF task, or
+  the reverse), which no flag switches."""
+  config = _with_legacy(record["config"])
+  flags = " ".join(reward_flags(config, record.get("env_stages") or ()))
+  run_clf = config["clf_pen_w"] is not None
+  if run_clf == (live["clf_pen_w"] is not None):
+    return f"Resume with the run's reward: {flags}"
+  if run_clf:
+    return (
+      "The run trained with the CLF: resume it under its CLF task (the -CLF variant "
+      f"of this task), with: {flags}"
+    )
+  return (
+    "The run trained MimicReward (no CLF): resume it under its MimicReward task "
+    f"(this task without -CLF), with: {flags}"
+  )
+
+
+def _refuse_unreadable_reward(path: str | Path, allowed: bool) -> None:
+  params = Path(path).parent / "params"
+  text = (
+    f"{path} records no reward settings (it predates them) and its run's params/ "
+    f"is not beside it ({params}), so the reward its run trained cannot be read."
+  )
+  if not allowed:
+    raise ValueError(
+      f"{text} Copy the run's params/ folder (env.yaml and agent.yaml) to "
+      f"{params}, or pass {RESUME_FLAG} True to train on regardless, adding the "
+      "run's old-reward flags to keep its reward (before 2026-11-18 a CLF run "
+      f"trained {_PARAMS}.clf.decay-form musclemimic at its own pen-w, and no run "
+      f"had regularizers: {_PARAMS}.regularizers.<name> 0 each; with the run's "
+      "--agent.env-stages)."
+    )
+  print(
+    f"[WARN] {text} Allowed ({RESUME_FLAG}): training on with this config's reward, "
+    "unchecked.",
     flush=True,
   )
 
@@ -407,8 +538,24 @@ def _shown(value: Any) -> str:
   return "not recorded" if value is None else f"{value:.3g}"
 
 
-def _shown_g(value: Any, default: float) -> str:
-  return f"{default if value is None else value:g}"
+def _or(value: Any, default: float) -> float:
+  return default if value is None else float(value)
+
+
+def _exact(value: Any, name: str = "") -> str:
+  """A setting as the command line takes it back unchanged: an int for
+  ``vdot_window``, ``repr`` of the float otherwise (``:g`` keeps 6 digits)."""
+  if value is None:
+    return "not recorded"
+  if name == "vdot_window":
+    return str(int(value))
+  return repr(float(value))
+
+
+def _reward_kind(settings: Mapping[str, Any]) -> str:
+  if settings["clf_pen_w"] is None:
+    return "MimicReward (no CLF)"
+  return f"CLF ({settings['clf_decay_form']} decrease condition)"
 
 
 def _flag(name: str) -> str:

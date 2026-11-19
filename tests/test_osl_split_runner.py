@@ -2080,10 +2080,12 @@ def _rewarded_env(seed: int = 0, old: bool = False) -> _FakeEnv:
 def test_a_resume_onto_another_reward_is_refused(
   tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-  """A stage-2 resume refuses a checkpoint whose run trained another reward,
-  naming the flags that rebuild it, unless ``--agent.allow-reward-mismatch``; with
-  those flags it passes. Checkpoints record their reward; one from before the
-  record is read from its run's params. Play's actor-only load is never checked."""
+  """A resumed stage-2 run refuses to train on a checkpoint whose run trained
+  another reward, naming the flags that rebuild it, unless
+  ``--agent.allow-reward-mismatch``; with those flags it passes. Checkpoints record
+  their reward; one from before the record is read from its run's params. The check
+  runs when training starts: a load alone (an evaluation's, play's actor-only one)
+  is never refused."""
   ws_path = tmp_path / "ws.pt"
   _write_warm_start(ws_path)
   runner = _Runner(
@@ -2098,6 +2100,7 @@ def test_a_resume_onto_another_reward_is_refused(
   same = _Runner(cast(Any, _rewarded_env(seed=1)), _quick_cfg(None), None, "cpu")
   capsys.readouterr()
   same.load(str(checkpoint))
+  same.check_resume()
   assert "another reward" not in capsys.readouterr().out
 
   # A run from before the record (and before stage-2 env stages), at pen_w 0.
@@ -2112,23 +2115,28 @@ def test_a_resume_onto_another_reward_is_refused(
   )
   old = str(old_dir / "model.pt")
   default = _Runner(cast(Any, _rewarded_env(seed=2)), _quick_cfg(None), None, "cpu")
+  default.load(old)  # A load alone: nothing is checked.
+  iteration = default.current_learning_iteration
   with pytest.raises(ValueError, match="trained on another reward") as refused:
-    default.load(old)
+    default.learn(1)
+  assert default.current_learning_iteration == iteration  # Refused before training.
   message = str(refused.value)
   for text in (
-    "regularizer osl_action_rate (x scale) 0 vs 1",
+    "regularizer osl_action_rate (x scale) 0.0 vs 1.0",
     "--env.rewards.mimic.params.clf.decay-form musclemimic",
-    "--env.rewards.mimic.params.clf.pen-w 0 ",
+    "--env.rewards.mimic.params.clf.pen-w 0.0 ",
     '--agent.env-stages "()"',
     "--agent.allow-reward-mismatch True",
   ):
     assert text in message, text
-  default.load(old, load_cfg={"actor": True})  # Play: unchecked.
+  default.load(old, load_cfg={"actor": True})  # Play: nothing to check.
+  default.check_resume()
   allowed_cfg = _quick_cfg(None)
   allowed_cfg["allow_reward_mismatch"] = True
   allowed = _Runner(cast(Any, _rewarded_env(seed=3)), allowed_cfg, None, "cpu")
   capsys.readouterr()
   allowed.load(old)
+  allowed.check_resume()
   assert "[WARN]" in capsys.readouterr().out and allowed._ready
   # The old reward's flags: silent (the checkpoint's curriculum has no stages).
   rebuilt = _Runner(
@@ -2136,7 +2144,62 @@ def test_a_resume_onto_another_reward_is_refused(
   )
   capsys.readouterr()
   rebuilt.load(old)
+  rebuilt.check_resume()
   assert rebuilt.env_stages == () and "another reward" not in capsys.readouterr().out
+
+
+def test_a_mid_ramp_resume_compares_the_restored_stages(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """A stage-2 resume compares the rewards from the stage-local iteration it
+  resumes at (k = 120 here, with stage 1's ~6000 iterations before it), under the
+  env stages its curriculum restored: the checkpoint's own whatever the config's,
+  and the config's under ``resume_curriculum="config"``, refused without the
+  stages. A MimicReward config refuses a CLF run, naming the task to resume it
+  under."""
+  ws_path = tmp_path / "ws.pt"
+  _write_warm_start(ws_path)
+  runner = _Runner(
+    cast(Any, _rewarded_env()), _quick_cfg(ws_path), str(tmp_path / "run"), "cpu"
+  )
+  runner.learn(ITERATIONS)
+  checkpoint = tmp_path / "run" / f"model_{STAGE_START + ITERATIONS - 1}.pt"
+  saved = torch.load(checkpoint, weights_only=False)
+  assert saved["infos"]["reward_settings"]["env_stages"] == [
+    list(s) for s in SPLIT_CLF_ENV_STAGES
+  ]
+  saved["infos"]["split"]["stage_start"] = 6000
+  saved["iter"] = 6119  # The resume trains k = 120 first.
+  path = tmp_path / "mid.pt"
+  torch.save(saved, path)
+  # The checkpoint's curriculum, whatever the config's stages: the run's own.
+  for stages in (SPLIT_CLF_ENV_STAGES, ()):
+    cfg = _quick_cfg(None)
+    cfg["env_stages"] = stages
+    kept = _Runner(cast(Any, _rewarded_env(seed=1)), cfg, None, "cpu")
+    capsys.readouterr()
+    kept.load(str(path))
+    kept.check_resume()
+    assert kept.env_stages == SPLIT_CLF_ENV_STAGES
+    assert "another reward" not in capsys.readouterr().out
+  # The config's curriculum without the stages: pen_scale 0 vs 1 at k = 120.
+  cfg = _quick_cfg(None)
+  cfg["resume_curriculum"] = "config"
+  cfg["env_stages"] = ()
+  taken = _Runner(cast(Any, _rewarded_env(seed=2)), cfg, None, "cpu")
+  taken.load(str(path))
+  with pytest.raises(ValueError, match="at stage-local iteration 120, with the env"):
+    taken.check_resume()
+  # A MimicReward config: the CLF run is resumed under its CLF task.
+  mimic_env = _rewarded_env(seed=3)
+  mimic_env.cfg.rewards = osl_split_env_cfg(
+    "msk", "compliant", "mimic", "train"
+  ).rewards
+  mimic = _Runner(cast(Any, mimic_env), _quick_cfg(None), None, "cpu")
+  mimic.load(str(path))
+  with pytest.raises(ValueError, match="resume it under its CLF task") as switched:
+    mimic.check_resume()
+  assert "reward CLF (paper decrease condition) vs MimicReward" in str(switched.value)
 
 
 def _provenance_lineage(**changes: Any) -> dict[str, Any]:

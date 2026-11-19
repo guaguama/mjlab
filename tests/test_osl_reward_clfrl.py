@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import copy
 import math
+import re
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -30,8 +32,10 @@ import mujoco
 import numpy as np
 import pytest
 import torch
+import tyro
 from osl_reward_head import HeadMimicReward, HeadSplitMimicReward
 
+import mjlab
 from mjlab.actuator.xml_actuator import XmlActuator
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   OSL_TORQUE_JOINTS,
@@ -40,6 +44,8 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   get_spec,
 )
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.scripts.train import TrainConfig
+from mjlab.tasks.osl_gait_library.evaluate import apply_run_reward
 from mjlab.tasks.osl_mimic.config.env_cfgs import (
   CLF_WEIGHTS,
   MIMIC_WEIGHTS,
@@ -58,12 +64,24 @@ from mjlab.tasks.osl_mimic.mdp.reference import MimicReference
 from mjlab.tasks.osl_mimic.mdp.rewards import (
   LIMIT_JOINTS,
   REGULARIZER_DIAGNOSTICS,
+  REGULARIZERS,
   SERVO_LOG_DIAGNOSTICS,
   ClfCfg,
   RegularizerCfg,
   clf_cfg,
   clf_regularizers,
   mimic_reward,
+)
+from mjlab.tasks.osl_mimic.reward_settings import CHECKPOINT_KEY as REWARD_KEY
+from mjlab.tasks.osl_mimic.reward_settings import (
+  apply_reward_settings,
+  check_resume_reward,
+  env_reward_settings,
+  resume_reward_mismatches,
+  reward_flags,
+  reward_mismatches,
+  reward_record,
+  reward_settings,
 )
 from mjlab.tasks.osl_mimic.rl.runner import OslMimicOnPolicyRunner, stage_accessors
 from mjlab.tasks.osl_split.mdp.rewards import (
@@ -76,6 +94,7 @@ from mjlab.tasks.osl_split.mdp.rewards import (
 )
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import matrix_from_quat
+from mjlab.utils.os import dump_yaml
 
 NUM_ENVS = 6
 DT = 0.01
@@ -1371,3 +1390,164 @@ def test_relative_site_rvel_is_bit_identical() -> None:
   pos, mat, ang, lin = cmd.site_state()
   *_, rvel = relative_site_quantities(pos, mat, ang, lin)
   _assert_identical(relative_site_rvel(mat, ang, lin), rvel)
+
+
+##
+# Across launches: the servo-cost metrics, the resume check, an evaluation's reward.
+##
+
+SERVO_LOG_FLAG = "--env.rewards.mimic.params.regularizers.log-servo-terms"
+MSK_UNICYCLE = "Mjlab-Gait-Library-Unicycle-OSL-Fullbody-MSK-Compliant"
+
+
+def _train_cfg(task: str, *argv: str) -> TrainConfig:
+  """The config ``train.py`` builds: the task's, with ``argv`` applied by tyro."""
+  return tyro.cli(
+    TrainConfig,
+    args=list(argv),
+    default=TrainConfig.from_task(task),
+    config=mjlab.TYRO_FLAGS,
+  )
+
+
+@pytest.mark.parametrize(
+  ("task", "value", "logged"),
+  [
+    ("Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT-CLF", None, True),
+    ("Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT-CLF", "False", False),
+    ("Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT", None, False),
+    ("Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT", "True", True),
+    ("Mjlab-FSM-Unicycle-OSL-Fullbody-ROBOT", "True", True),
+    ("Mjlab-Split-Unicycle-OSL-Fullbody-MSK-CLF-Compliant", "True", False),
+  ],
+)
+def test_servo_cost_metrics_follow_the_final_config(
+  task: str, value: str | None, logged: bool
+) -> None:
+  """The servo-cost metrics are registered from the config ``train.py`` ends with:
+  with ``log_servo_terms`` on a robot (the CLF tasks' default, or the flag on a
+  MimicReward task), not with it off, and never on the musculoskeletal model, which
+  has no servos to log."""
+  cfg = _train_cfg(task, *(() if value is None else (SERVO_LOG_FLAG, value))).env
+  if value is not None:
+    log = cfg.rewards["mimic"].params["regularizers"].log_servo_terms
+    assert log == (value == "True")
+  registered = {name for name in SERVO_LOG_DIAGNOSTICS if name in cfg.metrics}
+  assert registered == (set(SERVO_LOG_DIAGNOSTICS) if logged else set())
+
+
+def test_rebuild_flags_parse_back_exactly() -> None:
+  """``reward_flags`` writes numbers exactly: settings with more than 6 significant
+  digits parse back to themselves through the command line, so the resume check
+  accepts the flags it suggests."""
+  task = "Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT-CLF-Compliant"
+  base = env_reward_settings(TrainConfig.from_task(task).env)
+  assert base is not None
+  fine = dict(
+    base,
+    clf_pen_w=0.1234567,
+    clf_decay_rate=1.0 / 3.0,
+    reg_osl_action_rate=1.0 / 3.0,
+    reg_scale=0.7654321,
+  )
+  stages = [[123, "rewards.mimic.params.clf.pen_scale", 1.0 / 7.0]]
+  flags = reward_flags(fine, stages)
+  parsed = _train_cfg(task, *shlex.split(" ".join(flags)))
+  live = env_reward_settings(parsed.env)
+  assert live is not None
+  assert (live["clf_pen_w"], live["reg_osl_action_rate"]) == (0.1234567, 1.0 / 3.0)
+  assert live["clf_vdot_window"] == base["clf_vdot_window"] == 10
+  record = {"config": fine, "env_stages": stages}
+  resumed_stages = cast(Any, parsed.agent).env_stages
+  assert resume_reward_mismatches(record, live, resumed_stages, 0) == []
+
+
+def test_the_resume_check_compares_clf_presence() -> None:
+  """A MimicReward run under a CLF task (or the reverse) differs whatever the
+  regularizers: the check says so and names the task to resume it under, which no
+  flag switches. The warm start, whose reward switch handles that case, leaves the
+  line out."""
+  mimic = load_env_cfg(MSK_UNICYCLE)
+  clf = load_env_cfg(MSK_UNICYCLE.replace("-MSK-", "-MSK-CLF-"))
+  mimic_record, clf_record = reward_record(mimic, ()), reward_record(clf, ())
+  assert mimic_record is not None and clf_record is not None
+  clf_live = env_reward_settings(clf)
+  assert clf_live is not None
+  presence = "reward MimicReward (no CLF) vs CLF (paper decrease condition)"
+  assert resume_reward_mismatches(mimic_record, clf_live, (), 0)[0] == presence
+  with pytest.raises(ValueError, match=re.escape(presence)) as refused:
+    check_resume_reward("run/model_9.pt", {REWARD_KEY: mimic_record}, clf, (), 0, False)
+  assert "under its MimicReward task (this task without -CLF)" in str(refused.value)
+  with pytest.raises(ValueError, match="resume it under its CLF task"):
+    check_resume_reward("run/model_9.pt", {REWARD_KEY: clf_record}, mimic, (), 0, False)
+  # Equal regularizers: only the CLF differs, and only the resume check says so.
+  mimic_settings = dict(mimic_record["config"])
+  same_regs = {**clf_live, **{k: v for k, v in mimic_settings.items() if "reg_" in k}}
+  assert reward_mismatches(mimic_settings, same_regs) == [presence]
+  assert reward_mismatches(mimic_settings, same_regs, clf_presence=False) == []
+
+
+def test_an_unreadable_run_reward_is_said_so(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """A checkpoint from before the record whose run's params/ is not beside it (a
+  W&B download): the check says its run's reward cannot be read, not that it
+  differs, and how to go on; allowed, it trains on with a warning."""
+  cfg = load_env_cfg(MSK_UNICYCLE.replace("-MSK-", "-MSK-CLF-"))
+  path = tmp_path / "wandb_checkpoints" / "abc123" / "model_5998.pt"
+  with pytest.raises(ValueError, match="cannot be read") as refused:
+    check_resume_reward(path, {}, cfg, (), 5999, False)
+  message = str(refused.value)
+  params = path.parent / "params"
+  assert f"Copy the run's params/ folder (env.yaml and agent.yaml) to {params}" in (
+    message
+  )
+  assert "--agent.allow-reward-mismatch True" in message
+  assert "another reward" not in message and "its run's params (" not in message
+  check_resume_reward(path, {}, cfg, (), 5999, True)
+  out = capsys.readouterr().out
+  assert "[WARN]" in out and "cannot be read" in out and "unchecked" in out
+
+
+def test_an_evaluation_scores_under_the_runs_reward(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """``evaluate.py`` gives the task's config its run's reward: a checkpoint's own
+  record, else (a run from before 2026-11-18) its params', which then rebuild that
+  run's reward as the old flags do, in new config objects."""
+  task = MSK_UNICYCLE.replace("-MSK-", "-MSK-CLF-")
+  run = tmp_path / "r6"
+  clf = {"pen_w": 0.0, "tau": 0.1}
+  dump_yaml(
+    run / "params" / "env.yaml", {"rewards": {"mimic": {"params": {"clf": clf}}}}
+  )
+  torch.save({"infos": {}}, run / "model_5998.pt")
+  cfg = load_env_cfg(task)
+  before = cfg.rewards["mimic"].params["clf"]
+  apply_run_reward(cfg, run / "model_5998.pt")
+  params = cfg.rewards["mimic"].params
+  assert params["clf"] is not before and before.decay_form == "paper"
+  scored = params["clf"]
+  assert (scored.decay_form, scored.pen_w, scored.pen_scale, scored.vdot_window) == (
+    "musclemimic",
+    0.0,
+    1.0,
+    1,
+  )
+  assert all(getattr(params["regularizers"], name) == 0.0 for name in REGULARIZERS)
+  assert "(from its run's params/ (it predates the record))" in capsys.readouterr().out
+  # A checkpoint's record wins; log_servo_terms, a diagnostic, stays the config's.
+  robot = "Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT-CLF"
+  recorded = load_env_cfg(robot)
+  recorded.rewards["mimic"].params["clf"].pen_w = 0.3
+  recorded.rewards["mimic"].params["regularizers"].joint_limits = 2.0
+  record = reward_record(recorded, CLF_ENV_STAGES)
+  torch.save({"infos": {REWARD_KEY: record}}, run / "model_6000.pt")
+  cfg = load_env_cfg(robot)
+  apply_run_reward(cfg, run / "model_6000.pt")
+  assert record is not None and env_reward_settings(cfg) == record["config"]
+  assert cfg.rewards["mimic"].params["regularizers"].log_servo_terms
+  assert "(from its record)" in capsys.readouterr().out
+  # A MimicReward run's settings do not fit a CLF task.
+  with pytest.raises(ValueError, match="MimicReward"):
+    apply_reward_settings(load_env_cfg(task), reward_settings(None, RegularizerCfg()))

@@ -114,7 +114,7 @@ from mjlab.tasks.osl_gait_library.config.dr import nominal_plant
 from mjlab.tasks.osl_gait_library.mdp import TIGHT_ARC_WZ, GaitLibraryCommandCfg
 from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
 from mjlab.tasks.osl_mimic.reward_settings import CHECKPOINT_KEY as REWARD_KEY
-from mjlab.tasks.osl_mimic.reward_settings import check_resume_reward, reward_record
+from mjlab.tasks.osl_mimic.reward_settings import reward_record
 from mjlab.tasks.osl_mimic.rl.expected import auto_inference
 from mjlab.tasks.osl_mimic.rl.runner import (
   EvalPurpose,
@@ -506,7 +506,8 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     if not stage1:
       return
     stage2 = env_cfg_settings(getattr(self.env.unwrapped, "cfg", None))
-    mismatches = reward_mismatches(stage1, stage2)
+    # A reward switch is the warm start's own case (fresh critics), not a mismatch.
+    mismatches = reward_mismatches(stage1, stage2, clf_presence=not reward_switch)
     if not mismatches:
       return
     text = (
@@ -768,6 +769,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     del init_at_random_ep_len  # musclemimic never randomizes episode lengths.
     if not self._ready:
       raise RuntimeError(f"Nothing to train from. {WARM_START_HINT}")
+    self.check_resume()
     obs = self.env.get_observations().to(self.device)
     self.alg.train_mode()
     self.logger.init_logging_writer()
@@ -1465,11 +1467,10 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     ``load_cfg=None`` (``--agent.resume``) restores everything a resumed run trains
     on: every network, optimizer and statistic, the reward switch and the whole
     curriculum (:meth:`_restore_curriculum`). Training resumes at the iteration
-    after the checkpoint's. Such a resume is refused when it would train another
-    reward than the checkpoint's run did, from the stage-local iteration it resumes
-    at under the restored env stages
-    (:func:`~mjlab.tasks.osl_mimic.reward_settings.check_resume_reward`), unless
-    ``allow_reward_mismatch``.
+    after the checkpoint's. :meth:`learn` then refuses to train on another reward
+    than the checkpoint's run did, from the stage-local iteration it resumes at
+    under the restored env stages (:meth:`check_resume`), unless
+    ``allow_reward_mismatch``; a load alone (an evaluation) is not checked.
 
     A ``load_cfg`` that asks for neither ``critic`` nor ``optimizer`` (``play.py``'s
     ``{"actor": True}``) loads the two actors and the teacher head only, all
@@ -1487,9 +1488,8 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
       ValueError: For a stage-1 checkpoint, a warm-start file or anything else
         that is not a stage-2 checkpoint, one trained with other OSL touch sites
         than the env simulates (one that records none trained with ``original``),
-        one trained on another OSL input layout (the message names the flags
-        that build it), or a resume onto another reward (naming the flags that
-        rebuild the run's and ``--agent.allow-reward-mismatch``).
+        or one trained on another OSL input layout (the message names the flags
+        that build it).
     """
     loaded = torch.load(path, map_location=map_location, weights_only=False)
     _check_stage2_checkpoint(loaded, path)
@@ -1508,22 +1508,18 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
       self.env.unwrapped.common_step_counter = counter
     if actors_only:
       self._ready = False
+      self._resumed = None
       return infos
     self._restore_curriculum(split)
     self.current_learning_iteration = int(loaded["iter"]) + 1
-    # The reward from the stage-local iteration the resume trains first, under the
-    # env stages the curriculum just restored.
-    check_resume_reward(
-      path,
-      infos,
-      getattr(self.env.unwrapped, "cfg", None),
-      self.env_stages,
-      self.current_learning_iteration - self.stage_start,
-      bool(self.cfg.get("allow_reward_mismatch", False)),
-      what="stage-local iteration",
-    )
+    self._resumed = (path, infos)  # Its reward is checked when it trains.
     self._ready = True
     return infos
+
+  def _resume_point(self) -> tuple[int, str]:
+    """Where a resumed run trains first, for the env stages its curriculum restored:
+    the stage-local iteration (stage 2 continues stage 1's iteration count)."""
+    return self.current_learning_iteration - self.stage_start, "stage-local iteration"
 
   @classmethod
   def configure_env_for_checkpoint(
