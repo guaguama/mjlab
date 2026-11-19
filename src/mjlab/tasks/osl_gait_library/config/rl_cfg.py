@@ -1,5 +1,7 @@
 """Runner settings: the matching osl_mimic task's, plus time-out bootstrapping, and
-for the unicycle MSK tasks the stage-1 recipe (:func:`apply_unicycle_msk_recipe`)."""
+for the unicycle tasks the stage-1 recipe of their model: MSK's
+(:func:`apply_unicycle_msk_recipe`) and the robot's
+(:func:`apply_unicycle_robot_recipe`)."""
 
 from __future__ import annotations
 
@@ -8,6 +10,8 @@ from dataclasses import dataclass, field, fields
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.config.rl_cfg import (
+  HIDDEN_DIMS,
+  NUM_STEPS,
   MuscleMimicPpoCfg,
   OslMimicRunnerCfg,
   OslMimicValidationCfg,
@@ -49,6 +53,60 @@ the policy trail its reference (forward speed error 0.17 vs 0.13 m/s at update 1
 and fall more often; switched on at 1500 it taught recovery. The 0.2 twist weight
 paid off once the std was small (tight-arc failures 0.05 vs 0.19 at update 3800)."""
 
+# ===== The unicycle robot recipe (round 7, 2026-11; not yet tuned on the robot) ====
+# The 27 position servos and 2 OSL motors learn in fewer samples than the muscles
+# (the legacy 8192-env robot run, W&B h60d0llm, validated cleanly at ~0.45-0.5x the
+# MSK teacher's samples), so the robot trains 2000 iterations at 8192 envs (1.3e9
+# samples) in two phases: library sampling to update 1500, then continuous
+# tight-arc sampling at the held rate (a resume with the sampling flags, as the MSK
+# teacher's last phase). Every count here is set for 8192 envs; none derives from
+# osl_mimic's ``NUM_UPDATES`` (4096 envs). Under Muon a step's length is set by the
+# rate, so per-iteration movement is the rate times ``num_mini_batches``, whatever
+# the batch size.
+UNICYCLE_ROBOT_ITERATIONS = 2000
+"""The run's last checkpoint is model_1999: phase A trains the first
+``UNICYCLE_ROBOT_PHASE_A_ITERATIONS`` (``--agent.max-iterations 1500``), phase B
+resumes from model_1499 for the remaining 501 (an rsl_rl resume counts its
+iterations from the checkpoint's)."""
+UNICYCLE_ROBOT_PHASE_A_ITERATIONS = 1500
+"""Phase A's length: where the rate reaches its floor and the std cap its end."""
+UNICYCLE_ROBOT_LR = 4e-4
+UNICYCLE_ROBOT_LR_UPDATES = 1500
+"""The rate decays linearly to ``UNICYCLE_ROBOT_LR_FINAL_RATIO`` of itself (4e-5)
+over this many updates, then holds through phase B (musclemimic's decay to 0 left
+the legacy run learning almost nothing in its last ~90 iterations)."""
+UNICYCLE_ROBOT_LR_FINAL_RATIO = 0.1
+UNICYCLE_ROBOT_INIT_STD = 0.2
+"""Every row's initial std (servos and OSL motors alike): osl_mimic's robot value."""
+UNICYCLE_ROBOT_STD_CAP = (0.2, 0.07)
+"""The std cap at its first and last update, geometric in between. It binds early on
+the arms' high-std rows and makes the teacher end at the std stage 2 assumes: stage 2
+holds the human's std fixed, and its human rate (3e-5) was set for 0.07."""
+UNICYCLE_ROBOT_STD_CAP_UPDATES = (200, 1500)
+UNICYCLE_ROBOT_STD_FLOOR = 0.03
+"""A floor under every row (at most the cap's end): uncapped, a robot run's leg rows
+fell to 0.021, and stage 2 freezes whatever the teacher ends with."""
+UNICYCLE_ROBOT_NUM_MINI_BATCHES = 128
+"""5120-sample minibatches at 8192 envs x 80 steps. Stage 2 inherits it, and its
+rates were set for 128 Muon steps per iteration: keep it."""
+UNICYCLE_ROBOT_SAVE_INTERVAL = 250
+UNICYCLE_ROBOT_VALIDATION_INTERVAL = 125
+"""Lean evaluation: a robot validation pass costs about 2 min, so validating every
+30 iterations (osl_mimic's) spent ~17-20% of the wall time."""
+UNICYCLE_ROBOT_STRESS_INTERVAL = 250
+UNICYCLE_ROBOT_INFERENCE = ("mean",)
+"""Validation and stress validation play the raw mean: the robot deploys it (the
+robot's ``auto`` inference is the mean)."""
+UNICYCLE_ROBOT_ENV_STAGES = (
+  (400, "terminations.root_deviation.threshold", 1.0),
+  (1200, "rewards.twist.weight", 0.06),
+)
+"""The robot recipe's stages, after the CLF tasks' ramps (0 until update 500, half
+until 1000), never instead of them: the env config holds the final drift limit
+(2 m) and twist weight (0.2), reached as the MSK teacher reached them. Offset from
+the ramps' steps, so no two changes land on one update (each would be blurred in
+the other's ``Stages/`` curves)."""
+
 
 @dataclass
 class GaitLibraryValidationCfg(OslMimicValidationCfg):
@@ -71,7 +129,19 @@ def osl_gait_library_runner_cfg(
   reward: Reward,
   experiment_name: str,
   variant: Variant = "walk_fwd",
+  robot_recipe: bool = True,
 ) -> GaitLibraryRunnerCfg:
+  """The runner settings of a gait-library task.
+
+  Args:
+    model, socket, reward, experiment_name: As ``osl_mimic_runner_cfg``.
+    variant: ``"walk_fwd"`` or ``"unicycle"``; the unicycle tasks get their model's
+      stage-1 recipe.
+    robot_recipe: False keeps the robot's unicycle settings as they were before its
+      recipe (osl_mimic's), for stage-2 tasks whose stage 1 is not the robot recipe
+      (``osl_split_runner_cfg(..., robot_recipe=False)``). The MSK recipe applies
+      either way.
+  """
   base = osl_mimic_runner_cfg(model, socket, reward, experiment_name)
   cfg = GaitLibraryRunnerCfg(**{f.name: getattr(base, f.name) for f in fields(base)})
   assert isinstance(cfg.algorithm, MuscleMimicPpoCfg)
@@ -93,6 +163,8 @@ def osl_gait_library_runner_cfg(
   cfg.wandb_tags = ("osl_fullbody", model, reward, library_tag)
   if variant == "unicycle" and model == "msk":
     apply_unicycle_msk_recipe(cfg)
+  elif variant == "unicycle" and model == "robot" and robot_recipe:
+    apply_unicycle_robot_recipe(cfg)
   return cfg
 
 
@@ -116,3 +188,36 @@ def apply_unicycle_msk_recipe(cfg: GaitLibraryRunnerCfg) -> None:
   cfg.validation.stress_interval = UNICYCLE_MSK_STRESS_INTERVAL
   cfg.validation.stress_inference = ("mean", "expected")
   cfg.env_stages = (*cfg.env_stages, *UNICYCLE_MSK_ENV_STAGES)
+
+
+def apply_unicycle_robot_recipe(cfg: GaitLibraryRunnerCfg) -> None:
+  """Set the robot recipe's PPO schedule, networks and evaluation cadence, every
+  value explicitly, and add its env stages to the config's own (the CLF tasks'
+  reward ramps; none under MimicReward)."""
+  alg = cfg.algorithm
+  assert isinstance(alg, MuscleMimicPpoCfg)
+  assert cfg.actor.distribution_cfg is not None
+  cfg.actor.distribution_cfg["init_std"] = UNICYCLE_ROBOT_INIT_STD
+  for model_cfg in (cfg.actor, cfg.critic):
+    model_cfg.hidden_dims = HIDDEN_DIMS
+  alg.init_std_terms = {}
+  alg.std_cap_start, alg.std_cap_end = UNICYCLE_ROBOT_STD_CAP
+  alg.std_cap_begin_update, alg.std_cap_end_update = UNICYCLE_ROBOT_STD_CAP_UPDATES
+  alg.std_floor = UNICYCLE_ROBOT_STD_FLOOR
+  alg.actor_bias_init = "qpos0"
+  alg.learning_rate = UNICYCLE_ROBOT_LR
+  alg.lr_schedule = "linear"
+  alg.lr_schedule_updates = UNICYCLE_ROBOT_LR_UPDATES
+  alg.lr_schedule_offset = 0
+  alg.lr_final_ratio = UNICYCLE_ROBOT_LR_FINAL_RATIO
+  alg.muon_ns_dtype = "bfloat16"
+  alg.num_mini_batches = UNICYCLE_ROBOT_NUM_MINI_BATCHES
+  cfg.num_steps_per_env = NUM_STEPS
+  cfg.max_iterations = UNICYCLE_ROBOT_ITERATIONS
+  cfg.save_interval = UNICYCLE_ROBOT_SAVE_INTERVAL
+  cfg.validation.interval = UNICYCLE_ROBOT_VALIDATION_INTERVAL
+  cfg.validation.inference = UNICYCLE_ROBOT_INFERENCE
+  cfg.validation.stress_interval = UNICYCLE_ROBOT_STRESS_INTERVAL
+  cfg.validation.stress_inference = UNICYCLE_ROBOT_INFERENCE
+  cfg.video.enabled = True
+  cfg.env_stages = (*cfg.env_stages, *UNICYCLE_ROBOT_ENV_STAGES)

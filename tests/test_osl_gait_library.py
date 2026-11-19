@@ -47,6 +47,9 @@ from mjlab.tasks.osl_gait_library.config.env_cfgs import (
   UNICYCLE_FWD_ARC_REGIONS,
   UNICYCLE_MSK_ROOT_DEVIATION,
   UNICYCLE_MSK_TWIST_WEIGHT,
+  UNICYCLE_ROBOT_NUM_ENVS,
+  UNICYCLE_ROBOT_ROOT_DEVIATION,
+  UNICYCLE_ROBOT_TWIST_WEIGHT,
   UNICYCLE_TWIST_METRIC_WEIGHTS,
   UNICYCLE_WZ_RANGE,
   osl_gait_library_env_cfg,
@@ -60,6 +63,15 @@ from mjlab.tasks.osl_gait_library.config.rl_cfg import (
   UNICYCLE_MSK_STD_CAP,
   UNICYCLE_MSK_STD_CAP_UPDATES,
   UNICYCLE_MSK_STRESS_INTERVAL,
+  UNICYCLE_ROBOT_ENV_STAGES,
+  UNICYCLE_ROBOT_INIT_STD,
+  UNICYCLE_ROBOT_ITERATIONS,
+  UNICYCLE_ROBOT_LR_UPDATES,
+  UNICYCLE_ROBOT_STD_CAP,
+  UNICYCLE_ROBOT_STD_CAP_UPDATES,
+  UNICYCLE_ROBOT_STD_FLOOR,
+  UNICYCLE_ROBOT_STRESS_INTERVAL,
+  UNICYCLE_ROBOT_VALIDATION_INTERVAL,
   GaitLibraryRunnerCfg,
   osl_gait_library_runner_cfg,
 )
@@ -237,9 +249,9 @@ def test_unicycle_task_contract(task: str) -> None:
   assert rl.experiment_name.startswith("osl_fullbody_unicycle")
   assert "unicycle" in rl.wandb_tags
 
-  # The MSK tasks' stage-1 recipe; the robot tasks keep osl_mimic's settings. Every
-  # CLF task has the paper-form decrease condition and the regularizers, ramped in
-  # by env stages; MimicReward has neither.
+  # Each model's stage-1 recipe: MSK's and the robot's. Every CLF task has the
+  # paper-form decrease condition and the regularizers, ramped in by env stages;
+  # MimicReward has neither.
   msk = model == "msk"
   clf = cfg.rewards["mimic"].params["clf"]
   regularizers = cfg.rewards["mimic"].params["regularizers"]
@@ -251,10 +263,13 @@ def test_unicycle_task_contract(task: str) -> None:
   assert (
     validation.rewards["twist"].weight
     == cfg.rewards["twist"].weight
-    == (UNICYCLE_MSK_TWIST_WEIGHT if msk else TWIST_WEIGHT)
+    == (UNICYCLE_MSK_TWIST_WEIGHT if msk else UNICYCLE_ROBOT_TWIST_WEIGHT)
   )
   root = cfg.terminations["root_deviation"].params["threshold"]
-  assert root == (UNICYCLE_MSK_ROOT_DEVIATION if msk else 1.0)
+  assert root == (UNICYCLE_MSK_ROOT_DEVIATION if msk else UNICYCLE_ROBOT_ROOT_DEVIATION)
+  # The robot trains 8192 envs (training mode only), MSK osl_mimic's 4096.
+  assert cfg.scene.num_envs == (4096 if msk else UNICYCLE_ROBOT_NUM_ENVS)
+  assert validation.scene.num_envs == play.scene.num_envs == 1
   alg = rl.algorithm
   assert isinstance(alg, MuscleMimicPpoCfg) and rl.actor.distribution_cfg is not None
   if msk:
@@ -285,10 +300,34 @@ def test_unicycle_task_contract(task: str) -> None:
       "rewards.twist.weight": UNICYCLE_MSK_TWIST_WEIGHT,
     }
   else:
-    assert rl.actor.distribution_cfg["init_std"] == 0.2
-    assert alg.std_cap_start == 0.0 and not alg.init_std_terms
-    assert v.stress_interval == 0
-    assert rl.env_stages == (CLF_ENV_STAGES if clf is not None else ())
+    assert rl.actor.distribution_cfg["init_std"] == UNICYCLE_ROBOT_INIT_STD
+    assert not alg.init_std_terms and alg.actor_bias_init == "qpos0"
+    assert (alg.std_cap_start, alg.std_cap_end) == UNICYCLE_ROBOT_STD_CAP
+    updates = (alg.std_cap_begin_update, alg.std_cap_end_update)
+    assert updates == UNICYCLE_ROBOT_STD_CAP_UPDATES
+    assert alg.std_floor == UNICYCLE_ROBOT_STD_FLOOR
+    assert alg.lr_schedule_updates == UNICYCLE_ROBOT_LR_UPDATES
+    assert alg.lr_final_ratio == 0.1 and alg.muon_ns_dtype == "bfloat16"
+    assert rl.max_iterations == UNICYCLE_ROBOT_ITERATIONS
+    assert v.interval == UNICYCLE_ROBOT_VALIDATION_INTERVAL
+    assert v.stress_interval == UNICYCLE_ROBOT_STRESS_INTERVAL
+    assert v.inference == v.stress_inference == ("mean",)
+    # The robot's stages come after the CLF ramps (alone under MimicReward); every
+    # staged path names a setting of the training config.
+    ramps = CLF_ENV_STAGES if clf is not None else ()
+    assert rl.env_stages == (*ramps, *UNICYCLE_ROBOT_ENV_STAGES)
+    env = SimpleNamespace(
+      reward_manager=SimpleNamespace(get_term_cfg=lambda n: cfg.rewards[n]),
+      termination_manager=SimpleNamespace(get_term_cfg=lambda n: cfg.terminations[n]),
+    )
+    finals = {
+      path: stage_accessors(cast(Any, env), path)[0]() for _, path, _ in rl.env_stages
+    }
+    assert finals == {
+      **({path: 1.0 for _, path, _ in CLF_ENV_STAGES} if clf is not None else {}),
+      "terminations.root_deviation.threshold": UNICYCLE_ROBOT_ROOT_DEVIATION,
+      "rewards.twist.weight": UNICYCLE_ROBOT_TWIST_WEIGHT,
+    }
 
 
 def test_perception_switches() -> None:

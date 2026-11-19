@@ -524,6 +524,25 @@ def test_literals_mirror_mjlab() -> None:
   assert two_stage.LEGACY_TOUCH_SITES == osl_constants.LEGACY_TOUCH_SITES
   assert two_stage.TOUCH_SITES_KEY == mimic_touch_sites.ENV_FIELD
   assert two_stage.TOUCH_SITES_FLAG == mimic_touch_sites.CLI_FLAG
+  assert two_stage.TYRO_FLAGS == mjlab.TYRO_FLAGS
+
+
+def test_the_robot_model_is_refused(
+  tmp_path: Path,
+  library: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  capsys: pytest.CaptureFixture[str],
+) -> None:
+  """The robot recipe's two-phase stage 1 is the launchers' job: the driver refuses
+  it before anything runs, pointing there."""
+  refuse_to_launch(monkeypatch)
+  argv = ["--name", "p", "--library-dir", str(library), "--log-root", str(tmp_path)]
+  assert two_stage.main([*argv, "--model", "robot", "--dry-run", "True"]) == 1
+  err = capsys.readouterr().err
+  assert "--model robot" in err and "s1_robot_chain.sh" in err
+  assert not (tmp_path / "pipelines").exists()
+  # The musculoskeletal model still runs (here as a dry run).
+  assert two_stage.main([*argv, "--dry-run", "True"]) == 0
 
 
 @pytest.mark.parametrize(("model", "socket", "reward"), COMBOS)
@@ -710,8 +729,11 @@ def test_train_cli_accepts_the_commands(tmp_path: Path, library: Path) -> None:
 
 
 def test_cli_flags() -> None:
+  """The driver parses as ``train`` does (``mjlab.TYRO_FLAGS``): booleans take a
+  value."""
   cfg = tyro.cli(
     TwoStageCfg,
+    config=two_stage.TYRO_FLAGS,
     args=[
       "--name",
       "p",
@@ -730,9 +752,11 @@ def test_cli_flags() -> None:
       "--stage2.human-freeze-iterations",
       "50",
       "--stage2.skip",
+      "True",
       "--curves",
       "none",
       "--wait-for-gpu",
+      "True",
       "--gpu-poll-s",
       "5",
     ],
@@ -923,7 +947,7 @@ def test_dry_run_prints_every_command_and_runs_nothing(
   refuse_to_launch(monkeypatch)
   logs = tmp_path / "logs"
   argv = ["--name", "p", "--library-dir", str(library), "--log-root", str(logs)]
-  assert two_stage.main([*argv, "--dry-run", "--stage2.reward", "mimic"]) == 0
+  assert two_stage.main([*argv, "--dry-run", "True", "--stage2.reward", "mimic"]) == 0
   out = capsys.readouterr().out
   cfg = make_cfg(tmp_path)
   paths = PipelinePaths.of(cfg)

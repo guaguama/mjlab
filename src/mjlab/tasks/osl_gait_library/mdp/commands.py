@@ -57,11 +57,19 @@ For play (sesteban's ``play.py`` additions), the twist can be pinned for every e
 (``fixed_twist``, ``set_fixed_twist``; the viewer's keyboard and slider controls go
 through it), and with ``debug_vis`` on the viewer draws the served reference as a
 ghost of the robot model.
+
+The loaded library (its clips' arrays, names, frame counts, twists and strides) is
+shared by every command over the same files, entity, sites, device and rate: a
+training run's training, validation, stress and video envs hold one copy (516 MB
+for the 779-clip unicycle library) instead of four. Nothing writes into it after
+the load; each command derives its own sampling tables from it
+(``_index_library``), since those follow its own config.
 """
 
 from __future__ import annotations
 
 import math
+import weakref
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -121,6 +129,33 @@ _VELOCITY_OF = {
   "omega_rel": "rangles",
 }
 _VELOCITIES = (*_VELOCITY_OF, "root_ang_vel_w", "rvel")
+
+
+@dataclass(eq=False)
+class _LoadedLibrary:
+  """One gait library as :meth:`GaitLibraryCommand._load_library` loads it, shared
+  read-only by every command over the same library (:data:`_LIBRARY_CACHE`)."""
+
+  clip_names: tuple[str, ...]
+  num_frames: torch.Tensor
+  twists: torch.Tensor
+  strides: torch.Tensor
+  data: dict[str, torch.Tensor]
+  site_body_ids: tuple[int, ...]
+
+
+_LIBRARY_CACHE: weakref.WeakValueDictionary[tuple, _LoadedLibrary] = (
+  weakref.WeakValueDictionary()
+)
+"""Loaded libraries by :meth:`GaitLibraryCommand._library_key`, alive while a command
+holds them: a process that drops its envs frees the library with them."""
+
+
+def clear_library_cache() -> None:
+  """Forget every loaded library: the next command loads its own (commands that
+  hold one keep it)."""
+  _LIBRARY_CACHE.clear()
+
 
 GHOST_GEOM_GROUP = 0
 """The geom group the reference ghost shows: the visible anatomy and the socket and
@@ -371,13 +406,53 @@ class GaitLibraryCommand(CommandTerm):
   ##
 
   def _load_library(self, folder: Path) -> None:
+    """Load the library in ``folder``, or take the copy another command over the
+    same library already loaded (:data:`_LIBRARY_CACHE`): the shared tensors under a
+    dict of this command's own, then this command's sampling tables."""
     files = sorted(folder.glob("*.npz"))
     if not files:
       raise ValueError(f"No *.npz clips in {folder}.")
+    key = self._library_key(folder, files)
+    library = _LIBRARY_CACHE.get(key)
+    if library is None:
+      library = self._read_library(files)
+      _LIBRARY_CACHE[key] = library
+    self._library = library  # Keeps the shared copy alive while this command is.
+    self.num_clips = len(library.clip_names)
+    self.clip_names = list(library.clip_names)
+    self.num_frames = library.num_frames
+    self.twists = library.twists
+    self.strides = library.strides
+    self.data: dict[str, torch.Tensor] = dict(library.data)
+    self.site_body_ids = list(library.site_body_ids)
+    self._index_library()
+
+  def _library_key(self, folder: Path, files: Sequence[Path]) -> tuple:
+    """What the loaded arrays depend on: the clip files (path, size and
+    modification time, so a library rewritten in place is read again), the device,
+    the entity's body and joint names (the clips are padded to its joints), the
+    reference sites and the control step. Commands that match in all of them share
+    one copy, the robot's and the musculoskeletal model's included (their names are
+    equal); a model-specific loading step would have to join the key."""
+    stats = tuple(
+      (path.name, path.stat().st_size, path.stat().st_mtime_ns) for path in files
+    )
+    return (
+      str(folder.resolve()),
+      stats,
+      str(self.device),
+      tuple(self.robot.body_names),
+      tuple(self.robot.joint_names),
+      tuple(self.cfg.site_bodies),
+      float(self._step_dt),
+    )
+
+  def _read_library(self, files: Sequence[Path]) -> _LoadedLibrary:
+    """Read and check every clip, padded into (C, T_max, ...) arrays."""
     body_names = list(self.robot.body_names)
     joint_names = list(self.robot.joint_names)
     root = body_names.index(ROOT_BODY)
-    self.site_body_ids = [body_names.index(b) for b in self.cfg.site_bodies]
+    site_body_ids = [body_names.index(b) for b in self.cfg.site_bodies]
     dev = self.device
 
     clips: list[dict[str, torch.Tensor]] = []
@@ -411,10 +486,10 @@ class GaitLibraryCommand(CommandTerm):
         a["joint_pos"], a["joint_vel"], joint_names
       )
       quat = a["body_quat_w"][:, root]
-      site_pos = a["body_pos_w"][:, self.site_body_ids]
-      site_mat = matrix_from_quat(a["body_quat_w"][:, self.site_body_ids])
-      ang = a["body_ang_vel_w"][:, self.site_body_ids]
-      lin = a["body_lin_vel_w"][:, self.site_body_ids]
+      site_pos = a["body_pos_w"][:, site_body_ids]
+      site_mat = matrix_from_quat(a["body_quat_w"][:, site_body_ids])
+      ang = a["body_ang_vel_w"][:, site_body_ids]
+      lin = a["body_lin_vel_w"][:, site_body_ids]
       # rvel is served from the anchored sites (``_gather``), not stored.
       rpos, rangles, _ = relative_site_quantities(site_pos, site_mat, ang, lin)
       v_rel, omega_rel = relative_site_velocities(site_mat, ang, lin)
@@ -443,24 +518,24 @@ class GaitLibraryCommand(CommandTerm):
       lengths.append(int(joint_pos.shape[0]))
 
     t_max = max(lengths)
-    self.num_clips = len(clips)
-    self.clip_names = [p.stem for p in files]
-    self.num_frames = torch.tensor(lengths, dtype=torch.long, device=dev)
-    self.twists = torch.tensor(np.stack(twists), dtype=torch.float32, device=dev)
-    self.strides = torch.tensor(strides, dtype=torch.float32, device=dev)
     # (C, T_max, ...), short clips padded with their last frame (never read).
-    self.data: dict[str, torch.Tensor] = {}
+    stacked: dict[str, torch.Tensor] = {}
     for key in clips[0]:
       padded = []
       for clip in clips:
         x = clip[key]
         pad = x[-1:].expand(t_max - x.shape[0], *x.shape[1:])
         padded.append(torch.cat([x, pad], dim=0))
-      self.data[key] = torch.stack(padded)
-    self.data["root_planar"] = planar_pose(
-      self.data["root_pos"], self.data["root_quat"]
+      stacked[key] = torch.stack(padded)
+    stacked["root_planar"] = planar_pose(stacked["root_pos"], stacked["root_quat"])
+    return _LoadedLibrary(
+      clip_names=tuple(p.stem for p in files),
+      num_frames=torch.tensor(lengths, dtype=torch.long, device=dev),
+      twists=torch.tensor(np.stack(twists), dtype=torch.float32, device=dev),
+      strides=torch.tensor(strides, dtype=torch.float32, device=dev),
+      data=stacked,
+      site_body_ids=tuple(site_body_ids),
     )
-    self._index_library()
 
   def _index_library(self) -> None:
     """Everything derived from the loaded clips (``twists``, ``num_frames``): the idle

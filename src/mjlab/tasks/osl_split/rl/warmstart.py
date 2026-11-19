@@ -163,7 +163,8 @@ and they load all the same):
 * ``stage1_lr``: the rate of stage 1's last update; ``stage1_std_cap``: the std cap
   its final std was projected under (None without a cap);
 * ``stage1_env``: the env settings of stage 1's last update
-  (:func:`stage1_env_settings`), None without ``params/env.yaml``;
+  (:func:`stage1_env_settings`; its command sampling, :func:`sampling_settings`,
+  since 2026-11-19), None without ``params/env.yaml``;
 * ``stage1_planned_last_iteration``: the iteration the run was set to end at (None
   when its settings do not say);
 * ``osl_touch_sites``: the OSL foot touch sites stage 1 trained with
@@ -811,9 +812,11 @@ def stage1_env_settings(
 ) -> dict[str, Any] | None:
   """The env settings stage 1's last update trained with: the ``mimic`` term's
   :func:`reward_settings` (``clf_pen_w`` and the other ``clf_*`` None under
-  MimicReward), ``twist_weight`` and ``root_deviation`` (the training limit), from
-  ``params/env.yaml`` with the env stages then in force on top (recorded as
-  ``env_stages_in_force``). None without a readable env.yaml."""
+  MimicReward), ``twist_weight`` and ``root_deviation`` (the training limit) and the
+  command's :func:`sampling_settings`, from ``params/env.yaml`` with the env stages
+  then in force on top (recorded as ``env_stages_in_force``). A resumed run's
+  env.yaml is its own launch's, so a run that changed its sampling in its last
+  phase records that phase's. None without a readable env.yaml."""
   try:
     env = read_config(run_dir / "params" / "env.yaml")
   except (OSError, yaml.YAMLError, ValueError):
@@ -826,6 +829,7 @@ def stage1_env_settings(
     "root_deviation": _number(
       _dig(env, "terminations", "root_deviation", "params", "threshold")
     ),
+    **sampling_settings(_dig(env, "commands", "motion")),
   }
   stages = env_stages_in_force(agent.get("env_stages") or (), num_updates_done - 1)
   for path, value in stages.items():
@@ -851,7 +855,50 @@ def env_cfg_settings(cfg: Any) -> dict[str, Any]:
     **(env_reward_settings(cfg) or reward_settings(None, None)),
     "twist_weight": _number(getattr(twist, "weight", None)),
     "root_deviation": _number(threshold),
+    **sampling_settings(term("commands", "motion")),
   }
+
+
+def sampling_settings(motion: Any) -> dict[str, Any]:
+  """A gait-library command's ``sampling`` (``"library"`` or ``"continuous"``) and
+  ``fwd_arc_regions`` (nested lists of floats), from a live config or its saved
+  plain data; None for each where the command has none (a single clip's)."""
+
+  def get(name: str) -> Any:
+    if isinstance(motion, Mapping):
+      return motion.get(name)
+    return getattr(motion, name, None)
+
+  sampling, regions = get("sampling"), get("fwd_arc_regions")
+  return {
+    "sampling": sampling if isinstance(sampling, str) else None,
+    "fwd_arc_regions": None if regions is None else _float_lists(regions),
+  }
+
+
+def sampling_mismatch(
+  stage1: Mapping[str, Any], stage2: Mapping[str, Any]
+) -> str | None:
+  """How stage 2's command sampling (:func:`sampling_settings`) differs from stage
+  1's last phase, with the flags that give stage 2 stage 1's, or None (also when
+  either side records none). The forward-arc boxes count only where both sample
+  continuously: the library sampler never reads them."""
+  a, b = stage1.get("sampling"), stage2.get("sampling")
+  if a is None or b is None:
+    return None
+  regions = stage1.get("fwd_arc_regions")
+  if a == b and (
+    a != "continuous" or regions is None or regions == stage2.get("fwd_arc_regions")
+  ):
+    return None
+  flags = f"--env.commands.motion.sampling {a}"
+  if a == "continuous" and regions is not None:
+    flags += f' --env.commands.motion.fwd-arc-regions "{_regions_literal(regions)}"'
+  return (
+    f"Stage 1's last phase sampled commands {_shown_sampling(stage1)}; stage 2 "
+    f"samples {_shown_sampling(stage2)}. The warm-started human then trains on other "
+    f"commands than it ended stage 1 on; stage 1's flags are {flags}."
+  )
 
 
 def env_stage_setting(path: str) -> str | None:
@@ -963,6 +1010,17 @@ def provenance_lines(lineage: Mapping[str, Any]) -> list[str]:
       + (f" (env stages in force: {stages})" if stages else "")
     )
     lines.append(f"  stage-1 reward: {describe_reward_settings(env)}")
+    sampling = env.get("sampling")
+    if sampling is not None:
+      regions = env.get("fwd_arc_regions")
+      lines.append(
+        f"  stage-1 command sampling: {sampling}"
+        + (
+          f", forward-arc boxes {_regions_literal(regions)}"
+          if sampling == "continuous" and regions is not None
+          else ""
+        )
+      )
   release = lineage.get("library_release")
   if release:
     digest = release.get("sha256")
@@ -984,6 +1042,36 @@ def _dig(tree: Any, *keys: str) -> Any:
       return None
     tree = tree[key]
   return tree
+
+
+def _float_lists(value: Any) -> Any:
+  """Nested sequences as lists, numbers as floats (a saved config and a live one
+  then compare equal)."""
+  if isinstance(value, (list, tuple)):
+    return [_float_lists(item) for item in value]
+  if isinstance(value, (int, float)) and not isinstance(value, bool):
+    return float(value)
+  return value
+
+
+def _shown_sampling(settings: Mapping[str, Any]) -> str:
+  """A :func:`sampling_settings` record for messages: the sampler, and its boxes
+  where it reads them."""
+  sampling, regions = str(settings.get("sampling")), settings.get("fwd_arc_regions")
+  if sampling == "continuous" and regions is not None:
+    return f"{sampling} over the forward-arc boxes {_regions_literal(regions)}"
+  return sampling
+
+
+def _regions_literal(regions: Any) -> str:
+  """Forward-arc boxes as the command line's Python literal."""
+
+  def tuples(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+      return tuple(tuples(item) for item in value)
+    return value
+
+  return repr(tuples(regions)).replace(" ", "")
 
 
 def _number(value: Any) -> float | None:

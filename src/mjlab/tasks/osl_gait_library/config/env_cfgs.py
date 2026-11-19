@@ -20,7 +20,9 @@ Two variants:
   unicycle mode split, episodes starting at a random heading, and stage-1 domain
   randomization (``config/dr.py``). Its MSK tasks train with the stage-1 recipe: the
   ``UNICYCLE_MSK_*`` reward and termination settings below and the PPO schedule in
-  ``config/rl_cfg.py``.
+  ``config/rl_cfg.py``. Its robot tasks train with the robot recipe: the
+  ``UNICYCLE_ROBOT_*`` settings below (8192 envs, the MSK recipe's final twist
+  weight and drift limit) and their schedule in ``config/rl_cfg.py``.
 """
 
 from __future__ import annotations
@@ -119,6 +121,20 @@ error, with stress survival unchanged."""
 # --env.rewards.mimic.params.clf.decay-form musclemimic
 # --env.rewards.mimic.params.clf.pen-w 0 and the regularizers at 0.
 
+# ===== The unicycle robot recipe (round 7, 2026-11; not yet tuned on the robot) ====
+UNICYCLE_ROBOT_NUM_ENVS = 8192
+"""Training envs (osl_mimic's ``NUM_ENVS``, 4096, elsewhere); training mode only.
+The robot's two big networks and its smaller plant fit 8192 on a 24 GB GPU (the
+legacy robot run, W&B h60d0llm: 19 GB at old physics). Stage 2 inherits it through
+the split env. Every iteration count of the robot recipe (``config/rl_cfg.py``) is
+set for it; none derives from ``NUM_ENVS``."""
+UNICYCLE_ROBOT_ROOT_DEVIATION = UNICYCLE_MSK_ROOT_DEVIATION
+"""The root's drift limit in m, the MSK recipe's final value (training mode only);
+1.0 until update 400 (the runner's env stages)."""
+UNICYCLE_ROBOT_TWIST_WEIGHT = UNICYCLE_MSK_TWIST_WEIGHT
+"""The twist term's weight in every mode (validation scores with it too), the MSK
+recipe's final value; 0.06 until update 1200 (the runner's env stages)."""
+
 
 def osl_gait_library_env_cfg(
   model: Model = "robot",
@@ -185,6 +201,13 @@ def osl_gait_library_env_cfg(
     if "root_deviation" in cfg.terminations:  # Training mode only.
       root = cfg.terminations["root_deviation"]
       root.params = {**root.params, "threshold": UNICYCLE_MSK_ROOT_DEVIATION}
+  elif variant == "unicycle" and model == "robot":
+    cfg.rewards["twist"].weight = UNICYCLE_ROBOT_TWIST_WEIGHT
+    if "root_deviation" in cfg.terminations:  # Training mode only.
+      root = cfg.terminations["root_deviation"]
+      root.params = {**root.params, "threshold": UNICYCLE_ROBOT_ROOT_DEVIATION}
+    if mode == "train":
+      cfg.scene.num_envs = UNICYCLE_ROBOT_NUM_ENVS
 
   if variant == "unicycle":
     apply_osl_dr(cfg, model, socket, mode, dr_cfg)

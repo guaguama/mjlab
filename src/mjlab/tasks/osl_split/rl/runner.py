@@ -165,6 +165,7 @@ from .warmstart import (
   load_warm_start,
   provenance_lines,
   reward_mismatches,
+  sampling_mismatch,
 )
 
 OSL_JOINT_LABELS = ("knee", "ankle")
@@ -534,9 +535,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
 
   def _report_provenance(self, lineage: Mapping[str, Any]) -> None:
     """Print stage 1's recorded end state and how it compares with this run: the
-    twist weight, root-deviation limit and library release, the human's rate
-    against stage 1's last one, and the lineage's own warnings (a large human std,
-    an unfinished stage-1 run)."""
+    twist weight, root-deviation limit, command sampling (its last phase's) and
+    library release, the human's rate against stage 1's last one, and the
+    lineage's own warnings (a large human std, an unfinished stage-1 run)."""
     env = self.env.unwrapped
     lines = [f"[INFO] {line.strip()}" for line in provenance_lines(lineage)]
     stage1 = lineage.get("stage1_env")
@@ -551,6 +552,9 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
           lines.append(
             f"[WARN] Stage 1 trained with the {label} {a:g}; stage 2 uses {b:g}."
           )
+      sampling = sampling_mismatch(stage1, stage2)
+      if sampling is not None:
+        lines.append(f"[WARN] {sampling}")
     else:
       lines.append(
         "[WARN] The warm start records no stage-1 env settings (converted before "

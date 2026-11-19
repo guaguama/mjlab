@@ -214,6 +214,30 @@ def test_policy_stats_per_action_term() -> None:
   assert stats["mean_outside/osl_motors"] == 0.0
 
 
+def test_policy_stats_report_the_rows_at_the_bounds() -> None:
+  """Each term's smallest row, and the share of its rows the cap and the floor
+  hold: stage 2 freezes the human's per-row std, so its spread matters beside its
+  mean."""
+  alg = _algorithm(std_cap_start=0.5, std_cap_end=0.5, std_floor=0.1)
+  param, _ = gaussian_std_parameter(alg.actor)  # Every row at the cap, 0.5.
+  with torch.no_grad():
+    param[0] = math.log(0.05)  # An OSL row under the floor, projected onto it.
+    alg.apply_std_bounds()
+    param[3] = math.log(0.3)  # A muscle row between the bounds.
+  alg._record_policy_stats(torch.zeros(4, OSL + MUSCLES))
+  stats = alg.policy_stats
+  assert stats["std_min/osl_motors"] == pytest.approx(0.1)
+  assert stats["std_at_floor/osl_motors"] == stats["std_at_cap/osl_motors"] == 0.5
+  assert stats["std_min/muscles"] == pytest.approx(0.3)
+  assert stats["std_at_cap/muscles"] == pytest.approx(4 / MUSCLES)
+  assert stats["std_at_floor/muscles"] == 0.0
+  # Without bounds only the smallest row is reported.
+  free = _algorithm()
+  free._record_policy_stats(torch.zeros(4, OSL + MUSCLES))
+  assert free.policy_stats["std_min/muscles"] == pytest.approx(3.0)
+  assert not any(k.startswith("std_at_") for k in free.policy_stats)
+
+
 ##
 # Optimizer.
 ##

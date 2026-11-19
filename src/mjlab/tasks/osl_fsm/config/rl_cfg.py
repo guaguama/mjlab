@@ -203,7 +203,11 @@ def osl_fsm_runner_cfg(
 ) -> FsmRunnerCfg:
   """Stage 2's runner settings for this task, with stage 1.5's changes (see the
   module docstring)."""
-  base = osl_split_runner_cfg(model, socket, reward, experiment_name)
+  # Stage 1.5's own settings over the robot's from before its unicycle recipe (the
+  # recipe's are pinned to stage 1 and stage 2's tested design).
+  base = osl_split_runner_cfg(
+    model, socket, reward, experiment_name, robot_recipe=False
+  )
   changed = {
     "algorithm",
     "validation",

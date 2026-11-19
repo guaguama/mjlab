@@ -35,8 +35,9 @@ Tuning knobs that are not musclemimic's (all off by default):
 * **Newton-Schulz in bfloat16** (``muon_ns_dtype``), as the reference Muon runs it.
 
 Every update also records :attr:`MuscleMimicPPO.policy_stats` (the std per action
-term, the cap, and how far the noise moves the effective action away from the
-clipped mean), which the runner logs under ``Policy/``.
+term, its smallest row and the rows held at the cap or the floor, the cap, and how
+far the noise moves the effective action away from the clipped mean), which the
+runner logs under ``Policy/``.
 """
 
 from __future__ import annotations
@@ -84,6 +85,12 @@ def qpos0_action_bias(env) -> torch.Tensor:
     scale = torch.as_tensor(term.scale, device=env.device).reshape(-1, dim)[0]
     biases.append(((q0 - offset) / scale).clamp(-0.95, 0.95))
   return torch.cat(biases)
+
+
+STD_BOUND_RTOL = 1e-4
+"""A row whose std is within this relative distance of the cap (or the floor) counts
+as held there: the projection sets the log-std to the bound's exactly, up to float
+rounding."""
 
 
 def geometric_schedule(
@@ -249,16 +256,20 @@ class MuscleMimicPPO(PPO):
         param.clamp_(min=to_param(floor))
 
   def _record_policy_stats(self, mean: torch.Tensor) -> None:
-    """Per action term: the mean std, and how far the noise moves the effective
-    action from the clipped mean, ``|E[clip(mu + sigma eps)] - clip(mu)|``
-    (``noise_gap``), with the fraction of means outside the effective range
-    (``mean_outside``), over the batch ``mean`` (B, action_dim)."""
+    """Per action term: the mean std and its smallest row (``std_min``), the
+    fractions of rows the cap and the floor hold (``std_at_cap``, ``std_at_floor``,
+    where they are on), and how far the noise moves the effective action from the
+    clipped mean, ``|E[clip(mu + sigma eps)] - clip(mu)|`` (``noise_gap``), with the
+    fraction of means outside the effective range (``mean_outside``), over the batch
+    ``mean`` (B, action_dim). Stage 2 freezes the human's per-row std at the
+    warm start's, so the rows' spread matters beside their mean."""
     with torch.no_grad():
       std = gaussian_std(self.actor)
       stats: dict[str, float] = {}
       cap = self.std_cap()
       if cap is not None:
         stats["std_cap"] = cap
+      floor = self.std_floor if self.std_floor > 0.0 else None
       if self.action_lo is not None and self.action_hi is not None:
         lo, hi = self.action_lo, self.action_hi
         expected = expected_clipped_gaussian(mean, std, lo, hi)
@@ -266,7 +277,15 @@ class MuscleMimicPPO(PPO):
         gap = (expected - clipped).abs()
         outside = ((mean < lo) | (mean > hi)).float()
         for name, cols in self.action_slices.items():
-          stats[f"std/{name}"] = float(std[cols].mean())
+          rows = std[cols]
+          stats[f"std/{name}"] = float(rows.mean())
+          stats[f"std_min/{name}"] = float(rows.min())
+          if cap is not None:
+            at_cap = rows >= cap * (1.0 - STD_BOUND_RTOL)
+            stats[f"std_at_cap/{name}"] = float(at_cap.float().mean())
+          if floor is not None:
+            at_floor = rows <= floor * (1.0 + STD_BOUND_RTOL)
+            stats[f"std_at_floor/{name}"] = float(at_floor.float().mean())
           stats[f"noise_gap/{name}"] = float(gap[:, cols].mean())
           stats[f"mean_outside/{name}"] = float(outside[:, cols].mean())
       self.policy_stats = stats

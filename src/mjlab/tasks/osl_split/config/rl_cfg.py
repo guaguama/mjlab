@@ -23,6 +23,13 @@ plus what stage 2 adds:
 Iteration counts here are *stage-local*: iteration 0 is stage 2's first update,
 whatever global iteration number it is logged under (stage 2 continues stage 1's
 iteration axis).
+
+The robot's unicycle split tasks train with the robot recipe
+(:func:`apply_unicycle_robot_split_recipe`): round 6's tested MSK stage-2 length and
+cadence as defaults, on the robot stage-1 recipe's inherited settings (8192 envs,
+bfloat16 Newton-Schulz). The tasks that reuse this config on another stage 1 (stage
+1.5, stairs stage 2) build it with ``robot_recipe=False`` and keep the robot's
+settings from before that recipe.
 """
 
 from __future__ import annotations
@@ -47,6 +54,15 @@ from mjlab.tasks.osl_split.rl.ppo import STAGE1_ONLY_KNOBS, check_stage1_knobs
 
 STAGE2_ITERATIONS = 1000
 """Default stage-2 length: short first runs, to see the freeze and the unfreeze."""
+ROBOT_STAGE2_ITERATIONS = 500
+ROBOT_STAGE2_SCHEDULE_ITERATIONS = 600
+"""The robot's unicycle stage 2: 500 iterations on a 600-iteration schedule, round 6's
+tested MSK design (its launch flags). The only compressed stage 2 tested lost pivots
+and tight arcs, and under Muon the movement per iteration is the rate times 128
+minibatches, whatever the batch size."""
+ROBOT_STAGE2_VALIDATION_INTERVAL = 60
+"""Round 6's stage-2 cadence, set explicitly: the validation interval is otherwise
+copied from the robot's stage-1 recipe (125)."""
 SAVE_INTERVAL = 250
 """Stage-local iterations between checkpoints (about 0.7 GB each: the human actor and
 two 24M-parameter critics with their optimizer states)."""
@@ -194,8 +210,9 @@ class SplitPpoCfg(MuscleMimicPpoCfg):
   run extended past it keeps learning."""
   muon_ns_dtype: Literal["float32", "bfloat16"] = "bfloat16"
   """Newton-Schulz precision of all four optimizers, the stage-1 recipe's: bfloat16
-  for the musculoskeletal tasks (learning 7.2 -> 5.6 s per iteration there), float32
-  for the robot ones."""
+  for the musculoskeletal tasks (learning 7.2 -> 5.6 s per iteration there) and the
+  robot's unicycle tasks, float32 for the robot tasks built without the robot recipe
+  (stage 1.5, stairs stage 2)."""
 
   human_critic_lr: float = 1e-4
   """The human critic's peak rate. Its target, the human channel, starts as the
@@ -473,10 +490,29 @@ class SplitRunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 def osl_split_runner_cfg(
-  model: Model, socket: Socket, reward: Reward, experiment_name: str
+  model: Model,
+  socket: Socket,
+  reward: Reward,
+  experiment_name: str,
+  robot_recipe: bool = True,
 ) -> SplitRunnerCfg:
+  """Stage 2's runner settings over the stage-1 unicycle runner's.
+
+  Args:
+    model, socket, reward, experiment_name: As the stage-1 task's.
+    robot_recipe: The robot's unicycle recipe, stage 1's and stage 2's
+      (:func:`apply_unicycle_robot_split_recipe`); False keeps the robot's settings
+      from before it, for the tasks that reuse this config on another stage 1 (stage
+      1.5's FSM, stairs stage 2). The musculoskeletal model's settings are the same
+      either way.
+  """
   base = osl_gait_library_runner_cfg(
-    model, socket, reward, experiment_name, variant="unicycle"
+    model,
+    socket,
+    reward,
+    experiment_name,
+    variant="unicycle",
+    robot_recipe=robot_recipe,
   )
   shared = {
     f.name: getattr(base, f.name)
@@ -521,4 +557,20 @@ def osl_split_runner_cfg(
     osl_start=_stage1_weights(reward),
   )
   cfg.wandb_tags = ("osl_fullbody", model, reward, "unicycle", "split")
+  if model == "robot" and robot_recipe:
+    apply_unicycle_robot_split_recipe(cfg)
   return cfg
+
+
+def apply_unicycle_robot_split_recipe(cfg: SplitRunnerCfg) -> None:
+  """The robot's unicycle stage 2: round 6's length, schedule and cadence. The
+  curriculum (freeze, blend, anneal, rates), the reward ramps
+  (:data:`SPLIT_CLF_ENV_STAGES`) and the OSL actor are MSK's; the env count and the
+  Newton-Schulz precision come from the robot's stage-1 recipe. The command
+  sampling stays the env's: launchers pass stage 1's last phase's sampling flags, as
+  the split env's command must equal stage 1's."""
+  cfg.max_iterations = ROBOT_STAGE2_ITERATIONS
+  cfg.algorithm.schedule_iterations = ROBOT_STAGE2_SCHEDULE_ITERATIONS
+  cfg.validation.interval = ROBOT_STAGE2_VALIDATION_INTERVAL
+  cfg.validation.stress_interval = STRESS_INTERVAL
+  cfg.save_interval = SAVE_INTERVAL

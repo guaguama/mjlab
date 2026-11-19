@@ -237,6 +237,29 @@ Added
   the rewrite of the servos from clamped normalized commands to unclamped radian
   targets, all happen in ``get_spec``. OSL motion commands check that a clip's
   ``fps`` equals the control rate.
+- The robot model's unicycle training recipe as task defaults
+  (``apply_unicycle_robot_recipe``; the four
+  ``Mjlab-Gait-Library-Unicycle-OSL-Fullbody-ROBOT`` tasks): 8192 training envs and
+  2000 iterations (library sampling to model_1499, then a resume to model_1999 with
+  continuous tight-arc sampling), learning rate 4e-4 linear to 4e-5 by update 1500
+  and held, action std 0.2 capped geometrically to 0.07 over updates 200-1500 with a
+  0.03 floor, bfloat16 Newton-Schulz, validation every 125 and stress validation
+  every 250 iterations on the raw mean, checkpoints every 250, and the twist weight
+  0.2 and 2 m drift limit reached through env stages added after the CLF ramps (1 m
+  until update 400, twist 0.06 until 1200). The robot's split tasks default to round
+  6's stage-2 design (500 iterations at schedule 600, validation every 60) and
+  inherit the 8192 envs and bfloat16. Stage 1.5 and stairs stage 2 keep the robot's
+  former runner settings (``osl_split_runner_cfg(..., robot_recipe=False)``); stage
+  1.5's robot env is the split env, so it trains 8192 envs with twist 0.2 and the 2 m
+  drift limit. The musculoskeletal tasks' configurations are unchanged (a test pins
+  every OSL config field by field).
+- Stage-1 ``Policy/`` logs report each action term's smallest per-row std
+  (``std_min/<term>``) and the share of its rows the std cap and floor hold
+  (``std_at_cap/<term>``, ``std_at_floor/<term>``): stage 2 freezes the human's
+  per-row std.
+- The stage-2 warm start records stage 1's command sampling (``sampling`` and
+  ``fwd_arc_regions`` of its last launch) and warns, naming stage 1's flags, when
+  stage 2 samples commands otherwise.
 
 Changed
 ^^^^^^^
@@ -423,6 +446,17 @@ Changed
 - Bumped ``rsl-rl-lib`` from 5.4.2 to 5.5.0. This update removes the ``logger_type``
   attribute of the ``rsl_rl.utils.Logger``, so code that previously checked
   ``logger.logger_type`` must instead check the type of ``logger.writer``.
+
+- The gait-library command shares one loaded library among every command over the
+  same clip files, entity, reference sites, device and control step: a training
+  run's training, validation, stress and video envs hold one copy of the 779-clip
+  unicycle library (516 MB on the training device) instead of four.
+
+- ``osl_split/scripts/two_stage.py`` parses its command line with
+  ``mjlab.TYRO_FLAGS``, as ``train`` does: booleans take a value (``--dry-run True``,
+  ``--wait-for-gpu True``, ``--stage2.skip True``). It refuses ``--model robot``,
+  whose two-phase stage 1 and matching stage-2 sampling are launched with ``train``
+  itself.
 
 Fixed
 ^^^^^

@@ -153,7 +153,14 @@ def test_tasks_are_registered_with_unicycle_stage2_settings() -> None:
     experiment = "osl_fullbody_split_stairs" + suffix.lower().replace("-", "_")
     assert stairs_split_experiment_name(model, socket, reward) == experiment
 
-    expected = osl_split_runner_cfg(model, socket, reward, experiment)
+    # Stairs stage 1 is not the robot's unicycle recipe: the robot keeps its former
+    # stage-2 settings (float32 Newton-Schulz, 1000 iterations).
+    expected = osl_split_runner_cfg(
+      model, socket, reward, experiment, robot_recipe=False
+    )
+    assert expected.algorithm.muon_ns_dtype == (
+      "float32" if model == "robot" else "bfloat16"
+    )
     # Unicycle stage 2 bootstraps; stairs stage 1, whose critics stage 2 copies,
     # does not.
     assert expected.algorithm.bootstrap_time_outs

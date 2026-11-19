@@ -35,8 +35,9 @@ Beyond musclemimic's:
 * a launch whose last iteration is off an evaluation's interval grid (a resumed
   run ending at 5998, say) runs that evaluation once more there, before the final
   save, so the final checkpoint always has its numbers;
-* the algorithm's ``policy_stats`` (std per action term, the std cap, the noise gap)
-  are logged under ``Policy/`` every iteration;
+* the algorithm's ``policy_stats`` (std per action term, its smallest row and the
+  rows held at the cap or floor, the std cap, the noise gap) are logged under
+  ``Policy/`` every iteration;
 * videos play ``video.inference`` (by default the noise-averaged action for muscle
   policies whose median muscle std exceeds 0.3, the raw mean otherwise).
 """

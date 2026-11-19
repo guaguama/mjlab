@@ -600,7 +600,10 @@ def test_split_tasks_are_registered() -> None:
     assert validation.variant == "unicycle"
     assert rl_cfg.algorithm.class_name == "mjlab.tasks.osl_split.rl.ppo:TwoAgentPPO"
     assert rl_cfg.warm_start == WarmStartCfg()
-    assert rl_cfg.max_iterations == STAGE2_ITERATIONS
+    # The robot's unicycle recipe trains round 6's tested 500 (schedule 600).
+    robot = model == "robot"
+    assert rl_cfg.max_iterations == (500 if robot else STAGE2_ITERATIONS)
+    assert rl_cfg.algorithm.schedule_iterations == (600 if robot else 0)
     assert rl_cfg.export_osl_onnx
     stage1 = stage1_channel_weights(reward == "clf")
     assert asdict(rl_cfg.channels.human_start) == stage1["human"]
@@ -2292,6 +2295,40 @@ def test_warm_start_provenance(
   capsys.readouterr()
   runner().warm_start(replace(ws, lineage={**lineage, "reward": "mimic"}))
   assert "The reward switches" in capsys.readouterr().out
+
+
+def test_warm_start_sampling_provenance(
+  tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """Stage 2 is warned when it samples commands otherwise than stage 1's last phase
+  (the robot recipe's phase B samples continuously over tight boxes), with stage 1's
+  flags; the launchers' matching flags are silent."""
+  ws = _write_warm_start(tmp_path / "ws.pt")
+  train = osl_split_env_cfg("msk", "compliant", "clf", "train")
+  motion = train.commands["motion"]
+  assert isinstance(motion, GaitLibraryCommandCfg)
+  tight = (((0.5, 1.5), (0.0, 0.5), 0.5), ((0.6, 1.2), (0.5, 1.5), 0.5))
+  phase_b = {
+    "sampling": "continuous",
+    "fwd_arc_regions": [[list(vx), list(wz), share] for vx, wz, share in tight],
+  }
+
+  def warm_start() -> str:
+    env = _FakeEnv()
+    env.cfg = train
+    runner = _Runner(cast(Any, env), _quick_cfg(None), None, "cpu")
+    stage1 = {**env_cfg_settings(train), **phase_b, "env_stages_in_force": {}}
+    capsys.readouterr()
+    runner.warm_start(replace(ws, lineage=_provenance_lineage(stage1_env=stage1)))
+    return capsys.readouterr().out
+
+  out = warm_start()  # Stage 2 on the code default, library sampling.
+  assert "[WARN] Stage 1's last phase sampled commands continuous" in out
+  assert "stage 2 samples library" in out
+  assert "--env.commands.motion.sampling continuous" in out
+  assert "stage-1 command sampling: continuous, forward-arc boxes" in out
+  motion.sampling, motion.fwd_arc_regions = "continuous", tight
+  assert "last phase sampled" not in warm_start()
 
 
 ##

@@ -919,11 +919,14 @@ def test_stage1_knobs_are_neutral_or_refused() -> None:
   # The recipe's own values never reach the split config.
   assert algorithm["std_cap_start"] == 0.0 and algorithm["init_std_terms"] == {}
   assert algorithm["lr_final_ratio"] == 0.1  # Stage 2's schedule floor.
-  # Newton-Schulz runs at the stage-1 recipe's precision: bfloat16 for MSK, the
-  # robot's float32.
+  # Newton-Schulz runs at the stage-1 recipe's precision: bfloat16 for MSK and the
+  # robot's unicycle recipe; float32 for the robot without that recipe (stage 1.5,
+  # stairs stage 2).
   assert algorithm["muon_ns_dtype"] == "bfloat16"
   robot = osl_split_runner_cfg("robot", "compliant", "clf", "test").algorithm
-  assert robot.muon_ns_dtype == "float32"
+  assert robot.muon_ns_dtype == "bfloat16"
+  former = osl_split_runner_cfg("robot", "compliant", "clf", "test", robot_recipe=False)
+  assert former.algorithm.muon_ns_dtype == "float32"
   _alg()  # The defaults build.
   # On the command line (tyro builds the config) before the env is built...
   with pytest.raises(ValueError, match="std_floor = 0.03"):

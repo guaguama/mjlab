@@ -27,8 +27,12 @@ import yaml
 from tensordict import TensorDict
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket, TouchSites
-from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
+from mjlab.tasks.osl_gait_library.config.env_cfgs import (
+  UNICYCLE_FWD_ARC_REGIONS,
+  osl_gait_library_env_cfg,
+)
 from mjlab.tasks.osl_gait_library.config.rl_cfg import osl_gait_library_runner_cfg
+from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward, _actions
 from mjlab.tasks.osl_mimic.config.rl_cfg import CLF_ENV_STAGES, MuscleMimicPpoCfg
 from mjlab.tasks.osl_mimic.mdp.rewards import (
@@ -67,6 +71,7 @@ from mjlab.tasks.osl_split.rl.warmstart import (
   resolve_stage1_checkpoint,
   reward_mismatches,
   reward_settings,
+  sampling_mismatch,
   stage1_env_settings,
   stage1_learning_rate,
   stage1_std_cap,
@@ -367,19 +372,22 @@ def test_lineage(tmp_path: Path, model: Model) -> None:
   final = algorithm.lr_final_ratio
   fraction = 1.0 - 12 / algorithm.lr_schedule_updates
   assert lineage["stage1_lr"] == pytest.approx(4e-4 * (final + (1 - final) * fraction))
-  assert lineage["stage1_std_cap"] == (1.0 if model == "msk" else None)
-  # The CLF ramps are in force at update 12, and on the MSK model the recipe's.
+  # Each model's recipe caps the std from its first update (MSK's at 1.0, the
+  # robot's at 0.2), and at update 12 the CLF ramps and the recipe's own stages are
+  # in force (the same staged values on both models).
+  assert lineage["stage1_std_cap"] == (1.0 if model == "msk" else 0.2)
   stages = {path: 0.0 for _, path, _ in CLF_ENV_STAGES}
-  if model == "msk":
-    stages.update(
-      {"terminations.root_deviation.threshold": 1.0, "rewards.twist.weight": 0.06}
-    )
+  stages.update(
+    {"terminations.root_deviation.threshold": 1.0, "rewards.twist.weight": 0.06}
+  )
   assert lineage["stage1_env"] == {
     **reward_settings(None, None),  # This env.yaml records no reward.
     "clf_pen_scale": 0.0,
     "reg_scale": 0.0,
     "twist_weight": stages.get("rewards.twist.weight"),
     "root_deviation": stages.get("terminations.root_deviation.threshold"),
+    "sampling": None,  # Nor the command's sampling.
+    "fwd_arc_regions": None,
     "env_stages_in_force": stages,
   }
   assert lineage["stage1_planned_last_iteration"] == agent.max_iterations - 1
@@ -817,11 +825,14 @@ def test_stage1_env_settings(tmp_path: Path) -> None:
     "reg_servo_saturation": 0.0,
     "reg_joint_limit_joints": list(LIMIT_JOINTS),
   }
+  regions = [list(map(list, box[:2])) + [box[2]] for box in UNICYCLE_FWD_ARC_REGIONS]
+  sampling = {"sampling": "library", "fwd_arc_regions": regions}
   settings = stage1_env_settings(tmp_path, agent, num_updates_done=2000)
   assert settings == {
     **reward,
     "twist_weight": 0.06,  # Staged until update 3000.
     "root_deviation": 2.0,  # The env config's own from update 1500.
+    **sampling,
     "env_stages_in_force": {"rewards.twist.weight": 0.06},
   }
   done = stage1_env_settings(tmp_path, agent, num_updates_done=4500)
@@ -835,6 +846,7 @@ def test_stage1_env_settings(tmp_path: Path) -> None:
     **reward,
     "twist_weight": 0.2,
     "root_deviation": 2.0,
+    **sampling,
   }
   validation = osl_gait_library_env_cfg("msk", "compliant", "mimic", "validation")
   assert env_cfg_settings(validation)["clf_pen_w"] is None
@@ -845,6 +857,51 @@ def test_stage1_env_settings(tmp_path: Path) -> None:
     "terminations.root_deviation.threshold": 1.0,
     "rewards.twist.weight": 0.06,
   }
+
+
+TIGHT = (((0.5, 1.5), (0.0, 0.5), 0.5), ((0.6, 1.2), (0.5, 1.5), 0.5))
+TIGHT_FLAG = "(((0.5,1.5),(0.0,0.5),0.5),((0.6,1.2),(0.5,1.5),0.5))"
+
+
+def test_stage1_records_its_last_phases_sampling(tmp_path: Path) -> None:
+  """A run's env.yaml is its own launch's, so a run resumed with continuous
+  sampling (the robot recipe's phase B) records that phase's sampler and boxes;
+  stage 2 is warned when it samples otherwise, with stage 1's flags."""
+  env_cfg = osl_gait_library_env_cfg("robot", "compliant", "clf", "train", "unicycle")
+  motion = env_cfg.commands["motion"]
+  assert isinstance(motion, GaitLibraryCommandCfg)
+  motion.sampling = "continuous"
+  motion.fwd_arc_regions = TIGHT
+  dump_yaml(tmp_path / "params" / "env.yaml", asdict(env_cfg))
+  stage1 = stage1_env_settings(tmp_path, {}, num_updates_done=2000)
+  assert stage1 is not None
+  tight = [[[0.5, 1.5], [0.0, 0.5], 0.5], [[0.6, 1.2], [0.5, 1.5], 0.5]]
+  assert (stage1["sampling"], stage1["fwd_arc_regions"]) == ("continuous", tight)
+  live = env_cfg_settings(env_cfg)
+  assert (live["sampling"], live["fwd_arc_regions"]) == ("continuous", tight)
+  assert sampling_mismatch(stage1, live) is None
+  line = f"  stage-1 command sampling: continuous, forward-arc boxes {TIGHT_FLAG}"
+  assert line in provenance_lines({"stage1_env": stage1})
+
+  # Stage 2 on the code default (library sampling): warned, with stage 1's flags.
+  default = env_cfg_settings(
+    osl_gait_library_env_cfg("robot", "compliant", "clf", "train", "unicycle")
+  )
+  message = sampling_mismatch(stage1, default)
+  assert message is not None and "stage 2 samples library" in message
+  flags = (
+    "--env.commands.motion.sampling continuous --env.commands.motion.fwd-arc-regions "
+    f'"{TIGHT_FLAG}"'
+  )
+  assert flags in message
+  # Continuous over other boxes: warned. The boxes do not matter to the library
+  # sampler, and a side that records no sampling is not compared.
+  wide = {**stage1, "fwd_arc_regions": tight[:1]}
+  assert sampling_mismatch(stage1, wide) is not None
+  library = {"sampling": "library", "fwd_arc_regions": tight}
+  assert sampling_mismatch(library, {**library, "fwd_arc_regions": tight[:1]}) is None
+  assert sampling_mismatch({"sampling": None}, default) is None
+  assert sampling_mismatch(stage1, {}) is None
 
 
 ROUND6_CLF = {

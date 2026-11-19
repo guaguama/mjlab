@@ -1,6 +1,7 @@
 """Runner settings: unicycle stage 2's, with stairs stage 1's episode handling.
 
-Everything is ``osl_split_runner_cfg(model, socket, reward, experiment_name)``: the
+Everything is ``osl_split_runner_cfg(model, socket, reward, experiment_name,
+robot_recipe=False)`` (the robot's unicycle recipe is not this stage 1's): the
 OSL actor's network (256 x 3, LayerNorm, swish, initial std 0.2 with a 0.05 floor),
 the learning rates and their schedule, the human's freeze, the critics' warm-up, the
 blend, the reward channels and their anneal, the run length and the save interval.
@@ -33,7 +34,9 @@ VIDEO_STEPS = 800
 def osl_split_stairs_runner_cfg(
   model: Model, socket: Socket, reward: Reward, experiment_name: str
 ) -> SplitRunnerCfg:
-  cfg = osl_split_runner_cfg(model, socket, reward, experiment_name)
+  # Stairs stage 1 is not the robot's unicycle recipe: keep the robot's settings from
+  # before it (float32 Newton-Schulz included).
+  cfg = osl_split_runner_cfg(model, socket, reward, experiment_name, robot_recipe=False)
   stage1 = osl_stairs_runner_cfg(model, socket, reward, experiment_name)
   assert isinstance(stage1.algorithm, MuscleMimicPpoCfg)
   cfg.algorithm.bootstrap_time_outs = stage1.algorithm.bootstrap_time_outs

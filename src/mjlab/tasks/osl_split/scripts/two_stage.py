@@ -27,13 +27,21 @@ W&B runs and ``play``) and any step can be redone on its own:
    one directory as one run, and stage 2's steps start after stage 1's, so every
    curve continues across the handover. The links follow stage 2 while it runs.
 
-The tags are ``-ROBOT`` or ``-MSK``, then ``-CLF`` and ``-Compliant``. Model and socket are given once,
-for both stages, because a warm-started human actor can change neither (its inputs
-would change; the stage-2 runner refuses it too). Only the reward may switch
+The tags are ``-MSK``, then ``-CLF`` and ``-Compliant``. Model and socket are given
+once, for both stages, because a warm-started human actor can change neither (its
+inputs would change; the stage-2 runner refuses it too). Only the reward may switch
 (``--stage2.reward``; empty keeps stage 1's), and the stage-2 critics then start
 fresh. With ``--stage1.run-dir``, the run's model, socket and reward come from its
 ``params/agent.yaml``: a model or socket other than ``--model``/``--socket`` is
 refused, and stage 2's default reward is the run's own, never ``--stage1.reward``.
+
+**The musculoskeletal model only.** ``--model robot`` is refused: the robot recipe
+trains stage 1 in two phases (library sampling to model_1499, then a resume with
+continuous tight-arc sampling to model_1999) and stage 2 from its last phase with
+that phase's sampling flags, which one ``train`` call per stage cannot express. Its
+stage-1 schedule is the task's own (``apply_unicycle_robot_recipe``), which this
+driver's ``--agent.algorithm.lr-schedule-updates`` would replace. Launch the robot
+stages with ``train`` itself (round 7's robot launchers do).
 
 Why processes rather than one Python process calling ``launch_training`` twice:
 each stage then starts on a clean GPU (``ManagerBasedRlEnv.close`` releases only the
@@ -46,7 +54,7 @@ under a running stage. This module imports only the standard library and tyro.
 stage 1 still running elsewhere is split only once it has finished; and again just
 before stage 2, the driver asks ``nvidia-smi --query-compute-apps=pid,process_name,
 used_memory --format=csv,noheader`` whether another process holds a GPU. If one
-does, it exits with a message, or, with ``--wait-for-gpu``, checks again every
+does, it exits with a message, or, with ``--wait-for-gpu True``, checks again every
 ``--gpu-poll-s`` seconds. Any GPU counts, so a multi-GPU machine is guarded
 conservatively. Without ``nvidia-smi`` it warns and goes on.
 
@@ -66,9 +74,12 @@ on the installed wandb.
 
 **Output.** Everything goes to the console and to
 ``<log-root>/pipelines/<name>.log``. Each run directory is read from ``train``'s
-``[INFO] Logging experiment in directory: <path>`` line. ``--dry-run`` prints every
-command and runs nothing. Extra ``train`` arguments (``--stage1.extra-args``,
+``[INFO] Logging experiment in directory: <path>`` line. ``--dry-run True`` prints
+every command and runs nothing. Extra ``train`` arguments (``--stage1.extra-args``,
 ``--stage2.extra-args``) go last, so they win over the driver's own flags.
+
+**Command line.** ``train``'s conventions (``mjlab.TYRO_FLAGS``): a boolean takes a
+value (``--wait-for-gpu True``, ``--stage2.skip True``).
 
 **Stopping.** Each step runs in a process group (and session) of its own, so a
 signal reaches it only through the driver, whatever sent it: Ctrl-C, ``kill``, a
@@ -98,7 +109,7 @@ its ``params/agent.yaml`` plans (``max_iterations``, counted from ``N`` in a
 resumed run; see :func:`planned_last_iteration`). A checkpoint short of it means
 stage 1 crashed, was stopped or is still training: the driver refuses to split it
 unless ``--stage1.checkpoint`` names the checkpoint to use, and with
-``--stage2.skip`` it only warns.
+``--stage2.skip True`` it only warns.
 
 Run it from the repository root, as a file, e.g.::
 
@@ -108,7 +119,7 @@ Run it from the repository root, as a file, e.g.::
 or start from an existing stage-1 run, waiting for the GPU if it is busy::
 
   uv run --no-sync python src/mjlab/tasks/osl_split/scripts/two_stage.py \\
-    --name split_v1 --library-dir <folder> --wait-for-gpu \\
+    --name split_v1 --library-dir <folder> --wait-for-gpu True \\
     --stage1.run-dir logs/rsl_rl/osl_fullbody_unicycle_msk_clf_compliant/<run>
 
 As a file it imports only the standard library and tyro. Not as a module (``-m``):
@@ -155,6 +166,21 @@ TOUCH_SITES_KEY = "osl_touch_sites"
 """Mirror of ``osl_mimic.touch_sites.ENV_FIELD``: the lineage's key."""
 TOUCH_SITES_FLAG = "--env.osl-touch-sites"
 """Mirror of ``osl_mimic.touch_sites.CLI_FLAG``."""
+
+TYRO_FLAGS = (
+  tyro.conf.AvoidSubcommands,
+  tyro.conf.FlagConversionOff,
+  tyro.conf.UsePythonSyntaxForLiteralCollections,
+)
+"""Mirror of ``mjlab.TYRO_FLAGS``: ``train``'s command-line conventions."""
+ROBOT_REFUSAL = (
+  "--model robot: this driver runs the musculoskeletal model's recipe. The robot "
+  "recipe trains stage 1 in two phases (library sampling to model_1499, then a "
+  "resume to model_1999 with continuous tight-arc sampling) and stage 2 from its "
+  "last phase with that phase's sampling flags: launch both stages with train "
+  "itself, as the robot launchers do (logs/handover/round7_planning/robot/ in the "
+  "main checkout: s1_robot_chain.sh, s2_robot.sh)."
+)
 
 STAGE1_TASK = "Mjlab-Gait-Library-Unicycle-OSL-Fullbody"
 STAGE2_TASK = "Mjlab-Split-Unicycle-OSL-Fullbody"
@@ -230,6 +256,7 @@ class TwoStageCfg:
   """Names the runs (``<name>_stage1``/``_stage2``), their W&B group and the
   pipeline's own files in ``<log-root>/pipelines/``."""
   model: Model = "msk"
+  """``"msk"``; ``"robot"`` is refused (the module docstring says why)."""
   socket: Socket = "compliant"
   library_dir: str = ""
   """The clipper unicycle library folder, for both stages."""
@@ -582,7 +609,7 @@ def ensure_gpu_free(
     holders = "; ".join(str(p) for p in busy)
     if not wait:
       raise GpuBusyError(
-        f"The GPU is in use by {holders}. Let it finish, or pass --wait-for-gpu."
+        f"The GPU is in use by {holders}. Let it finish, or pass --wait-for-gpu True."
       )
     pids = {p.pid for p in busy}
     if pids != reported:
@@ -879,6 +906,8 @@ class PipelinePaths:
 
 def check_cfg(cfg: TwoStageCfg) -> None:
   """Everything that can be checked before anything runs."""
+  if cfg.model == "robot":
+    raise PipelineError(ROBOT_REFUSAL)
   if not _NAME.fullmatch(cfg.name):
     raise PipelineError(
       f"--name {cfg.name!r}: use letters, digits, '.', '_' and '-', starting with "
@@ -1173,7 +1202,7 @@ def run_pipeline(cfg: TwoStageCfg, python: str = sys.executable) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
   """The command line: ``argv`` defaults to ``sys.argv[1:]``."""
-  cfg = tyro.cli(TwoStageCfg, args=argv, prog="two_stage")
+  cfg = tyro.cli(TwoStageCfg, args=argv, prog="two_stage", config=TYRO_FLAGS)
   return run_pipeline(cfg)
 
 
