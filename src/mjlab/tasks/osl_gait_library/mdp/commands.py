@@ -71,7 +71,7 @@ from __future__ import annotations
 import math
 import weakref
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -333,6 +333,98 @@ class GaitLibraryCommandCfg(CommandTermCfg):
 
   def build(self, env: ManagerBasedRlEnv) -> GaitLibraryCommand:
     return GaitLibraryCommand(self, env)
+
+
+SAMPLER_SETTINGS = (
+  "sampling",
+  "rel_static_envs",
+  "rel_turn_envs",
+  "rel_back_envs",
+  "vx_fwd_range",
+  "vx_bck_range",
+  "arc_wz_range",
+  "wz_range",
+  "fwd_arc_regions",
+  "bck_arc_regions",
+  "max_snap_error",
+  "twist_metric_weights",
+)
+"""The sampler: the :class:`GaitLibraryCommandCfg` fields that say which twists a
+draw commands (the mode split, the ranges and the boxes), which clip a continuous
+draw snaps to (``twist_metric_weights``, the metric of the snap, of the load check
+and of play's ``--twist``) and what the load check asks of the library for them. A
+run sets them on its training env (a forward-only library needs ``rel_turn_envs``
+and ``rel_back_envs`` at 0), so every other command config built for that run takes
+them from it (:func:`apply_sampler`).
+
+Not among them: ``max_twist``, a cap a curriculum moves during training (a rebuilt
+command draws from the whole sampler); the reference settings, which shape the
+observation (the exporter's ``COMMAND_SETTINGS``, which also holds
+``twist_metric_weights``: a bundle records the metric); and what each mode sets
+for itself (``fixed_clips``, ``resampling_time_range``, ``start_yaw_range``,
+``fixed_twist``)."""
+
+
+def _as_tuples(value: Any) -> Any:
+  """Lists as tuples, recursively: a saved ``env.yaml`` reads tuples back as
+  lists."""
+  if isinstance(value, (list, tuple)):
+    return tuple(_as_tuples(v) for v in value)
+  return value
+
+
+def apply_sampler(
+  cfg: GaitLibraryCommandCfg, source: GaitLibraryCommandCfg | Mapping[str, Any]
+) -> dict[str, tuple[Any, Any]]:
+  """Give ``cfg`` the sampler of ``source`` (:data:`SAMPLER_SETTINGS`), in place.
+
+  A command config rebuilt from a task carries the task's default sampler, which a
+  run may have changed: the full unicycle split draws pivots and backward arcs, and
+  a command over a forward-only library refuses to load with it. Everything that
+  rebuilds a run's command (the exporters, ``evaluate``, play, and the runners'
+  validation and video envs) calls this with the run's own settings.
+
+  Args:
+    cfg: The rebuilt command config.
+    source: The run's command: its live config, or the ``commands.motion`` entry
+      of its ``params/env.yaml`` read as plain data. A setting the entry lacks (a
+      run older than the field) keeps ``cfg``'s value.
+
+  Returns:
+    The settings that changed, as ``{name: (before, after)}``.
+  """
+  changed: dict[str, tuple[Any, Any]] = {}
+  for key in SAMPLER_SETTINGS:
+    if isinstance(source, GaitLibraryCommandCfg):
+      value = getattr(source, key)
+    elif key in source:
+      value = _as_tuples(source[key])
+    else:
+      continue
+    before = getattr(cfg, key)
+    if before != value:
+      changed[key] = (before, value)
+    setattr(cfg, key, value)
+  return changed
+
+
+def describe_sampler(cfg: GaitLibraryCommandCfg | Mapping[str, Any]) -> str:
+  """One line on a command's sampler, for logs: the kind of draw, the mode split
+  and, in continuous mode, the forward boxes."""
+
+  def get(key: str) -> Any:
+    if isinstance(cfg, GaitLibraryCommandCfg):
+      return getattr(cfg, key)
+    return cfg.get(key)
+
+  text = (
+    f"{get('sampling')} draws, idle {get('rel_static_envs'):g}, pivots "
+    f"{get('rel_turn_envs'):g}, backward {get('rel_back_envs'):g} of the arcs"
+  )
+  if get("sampling") == "continuous":
+    boxes = _as_tuples(get("fwd_arc_regions")) or "vx_fwd_range x arc_wz_range"
+    text += f", forward boxes {boxes}"
+  return text
 
 
 def span_normalized_weights(

@@ -498,10 +498,31 @@ Changed
   ``--wait-for-gpu True``, ``--stage2.skip True``). It refuses ``--model robot``,
   whose two-phase stage 1 and matching stage-2 sampling are launched with ``train``
   itself.
+- ``python -m mjlab.tasks.osl_gait_library.evaluate`` draws its stress pass from the
+  twist sampler of the checkpoint's own run (the ``commands.motion`` entry of its
+  ``params/env.yaml``; its ``blend_time_s`` too), as the in-training stress pass
+  does. It drew from the task's default sampler before, so its stress numbers for a
+  run trained with another sampler (continuous draws over forward boxes, a
+  forward-only library) change and compare only with numbers taken since.
+  Checkpoint videos and ``play`` draw their twists from the run's sampler too.
 
 Fixed
 ^^^^^
 
+- A gait-library run on a library without pivots or backward arcs (trained with
+  ``--env.commands.motion.rel-turn-envs 0 --env.commands.motion.rel-back-envs 0``)
+  now exports, evaluates, plays and records checkpoint videos. Every command rebuilt
+  for a run takes the run's twist sampler through one helper
+  (``osl_gait_library.mdp.apply_sampler``: ``sampling``, the mode fractions, the
+  ranges and boxes, ``max_snap_error``, ``twist_metric_weights``): the stage-1,
+  stage-2 and stage-1.5 exporters and ``evaluate`` read it from
+  ``params/env.yaml``, ``play`` from the checkpoint's run, and the runners'
+  validation and video envs from the training env. They were rebuilt with the
+  task's default sampler before and refused such a library ("the gait library has
+  no pivot clip"). Bundles of existing runs do not change: nothing in a bundle
+  depends on the sampler.
+- ``check_motion_fps`` names the right clipper flag for a gait library at another
+  frame rate (``--fps``; ``--output-fps`` is the single-clip converter's).
 - The gait-library reference serves the relative site velocity ``rvel`` at the
   anchor's heading. It was computed once at each clip's own heading and served
   unturned, while the positions and other velocities turned with the anchor, so a

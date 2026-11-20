@@ -72,7 +72,7 @@ from mjlab.tasks.osl_fsm.config.env_cfgs import (
 from mjlab.tasks.osl_fsm.config.rl_cfg import check_fsm_runner_cfg
 from mjlab.tasks.osl_fsm.mdp import OslFsmActionCfg
 from mjlab.tasks.osl_gait_library.config.dr import nominal_plant
-from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
+from mjlab.tasks.osl_gait_library.rl.runner import follow_training_command
 from mjlab.tasks.osl_mimic.rl.runner import EvalPurpose, eval_mode
 from mjlab.tasks.osl_mimic.touch_sites import load_checkpoint
 from mjlab.tasks.osl_split.rl.layout import OSL_ACTION_TERM
@@ -171,7 +171,7 @@ class FsmSplitRunner(SplitOnPolicyRunner):
     ``osl_motors`` term (the controller choice and the clip too; nothing in it is
     mode-specific), except that their episodes start in early stance
     (:data:`EVAL_INITIAL_STATE`, see the module docstring). They also take the
-    training env's motion library and its settings
+    training env's motion library and command sampler and its settings
     (:meth:`_inherit_training_settings`: the simulation, the observation groups, the
     clean ``osl`` group among them, every shared reward term's weight and params,
     the touch sites). The task's OSL motor delay is zero in every mode.
@@ -198,11 +198,7 @@ class FsmSplitRunner(SplitOnPolicyRunner):
     sync_osl_fsm(cfg)  # The copied term takes the evaluation's initial state.
     if purpose == "video":
       nominal_plant(cfg)
-    train_motion = train.commands["motion"]
-    motion = cfg.commands["motion"]
-    assert isinstance(train_motion, GaitLibraryCommandCfg)
-    assert isinstance(motion, GaitLibraryCommandCfg)
-    motion.library_dir = train_motion.library_dir
+    follow_training_command(cfg, train)
     self._inherit_training_settings(cfg)
     return cfg
 

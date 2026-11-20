@@ -23,7 +23,10 @@ from mjlab.tasks.osl_gait_library.mdp import (
   TIGHT_ARC_WZ,
   GaitLibraryCommand,
   GaitLibraryCommandCfg,
+  apply_sampler,
+  describe_sampler,
 )
+from mjlab.tasks.osl_mimic.reward_settings import read_params_yaml
 from mjlab.tasks.osl_mimic.rl.runner import (
   EvalPurpose,
   OslMimicOnPolicyRunner,
@@ -44,6 +47,41 @@ def slow_clips(twists: torch.Tensor) -> torch.Tensor:
   return (vx > eps) & (vx <= SLOW_VX + eps) & (wz.abs() <= TIGHT_ARC_WZ + eps)
 
 
+def follow_training_command(
+  cfg: ManagerBasedRlEnvCfg, train: ManagerBasedRlEnvCfg
+) -> None:
+  """Give an evaluation config rebuilt from the task the training env's gait library
+  and its command sampler (:func:`~mjlab.tasks.osl_gait_library.mdp.apply_sampler`),
+  in place: a run on a forward-only library sets its pivot and backward fractions to
+  0, and a command rebuilt with the task's default split would refuse that library.
+  Validation plays fixed clips and never draws; it takes the sampler all the same,
+  so that every command of a run loads under the same check."""
+  train_motion = train.commands["motion"]
+  motion = cfg.commands["motion"]
+  assert isinstance(train_motion, GaitLibraryCommandCfg)
+  assert isinstance(motion, GaitLibraryCommandCfg)
+  motion.library_dir = train_motion.library_dir
+  apply_sampler(motion, train_motion)
+
+
+def configure_sampler_for_checkpoint(
+  env_cfg: ManagerBasedRlEnvCfg, checkpoint: str | Path
+) -> None:
+  """Give ``env_cfg``'s gait-library command the sampler ``checkpoint``'s run trained
+  with, from the run's ``params/env.yaml``, in place, and say what changed. A config
+  without a gait-library command, or a run whose ``params/`` is not beside the
+  checkpoint, keeps the task's sampler."""
+  motion = env_cfg.commands.get("motion")
+  if not isinstance(motion, GaitLibraryCommandCfg):
+    return
+  saved = read_params_yaml(Path(checkpoint).parent / "params" / "env.yaml")
+  saved_motion = ((saved or {}).get("commands") or {}).get("motion")
+  if not isinstance(saved_motion, dict):
+    return
+  if apply_sampler(motion, saved_motion):
+    print(f"[INFO] Twist sampler as the run's: {describe_sampler(motion)}.")
+
+
 class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
   validation_group_keys = (
     "err_site_abs",
@@ -55,9 +93,10 @@ class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
   )
 
   def _eval_env_cfg(self, purpose: EvalPurpose) -> ManagerBasedRlEnvCfg:
-    """The task's validation mode; for videos its play mode (twists drawn from the
-    library, the reference ghost) on validation's nominal plant; both with the
-    training env's library and its command-line settings (simulation, rewards; see
+    """The task's validation mode; for videos its play mode (twists drawn as in
+    training, the reference ghost) on validation's nominal plant; both with the
+    training env's library and command sampler (:func:`follow_training_command`)
+    and its command-line settings (simulation, rewards; see
     ``_inherit_training_settings``). Stress validation plays the training config
     itself (random switches and headings, physical draws, pushes, random delays)."""
     # Local import: config imports this runner to register the tasks.
@@ -74,13 +113,20 @@ class GaitLibraryOnPolicyRunner(OslMimicOnPolicyRunner):
     )
     if purpose == "video" and variant == "unicycle":
       nominal_plant(cfg)
-    train_motion = self.env.unwrapped.cfg.commands["motion"]
-    motion = cfg.commands["motion"]
-    assert isinstance(train_motion, GaitLibraryCommandCfg)
-    assert isinstance(motion, GaitLibraryCommandCfg)
-    motion.library_dir = train_motion.library_dir
+    follow_training_command(cfg, self.env.unwrapped.cfg)
     self._inherit_training_settings(cfg)
     return cfg
+
+  @classmethod
+  def configure_env_for_checkpoint(
+    cls, env_cfg: ManagerBasedRlEnvCfg, checkpoint: str | Path
+  ) -> None:
+    """The imitation runner's (the OSL touch sites), then the twist sampler the
+    checkpoint's run trained with (:func:`configure_sampler_for_checkpoint`):
+    ``play`` takes no ``--env`` overrides, and the task's default split does not
+    load on a forward-only library."""
+    super().configure_env_for_checkpoint(env_cfg, checkpoint)
+    configure_sampler_for_checkpoint(env_cfg, checkpoint)
 
   def _validation_num_envs(self) -> int:
     """One env per clip unless set."""

@@ -19,7 +19,8 @@ socket, reward and variant; the task's config is rebuilt from code, with the OSL
 touch sites the checkpoint was trained with (its ``osl_touch_sites`` key, else its
 run's ``params/env.yaml`` field, else ``original``), and checked against the run's
 ``params/env.yaml`` (touch sites, simulation, decimation, observation terms, action
-maps, actuator delays), and the reference settings are taken from the run.
+maps, actuator delays), and the reference settings and the command's twist sampler
+are taken from the run (a forward-only library exports as it trained).
 No Warp simulation or GPU is involved::
 
   uv run --no-sync python -m mjlab.tasks.osl_gait_library.export \\
@@ -80,7 +81,7 @@ from mjlab.tasks.osl_mimic.touch_sites import (
 )
 
 from .config.env_cfgs import Variant, osl_gait_library_env_cfg
-from .mdp import GaitLibraryCommand, GaitLibraryCommandCfg
+from .mdp import GaitLibraryCommand, GaitLibraryCommandCfg, apply_sampler
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnvCfg
@@ -369,8 +370,10 @@ def compile_task(
   solver_iterations: int | None = None,
   ls_solver_iterations: int | None = None,
 ) -> tuple[SimpleNamespace, GaitLibraryCommand, dict[str, BaseAction], dict]:
-  """Compile a gait-library task config on CPU: the run's reference settings and
-  library, the deployment solver caps, the scene, the command and the actions.
+  """Compile a gait-library task config on CPU: the run's reference settings,
+  command sampler (:func:`~.mdp.apply_sampler`: nothing in a bundle depends on it,
+  but the command loads its library under it) and library, the deployment solver
+  caps, the scene, the command and the actions.
 
   ``cfg`` is edited in place (its command settings and solver caps). Returns the
   CPU env namespace, the command, the action terms in action-manager order and
@@ -388,6 +391,9 @@ def compile_task(
   for key in COMMAND_SETTINGS:
     value = saved_motion[key]
     setattr(command_cfg, key, tuple(value) if isinstance(value, list) else value)
+  # The run's sampler: the command checks its library against it when it loads, and
+  # the task's default split refuses a library without pivots or backward arcs.
+  apply_sampler(command_cfg, saved_motion)
   folder = Path(library or saved_motion["library_dir"]).expanduser()
   if not folder.is_dir() or not any(folder.glob("*.npz")):
     raise ValueError(

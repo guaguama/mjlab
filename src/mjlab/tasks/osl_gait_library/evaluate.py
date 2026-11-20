@@ -23,7 +23,14 @@ and the runner's passes run once per inference mode:
   per-family metrics (the ``slow`` group included);
 * stress validation (``Stress*/``): each env's first episode of the training
   distribution (random clips and switches, physical draws, pushes, random delays),
-  with the same failure check.
+  with the same failure check. Its twists come from the run's own sampler (the
+  ``commands.motion`` entry of ``params/env.yaml``: library or continuous draws, the
+  mode split, the boxes, the snap metric) and its clip switches blend over the
+  run's ``blend_time_s``, as in the in-training stress pass. Until 2026-11-20 this
+  script drew from the task's default sampler instead (library draws in the full
+  unicycle split), so its stress numbers for a run trained with another sampler (a
+  chain's continuous phase B, a forward-only library) changed on that date and
+  compare only with numbers taken since.
 
 Results print as one JSON object; nothing is logged to TensorBoard or W&B.
 
@@ -118,7 +125,11 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
     LIBRARY_ENV_VAR,
     UNICYCLE_LIBRARY_ENV_VAR,
   )
-  from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
+  from mjlab.tasks.osl_gait_library.mdp import (
+    GaitLibraryCommandCfg,
+    apply_sampler,
+    describe_sampler,
+  )
   from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
   from mjlab.tasks.osl_mimic.rl.runner import configure_networks_for_checkpoint
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
@@ -164,6 +175,13 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
   motion = env_cfg.commands["motion"]
   assert isinstance(motion, GaitLibraryCommandCfg)
   motion.library_dir = str(library)
+  # The run's own sampler: the stress pass draws from it, and every env's command
+  # loads the library under it. Its blend time too: the stress pass switches clips.
+  saved_motion = (saved.get("commands") or {}).get("motion") or {}
+  apply_sampler(motion, saved_motion)
+  if "blend_time_s" in saved_motion:
+    motion.blend_time_s = float(saved_motion["blend_time_s"])
+  print(f"[INFO] Twist sampler: {describe_sampler(motion)} (the run's env.yaml).")
   for issue in config_mismatches(env_cfg, saved):
     print(f"[WARN] Differs from the run's env.yaml: {issue}", file=sys.stderr)
   env_cfg.scene.num_envs = 2  # The runner needs a training env; the evals own theirs.

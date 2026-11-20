@@ -110,8 +110,11 @@ from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import TendonEffortAction
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.osl_gait_library.config.dr import nominal_plant
-from mjlab.tasks.osl_gait_library.mdp import TIGHT_ARC_WZ, GaitLibraryCommandCfg
-from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
+from mjlab.tasks.osl_gait_library.mdp import TIGHT_ARC_WZ
+from mjlab.tasks.osl_gait_library.rl.runner import (
+  GaitLibraryOnPolicyRunner,
+  follow_training_command,
+)
 from mjlab.tasks.osl_mimic.reward_settings import CHECKPOINT_KEY as REWARD_KEY
 from mjlab.tasks.osl_mimic.reward_settings import reward_record
 from mjlab.tasks.osl_mimic.rl.expected import auto_inference
@@ -1010,6 +1013,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     and training's numpy, Python and warp generators would be reset mid-run).
     Validation is the task's validation mode, and a video its play mode on
     validation's nominal plant, each with the training run's motion library and
+    command sampler (stage 1's ``follow_training_command``) and
     its settings (:meth:`_inherit_training_settings`: the simulation, the
     observation groups with their corruption off, and every shared reward term's
     weight and params, the channels' settings included), then the training OSL
@@ -1026,11 +1030,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     cfg = osl_split_env_cfg(v["model"], v["socket"], v["reward"], eval_mode(purpose))
     if purpose == "video":
       nominal_plant(cfg)
-    train_motion = train.commands["motion"]
-    motion = cfg.commands["motion"]
-    assert isinstance(train_motion, GaitLibraryCommandCfg)
-    assert isinstance(motion, GaitLibraryCommandCfg)
-    motion.library_dir = train_motion.library_dir
+    follow_training_command(cfg, train)
     self._inherit_training_settings(cfg)
     train_osl = train.observations[OSL_OBS_GROUP]
     cfg.observations[OSL_OBS_GROUP] = osl_validation_group(

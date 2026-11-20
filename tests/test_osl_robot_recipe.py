@@ -492,6 +492,48 @@ def test_evaluation_builds_the_networks_of_the_checkpoints_run(
   assert agent["actor"]["hidden_dims"] == agent["critic"]["hidden_dims"] == HIDDEN_DIMS
 
 
+def test_evaluation_gives_its_envs_the_runs_sampler(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """The gait-library evaluation builds its training env (which the stress pass
+  copies, and whose command the validation env follows) with the twist sampler of
+  the checkpoint's run, read from its params/env.yaml: a run on a forward-only
+  library, its pivot and backward fractions at 0, is evaluated as it trained."""
+  task = STAGE1 + "-CLF-Compliant"
+  checkpoint = _old_robot_run(tmp_path, task)
+  saved = load_env_cfg(task)
+  motion = cast(GaitLibraryCommandCfg, saved.commands["motion"])
+  motion.sampling = "continuous"
+  motion.rel_turn_envs = motion.rel_back_envs = 0.0
+  motion.fwd_arc_regions = (((0.5, 1.5), (0.0, 0.5), 1.0),)
+  motion.twist_metric_weights, motion.blend_time_s = (1.0, 1.0, 0.25), 0.6
+  dump_yaml(checkpoint.parent / "params" / "env.yaml", asdict(saved))
+  monkeypatch.setenv(UNICYCLE_LIBRARY_ENV_VAR, "")  # The evaluation sets it.
+  built: list[Any] = []
+
+  def env(cfg: Any, **kwargs: Any) -> Any:
+    built.append(cfg)
+    raise _Built
+
+  monkeypatch.setattr(mjlab.envs, "ManagerBasedRlEnv", env)
+  with pytest.raises(_Built):
+    evaluate(EvaluateConfig(checkpoint, library=tmp_path, device="cpu"))
+  (cfg,) = built
+  rebuilt = cfg.commands["motion"]
+  assert isinstance(rebuilt, GaitLibraryCommandCfg)
+  assert rebuilt.library_dir == str(tmp_path)
+  assert (rebuilt.sampling, rebuilt.rel_turn_envs, rebuilt.rel_back_envs) == (
+    "continuous",
+    0.0,
+    0.0,
+  )
+  assert rebuilt.fwd_arc_regions == (((0.5, 1.5), (0.0, 0.5), 1.0),)
+  assert rebuilt.bck_arc_regions == motion.bck_arc_regions  # Unchanged by the run.
+  # The snap metric and the blend time of the run's clip switches.
+  assert rebuilt.twist_metric_weights == (1.0, 1.0, 0.25)
+  assert rebuilt.blend_time_s == 0.6
+
+
 ##
 # The shared library.
 ##

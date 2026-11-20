@@ -180,20 +180,46 @@ def library(tmp_path_factory) -> Path:
   return folder
 
 
+FORWARD_ONLY = {"rel_turn_envs": 0.0, "rel_back_envs": 0.0}
+"""The sampler flags of a run on a library without pivots and backward arcs."""
+
+
+@pytest.fixture(scope="module")
+def forward_library(tmp_path_factory) -> Path:
+  """A forward-only library, as clipper's highstep one: idle and two forward
+  walks (0.6 and 1.0 m/s), no pivot, no backward arc."""
+  folder = tmp_path_factory.mktemp("forward_library")
+  model = get_spec("robot", "rigid").compile()
+  data = mujoco.MjData(model)
+  frames = 40
+  clips = {"idle": 0.0, "walk_fwd_slow": 0.6, "walk_fwd_fast": 1.0}
+  for name, v in clips.items():
+    clip = _clip(model, data, frames, (0, -v, 0), 0.0, (0.0, 0.0))
+    stride = _se2(0, -v * frames * DT, 0)
+    np.savez(
+      folder / f"{name}.npz", twist=np.array([v, 0.0, 0.0]), stride_se2=stride, **clip
+    )
+  return folder
+
+
 def _make_run(
   root: Path,
   case,
   library: Path,
   legacy: bool = False,
   touch_sites: TouchSites | None = None,
+  sampler: dict[str, Any] | None = None,
 ) -> Path:
   """A run on the default touch sites; a ``legacy`` run predates the setting, so
-  neither its env.yaml nor its checkpoint records any (``original``)."""
+  neither its env.yaml nor its checkpoint records any (``original``). ``sampler``:
+  command sampler settings the run changed on its command line."""
   model, socket, reward = case
   obs_dim, action_dim, _ = CASES[case]
   run = root / f"{model}_{socket}" / "run"
   env_cfg = osl_gait_library_env_cfg(model, socket, reward, "train", "unicycle")
   env_cfg.commands["motion"].library_dir = str(library)  # type: ignore[attr-defined]
+  for key, value in (sampler or {}).items():
+    setattr(env_cfg.commands["motion"], key, value)
   agent = osl_gait_library_runner_cfg(model, socket, reward, "exp", "unicycle")
   agent.actor.hidden_dims = HIDDEN
   if touch_sites is not None:
@@ -420,6 +446,45 @@ def test_touch_site_drift_and_disagreement_refuse(library, tmp_path) -> None:
   disagree = r"touch sites 'original', but its run's params/env\.yaml records 'feet"
   with pytest.raises(ValueError, match=disagree):
     gl_export.build_components(moved)
+
+
+def test_a_forward_only_run_exports_under_its_own_sampler(
+  forward_library, tmp_path
+) -> None:
+  """The command is rebuilt with the run's sampler, not the task's default split: a
+  run on a library without pivots and backward arcs (its fractions at 0) exports,
+  with library draws or with continuous ones over its own box and snap tolerance;
+  the same library under the default split is refused as in training; and nothing
+  in a bundle depends on the sampler."""
+  msk = ("msk", "compliant", "clf")
+  drawn = _make_run(tmp_path / "drawn", msk, forward_library, sampler=FORWARD_ONLY)
+  bundle = gl_export.export_bundle(drawn)
+  m = json.loads((bundle / "manifest.json").read_text())
+  assert m["reference"]["clip_names"] == ["idle", "walk_fwd_fast", "walk_fwd_slow"]
+  with np.load(bundle / "reference.npz") as ref:
+    np.testing.assert_allclose(ref["twists"][:, 0], [0.0, 1.0, 0.6])
+
+  # Continuous draws over one forward box: midway between the two clips a command
+  # is 0.2 from its clip, which the run's own tolerance allows.
+  box = {
+    **FORWARD_ONLY,
+    "sampling": "continuous",
+    "fwd_arc_regions": (((0.6, 1.0), (0.0, 0.0), 1.0),),
+    "max_snap_error": 0.25,
+  }
+  continuous = _make_run(tmp_path / "box", msk, forward_library, sampler=box)
+  other = gl_export.export_bundle(continuous)
+  for name in ("model.mjb", "reference.npz", "parity.npz"):
+    assert (other / name).read_bytes() == (bundle / name).read_bytes(), name
+  tight = _make_run(
+    tmp_path / "tight", msk, forward_library, sampler={**box, "max_snap_error": 0.1}
+  )
+  with pytest.raises(ValueError, match="does not cover the commanded twists"):
+    gl_export.export_bundle(tight)
+
+  default = _make_run(tmp_path / "default", msk, forward_library)
+  with pytest.raises(ValueError, match="no pivot clip"):
+    gl_export.export_bundle(default)
 
 
 def test_run_spec_reads_the_validation_cfg(tmp_path) -> None:

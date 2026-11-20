@@ -261,6 +261,7 @@ def _make_run(
   legacy: bool = False,
   touch_sites: TouchSites | None = None,
   osl_obs: mdp.OslObsCfg | None = None,
+  sampler: dict[str, Any] | None = None,
 ) -> Path:
   """A run on the default touch sites and OSL sensor set (or ``osl_obs``'s),
   recorded in its env.yaml, its checkpoint and its warm start's lineage; a
@@ -274,6 +275,8 @@ def _make_run(
     osl_obs = mdp.OslObsCfg(**mdp.LEGACY_OSL_SENSORS)
   env_cfg = osl_split_env_cfg(model, socket, reward, "train", osl_obs=osl_obs)
   env_cfg.commands["motion"].library_dir = str(library)  # type: ignore[attr-defined]
+  for key, value in (sampler or {}).items():  # The run's command-line sampler.
+    setattr(env_cfg.commands["motion"], key, value)
   agent = osl_split_runner_cfg(model, socket, reward, "exp")
   agent.actor.hidden_dims = HIDDEN
   agent.osl_actor.hidden_dims = HIDDEN
@@ -727,6 +730,38 @@ def test_legacy_run_exports_the_xml_touch_sites(legacy) -> None:
   readme = (bundle / "README.md").read_text()
   assert "\n- Touch zones: **original**, " in readme
   assert _readme_zones("-0.025 to 0.075", "-0.020") in readme
+
+
+def test_a_forward_only_run_exports_under_its_own_sampler(tmp_path) -> None:
+  """A stage-2 run on a library without pivots and backward arcs (clipper's
+  highstep one) exports: the command is rebuilt with the run's sampler (its pivot
+  and backward fractions at 0). Under the task's default split the same library is
+  refused, as it is in training."""
+  folder = tmp_path / "forward_library"
+  folder.mkdir()
+  model = get_spec("robot", "rigid").compile()
+  data = mujoco.MjData(model)
+  frames = 50
+  for name, v in {"idle": 0.0, "walk_fwd_slow": 0.6, "walk_fwd_fast": 1.0}.items():
+    clip = _clip(model, data, frames, (0, -v, 0), 0.0)
+    stride = _se2(0, -v * frames * DT, 0)
+    np.savez(
+      folder / f"{name}.npz", twist=np.array([v, 0.0, 0.0]), stride_se2=stride, **clip
+    )
+  msk = ("msk", "compliant", "clf")
+  forward = {"rel_turn_envs": 0.0, "rel_back_envs": 0.0}
+  checkpoint = _make_run(tmp_path / "forward", msk, folder, sampler=forward)
+  bundle = split_export.export_bundle(checkpoint)
+  manifest = json.loads((bundle / "manifest.json").read_text())
+  assert manifest["kind"] == "osl_split_dual"
+  assert manifest["reference"]["clip_names"] == [
+    "idle",
+    "walk_fwd_fast",
+    "walk_fwd_slow",
+  ]
+  default = _make_run(tmp_path / "default", msk, folder)
+  with pytest.raises(ValueError, match="no pivot clip"):
+    split_export.export_bundle(default)
 
 
 def test_heel_extended_run_exports_its_touch_sites(library, tmp_path) -> None:

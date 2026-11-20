@@ -31,7 +31,9 @@ def check_motion_fps(motion_file: str | Path, step_dt: float) -> float:
 
   mjlab's motion loaders advance one frame per env step and never read ``fps``, so a
   clip at any other rate silently plays at the wrong speed. clipper writes ``fps``
-  into every NPZ (``--output-fps`` sets it). Returns the clip's rate.
+  into every NPZ: its single-clip converter's ``--output-fps`` sets it, and the
+  gait-library converter's (``scripts/convert_gait_library.py``) ``--fps``. Returns
+  the clip's rate.
   """
   with np.load(motion_file) as data:
     if "fps" not in data:
@@ -44,8 +46,9 @@ def check_motion_fps(motion_file: str | Path, step_dt: float) -> float:
   if abs(fps - expected) > 1e-6 * expected:
     raise ValueError(
       f"{motion_file} is a {fps:g} Hz clip, but this task steps at {expected:g} Hz "
-      f"(step_dt {step_dt:g} s). Re-export it with clipper's --output-fps "
-      f"{expected:g}."
+      f"(step_dt {step_dt:g} s). Re-export it with clipper at {expected:g} Hz: "
+      f"--output-fps {expected:g} for a single clip, --fps {expected:g} for a gait "
+      "library (scripts/convert_gait_library.py)."
     )
   return fps
 

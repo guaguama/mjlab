@@ -76,9 +76,13 @@ from mjlab.tasks.osl_gait_library.config.rl_cfg import (
   GaitLibraryRunnerCfg,
   osl_gait_library_runner_cfg,
 )
+from mjlab.tasks.osl_gait_library.export import read_config
 from mjlab.tasks.osl_gait_library.mdp import (
+  SAMPLER_SETTINGS,
   GaitLibraryCommand,
   GaitLibraryCommandCfg,
+  apply_sampler,
+  describe_sampler,
   heading_twist,
   stride_twist,
   twist_limit_curriculum,
@@ -806,6 +810,206 @@ def test_unicycle_regions_cover_the_library_grid() -> None:
   error = (twist - cmd.twists[clip]).abs()
   idle = clip == cmd.idle_clip
   assert float(error[~idle].max()) <= cmd.cfg.max_snap_error
+
+
+##
+# The run's sampler in every command rebuilt for it.
+##
+
+# A forward-only library, as clipper's highstep one: idle and forward arcs on a
+# grid (here 0.5 apart on both axes).
+FORWARD_TWISTS = [[0.0, 0.0, 0.0]] + [
+  [vx, 0.0, wz] for vx in (0.5, 1.0, 1.5) for wz in (-0.5, 0.0, 0.5)
+]
+FORWARD_BOX = (((0.5, 1.5), (0.0, 0.5), 1.0),)
+FORWARD_ONLY = {"rel_turn_envs": 0.0, "rel_back_envs": 0.0}
+
+
+def _unicycle_motion(mode: Any = "train") -> GaitLibraryCommandCfg:
+  cfg = osl_gait_library_env_cfg("msk", "compliant", "clf", mode, "unicycle")
+  motion = cfg.commands["motion"]
+  assert isinstance(motion, GaitLibraryCommandCfg)
+  return motion
+
+
+def test_apply_sampler_copies_the_sampler_and_nothing_else(tmp_path: Path) -> None:
+  """From a live config, and from a run's saved env.yaml (tuples read back as lists,
+  absent settings kept): the sampler fields take the source's values, and the
+  mode's own settings, the reference settings and the twist cap stay."""
+  fields = set(GaitLibraryCommandCfg.__dataclass_fields__)
+  assert set(SAMPLER_SETTINGS) <= fields and len(set(SAMPLER_SETTINGS)) == 12
+  run = _unicycle_motion()
+  run.library_dir = "/run/library"
+  run.sampling = "continuous"
+  run.rel_static_envs, run.rel_turn_envs, run.rel_back_envs = 0.1, 0.0, 0.0
+  run.fwd_arc_regions = FORWARD_BOX
+  run.vx_fwd_range, run.arc_wz_range = (0.5, 1.5), (0.0, 0.5)
+  run.max_snap_error = 0.07
+  run.max_twist = (0.8, 0.6, 0.5)
+  run.twist_metric_weights = (1.0, 1.0, 0.25)  # The snap metric: the sampler's.
+  run.blend_time_s, run.lookahead_steps = 0.6, 3  # Reference settings: not copied.
+
+  def check(rebuilt: GaitLibraryCommandCfg, mode: str) -> None:
+    for key in SAMPLER_SETTINGS:
+      assert getattr(rebuilt, key) == getattr(run, key), key
+      assert type(getattr(rebuilt, key)) is type(getattr(run, key)), key
+    assert rebuilt.fwd_arc_regions == FORWARD_BOX
+    assert type(rebuilt.fwd_arc_regions[0][0]) is tuple  # Nested lists too.
+    assert rebuilt.library_dir == "" and rebuilt.max_twist is None
+    assert rebuilt.twist_metric_weights == (1.0, 1.0, 0.25)
+    assert rebuilt.blend_time_s == 0.4 and rebuilt.lookahead_steps != 3
+    assert rebuilt.fixed_clips == (mode == "validation")
+    assert rebuilt.debug_vis == (mode == "play")
+    assert rebuilt.start_yaw_range == (0.0 if mode == "validation" else math.pi)
+
+  dump_yaml(tmp_path / "env.yaml", {"commands": {"motion": asdict(run)}})
+  saved = read_config(tmp_path / "env.yaml")["commands"]["motion"]
+  assert saved["fwd_arc_regions"] == [[[0.5, 1.5], [0.0, 0.5], 1.0]]  # Plain lists.
+  for mode in ("train", "validation", "play"):
+    for source in (run, saved):
+      rebuilt = _unicycle_motion(mode)
+      changed = apply_sampler(rebuilt, source)
+      check(rebuilt, mode)
+      assert changed["rel_turn_envs"] == (0.3, 0.0)
+      assert changed["sampling"] == ("library", "continuous")
+      assert changed["twist_metric_weights"] == (
+        UNICYCLE_TWIST_METRIC_WEIGHTS,
+        (1.0, 1.0, 0.25),
+      )
+      assert "wz_range" not in changed and "bck_arc_regions" not in changed
+      assert apply_sampler(rebuilt, source) == {}  # Nothing left to change.
+
+  # A run older than a setting keeps the rebuilt config's value of it.
+  old_run = {k: v for k, v in saved.items() if k not in ("fwd_arc_regions", "sampling")}
+  rebuilt = _unicycle_motion()
+  apply_sampler(rebuilt, old_run)
+  assert rebuilt.sampling == "library"
+  assert rebuilt.fwd_arc_regions == UNICYCLE_FWD_ARC_REGIONS
+  assert rebuilt.rel_turn_envs == 0.0 and rebuilt.max_snap_error == 0.07
+  assert (
+    describe_sampler(run)
+    == describe_sampler(saved)
+    == (
+      "continuous draws, idle 0.1, pivots 0, backward 0 of the arcs, forward boxes "
+      "(((0.5, 1.5), (0.0, 0.5), 1.0),)"
+    )
+  )
+  assert describe_sampler(_unicycle_motion()) == (
+    "library draws, idle 0.15, pivots 0.3, backward 0.4 of the arcs"
+  )
+
+
+def test_a_forward_only_library_loads_only_under_the_runs_sampler() -> None:
+  """The task's default split draws pivots and backward arcs, which a forward-only
+  library (clipper's highstep one) does not hold: a command rebuilt from the task
+  refuses it, and loads once it carries the run's sampler, with library draws and
+  with continuous draws over the run's one forward box."""
+
+  def rebuilt(**run: Any) -> dict[str, Any]:
+    motion = _unicycle_motion("play")
+    if run:
+      apply_sampler(motion, {**asdict(_unicycle_motion()), **run})
+    return {key: getattr(motion, key) for key in SAMPLER_SETTINGS}
+
+  with pytest.raises(ValueError, match="no pivot clip"):
+    _indexed_command(FORWARD_TWISTS, **rebuilt())
+  cmd = _indexed_command(FORWARD_TWISTS, **rebuilt(**FORWARD_ONLY))
+  torch.manual_seed(0)
+  _, clip = cmd._draw(2000)
+  assert set(clip.tolist()) == set(range(10))
+  # The unicycle task's second forward box (|wz| up to 1.5) has no clip to snap to
+  # here; the run's own single box has.
+  continuous = {**FORWARD_ONLY, "sampling": "continuous", "max_snap_error": 0.26}
+  with pytest.raises(ValueError, match="does not cover the commanded twists"):
+    _indexed_command(FORWARD_TWISTS, **rebuilt(**continuous))
+  cmd = _indexed_command(
+    FORWARD_TWISTS, **rebuilt(**continuous, fwd_arc_regions=FORWARD_BOX)
+  )
+  twist, clip = cmd._draw(2000)
+  assert float(twist[:, 0].max()) <= 1.5 and float(twist[:, 2].abs().max()) <= 0.5
+  assert not bool((twist[:, 0] < 0).any())
+
+
+@pytest.mark.parametrize("stage", ["stage1", "stage2", "stage1.5"])
+def test_evaluation_commands_take_the_training_sampler(stage: str) -> None:
+  """Validation and video configs are rebuilt from the task; their command takes
+  the training env's library and sampler (a forward-only run's video env would not
+  load its library otherwise), and keeps its own mode. Stress copies training."""
+  task = {
+    "stage1": "Mjlab-Gait-Library-Unicycle-OSL-Fullbody-MSK-CLF-Compliant",
+    "stage2": "Mjlab-Split-Unicycle-OSL-Fullbody-MSK-CLF-Compliant",
+    "stage1.5": "Mjlab-FSM-Unicycle-OSL-Fullbody-MSK-CLF-Compliant",
+  }[stage]
+  train = load_env_cfg(task)
+  motion = train.commands["motion"]
+  assert isinstance(motion, GaitLibraryCommandCfg)
+  motion.library_dir = "/run/library"
+  motion.sampling = "continuous"
+  motion.rel_turn_envs = motion.rel_back_envs = 0.0
+  motion.fwd_arc_regions = FORWARD_BOX
+  motion.max_twist = (0.8, 0.6, 0.5)
+  runner_cls = load_runner_cls(task)
+  assert runner_cls is not None
+  runner: Any = object.__new__(runner_cls)
+  runner.env = SimpleNamespace(unwrapped=SimpleNamespace(cfg=train))
+  runner.validation_cfg = dict(asdict(load_rl_cfg(task))["validation"])
+  for purpose in ("validation", "video", "stress"):
+    rebuilt = runner._eval_env_cfg(purpose).commands["motion"]
+    assert isinstance(rebuilt, GaitLibraryCommandCfg) and rebuilt is not motion
+    assert rebuilt.library_dir == "/run/library", purpose
+    for key in SAMPLER_SETTINGS:
+      assert getattr(rebuilt, key) == getattr(motion, key), (purpose, key)
+    assert rebuilt.fixed_clips == (purpose == "validation"), purpose
+    assert rebuilt.debug_vis == (purpose == "video"), purpose
+    # The twist cap is a training curriculum's: only the copy of training has it.
+    assert rebuilt.max_twist == (motion.max_twist if purpose == "stress" else None)
+
+
+@pytest.mark.parametrize(
+  "task",
+  [
+    "Mjlab-Gait-Library-Unicycle-OSL-Fullbody-MSK-CLF-Compliant",
+    "Mjlab-Split-Unicycle-OSL-Fullbody-MSK-CLF-Compliant",
+    "Mjlab-FSM-Unicycle-OSL-Fullbody-MSK-CLF-Compliant",
+  ],
+)
+def test_play_takes_the_runs_sampler(
+  task: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+  """play.py takes no --env overrides: the runner gives the play config the sampler
+  the checkpoint's run recorded in its params/env.yaml (and says so); a checkpoint
+  with no run around it keeps the task's."""
+  configure = cast(Any, load_runner_cls(task)).configure_env_for_checkpoint
+  saved = load_env_cfg(task)
+  motion = saved.commands["motion"]
+  assert isinstance(motion, GaitLibraryCommandCfg)
+  motion.rel_turn_envs = motion.rel_back_envs = 0.0
+  payload = {
+    "actor_state_dict": {},
+    "iter": 10,
+    "infos": None,
+    "osl_touch_sites": "feet_extended",
+  }
+  dump_yaml(tmp_path / "run" / "params" / "env.yaml", asdict(saved))
+  torch.save(payload, tmp_path / "run" / "model_10.pt")
+  torch.save(payload, tmp_path / "bare.pt")
+
+  def played(path: Path) -> GaitLibraryCommandCfg:
+    cfg = load_env_cfg(task, play=True)
+    configure(cfg, path)
+    rebuilt = cfg.commands["motion"]
+    assert isinstance(rebuilt, GaitLibraryCommandCfg) and rebuilt.debug_vis
+    return rebuilt
+
+  capsys.readouterr()
+  rebuilt = played(tmp_path / "run" / "model_10.pt")
+  assert (rebuilt.rel_turn_envs, rebuilt.rel_back_envs) == (0.0, 0.0)
+  assert "Twist sampler as the run's: library draws, idle 0.15, pivots 0, " in (
+    capsys.readouterr().out
+  )
+  rebuilt = played(tmp_path / "bare.pt")
+  assert (rebuilt.rel_turn_envs, rebuilt.rel_back_envs) == (0.3, 0.4)
+  assert "Twist sampler" not in capsys.readouterr().out
 
 
 def test_twist_limit_caps_draws() -> None:

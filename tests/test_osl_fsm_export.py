@@ -156,7 +156,11 @@ def _actor(group: str, obs_dim: int, action_dim: int, distribution: dict):
 
 
 def _make_run(
-  root: Path, case: Case, library: Path, touch_sites: TouchSites | None = None
+  root: Path,
+  case: Case,
+  library: Path,
+  touch_sites: TouchSites | None = None,
+  sampler: dict[str, Any] | None = None,
 ) -> Path:
   """A stage-1.5 run on the default touch sites (or ``touch_sites``) with
   ``CASES``' controller: its env.yaml, agent.yaml, and a checkpoint whose
@@ -171,6 +175,8 @@ def _make_run(
   if touch_sites is not None:
     set_touch_sites(env_cfg, touch_sites)
   env_cfg.commands["motion"].library_dir = str(library)  # type: ignore[attr-defined]
+  for key, value in (sampler or {}).items():  # The run's command-line sampler.
+    setattr(env_cfg.commands["motion"], key, value)
   agent = osl_fsm_runner_cfg(model, socket, reward, "exp")
   agent.actor.hidden_dims = HIDDEN
   dump_yaml(run / "params" / "env.yaml", asdict(env_cfg))
@@ -510,6 +516,36 @@ def test_refuses_a_lineage_on_other_touch_sites(exported) -> None:
   torch.save(payload, other)
   with pytest.raises(ValueError, match="but its warm start's stage 1 with 'original'"):
     fsm_export.export_bundle(other)
+
+
+def test_a_forward_only_run_exports_under_its_own_sampler(tmp_path) -> None:
+  """A stage-1.5 run on a library without pivots and backward arcs (clipper's
+  highstep one) exports: the command is rebuilt with the run's sampler (its pivot
+  and backward fractions at 0), not the task's default split."""
+  folder = tmp_path / "forward_library"
+  folder.mkdir()
+  model = get_spec("robot", "rigid").compile()
+  data = mujoco.MjData(model)
+  span = FRAMES * DT
+  for name, v in {"idle": 0.0, "walk_fwd_slow": 0.6, "walk_fwd_fast": 1.0}.items():
+    clip = _clip(model, data, FRAMES, (0, -v, 0), 0.0, swing=name != "idle")
+    np.savez(
+      folder / f"{name}.npz",
+      twist=np.array([v, 0.0, 0.0]),
+      stride_se2=_se2(0, -v * span, 0),
+      **clip,
+    )
+  forward = {"rel_turn_envs": 0.0, "rel_back_envs": 0.0}
+  msk: Case = ("msk", "compliant", "clf")
+  checkpoint = _make_run(tmp_path, msk, folder, sampler=forward)
+  bundle = fsm_export.export_bundle(checkpoint)
+  manifest = json.loads((bundle / "manifest.json").read_text())
+  assert manifest["reference"]["clip_names"] == [
+    "idle",
+    "walk_fwd_fast",
+    "walk_fwd_slow",
+  ]
+  assert manifest["controllers"]["osl"]["fsm"]["format"] == "mjlab.osl_fsm/1"
 
 
 def test_s15_style_run_on_the_original_touch_sites_exports(library, tmp_path) -> None:
