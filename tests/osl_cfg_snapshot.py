@@ -1,11 +1,13 @@
 """Canonical digests of the OSL tasks' configs, for bit-identity tests across commits.
 
 ``tests/test_osl_robot_recipe.py`` checks that every OSL task's training env, play
-env and runner config equals the one of the commit the robot recipe was built on
-(the CLF-RL reward commit), except the robot unicycle configs the recipe sets: every
-musculoskeletal (MSK) task stays bit-identical. :data:`FIXTURE` holds that commit's
-digests, one per top-level config field, so a failure names the field. Regenerate
-it from the base commit's code, never from a branch under test::
+env and runner config equals the one of the fixture's source commit (its ``source``:
+the CLF-RL reward commit's configs, then the OSL/left-leg contact sensor and penalty
+fields), except the robot unicycle configs the recipe sets: every musculoskeletal
+(MSK) task stays bit-identical. :data:`FIXTURE` holds that commit's digests, one per
+top-level config field, so a failure names the field. Regenerate it from the base
+commit's code, never from a branch under test (a change that alters configs on
+purpose regenerates it from its own tree once its field-level diff is checked)::
 
   PYTHONPATH=<base commit checkout>/src python tests/osl_cfg_snapshot.py <commit>
 

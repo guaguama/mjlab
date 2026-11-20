@@ -24,6 +24,7 @@ import copy
 import math
 import re
 import shlex
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -320,6 +321,12 @@ def _term(env: Any, params: dict[str, Any], split: bool = False) -> Any:
   return func(RewardTermCfg(func=func, weight=1.0, params=params), env)
 
 
+def _no_contact(regularizers: RegularizerCfg) -> RegularizerCfg:
+  """``regularizers`` without the leg-contact penalty, which needs the scene's contact
+  sensor these fake envs lack (``test_osl_leg_contact`` covers it)."""
+  return replace(regularizers, leg_contact=0.0)
+
+
 def _v_max(clf: ClfCfg) -> float:
   return v_max_unit(*di_care_block(clf.q_pos, clf.q_vel, clf.r)) + 1e-8
 
@@ -338,7 +345,7 @@ def _legacy(params: dict[str, Any], pen_w: float | None) -> dict[str, Any]:
     params["clf"].decay_form = "musclemimic"
     params["clf"].pen_w = pen_w
   regularizers = params["regularizers"]
-  for name in ("osl_action_rate", "servo_action_rate", "joint_limits"):
+  for name in ("osl_action_rate", "servo_action_rate", "joint_limits", "leg_contact"):
     setattr(regularizers, name, 0.0)
   regularizers.servo_torque = regularizers.servo_saturation = 0.0
   return params
@@ -1181,7 +1188,7 @@ def test_servo_costs_are_logged_but_never_rewarded() -> None:
   the log, a NaN in the log included. A model without servos logs nothing."""
   scene = _mujoco_servos()
   env, cmd = scene.env, scene.cmd
-  regularizers = clf_regularizers("robot")
+  regularizers = _no_contact(clf_regularizers("robot"))
   assert regularizers.log_servo_terms and regularizers.joint_limits > 0.0
   assert regularizers.servo_torque == regularizers.servo_saturation == 0.0
   silent = copy.deepcopy(regularizers)
@@ -1230,7 +1237,7 @@ def test_activation_energy_metric(model: Model) -> None:
   mj_model = get_spec(model, "rigid").compile()
   cmd = _Command(seed=9)
   env = _env(cmd)
-  params = _params("clf", regularizers=clf_regularizers(model))
+  params = _params("clf", regularizers=_no_contact(clf_regularizers(model)))
   plain = _term(env, copy.deepcopy(params))  # Built without a model: no metric.
   env.sim.mj_model = mj_model
   term = _term(env, params)
@@ -1373,7 +1380,7 @@ def test_diagnostic_keys() -> None:
   """Every split diagnostic is reported, the new ones included."""
   cmd = _Command(seed=11)
   env = _env(cmd)
-  params = _params("clf", regularizers=clf_regularizers("msk"))
+  params = _params("clf", regularizers=_no_contact(clf_regularizers("msk")))
   term = _term(env, params, split=True)
   _advance(env, cmd)
   _advance(env, cmd, new_reference=False)

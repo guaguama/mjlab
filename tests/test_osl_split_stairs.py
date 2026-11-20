@@ -203,7 +203,8 @@ def test_env_is_stairs_stage1_through_the_split_stage(model: str) -> None:
     qualname = cast(Any, robot.spec_fn).__qualname__
     assert qualname == cast(Any, uni_robot.spec_fn).__qualname__
     assert "with_osl_sensors" in qualname
-    assert cfg.scene.sensors == (*stage1.scene.sensors, unicycle.scene.sensors[-1])
+    # Stage 1's leg-contact sensor, once: unicycle stage 2's scene sensor.
+    assert cfg.scene.sensors == stage1.scene.sensors == unicycle.scene.sensors
 
     assert cfg.events == stage1.events
     assert cfg.terminations == stage1.terminations

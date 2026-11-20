@@ -17,6 +17,9 @@ from .reference import MimicReference as MimicReference
 from .reference import MimicReferenceSource as MimicReferenceSource
 from .rewards import ACTIVATION_DIAGNOSTIC as ACTIVATION_DIAGNOSTIC
 from .rewards import CLF_EXTRA_DIAGNOSTICS as CLF_EXTRA_DIAGNOSTICS
+from .rewards import LEG_CONTACT_COEFFICIENT as LEG_CONTACT_COEFFICIENT
+from .rewards import LEG_CONTACT_OWNERS as LEG_CONTACT_OWNERS
+from .rewards import LEG_CONTACT_THRESHOLD as LEG_CONTACT_THRESHOLD
 from .rewards import LIMIT_JOINTS as LIMIT_JOINTS
 from .rewards import REGULARIZER_DIAGNOSTICS as REGULARIZER_DIAGNOSTICS
 from .rewards import REGULARIZERS as REGULARIZERS

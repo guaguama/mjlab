@@ -44,6 +44,7 @@ from .observations import term_channels as term_channels
 from .observations import term_components as term_components
 from .rewards import CHANNELS as CHANNELS
 from .rewards import GROUPS as GROUPS
+from .rewards import LEG_CONTACT_CHANNELS as LEG_CONTACT_CHANNELS
 from .rewards import SPLIT_CLF_DIAGNOSTICS as SPLIT_CLF_DIAGNOSTICS
 from .rewards import SPLIT_CONTACT_DIAGNOSTICS as SPLIT_CONTACT_DIAGNOSTICS
 from .rewards import SPLIT_DIAGNOSTICS as SPLIT_DIAGNOSTICS

@@ -15,7 +15,8 @@ whole body) with the reference, terrain and checks a single clip needs:
 * ``model.mjb``: the compiled scene with the terrain boxes (geoms
   ``terrain_box_<i>`` on the body ``terrain``, with the floor plane), the task's
   simulation options at the deployment solver caps, and the OSL foot touch sites
-  the run trained with (the manifest's ``touch_sites`` declares them);
+  the run trained with (the manifest's ``touch_sites`` declares them), without
+  the training scene's OSL/left-leg contact sensor;
 * ``terrain.json``: the TERRA terrain file the run trained on (the run's
   ``params/terrain.json``), from which ``model.mjb``'s boxes were built;
 * ``reference.npz``: the clip as the training command preprocessed it, (T, ...)
@@ -64,6 +65,7 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
 from mjlab.entity.data import EntityData
 from mjlab.tasks.osl_gait_library import export as gl
 from mjlab.tasks.osl_mimic.config.env_cfgs import VALIDATION_SITE_THRESHOLD, Reward
+from mjlab.tasks.osl_mimic.leg_contact import drop_leg_contact_sensor
 from mjlab.tasks.osl_mimic.rl.export import (
   Inference,
   PolicyParts,
@@ -857,6 +859,8 @@ def export_bundle(
   warn_on_refit_sidecar(clip, terrain)
 
   cfg = osl_stairs_env_cfg(spec.model, spec.socket, spec.reward, "train")
+  # A training measurement: the bundle's model is the deployed plant.
+  drop_leg_contact_sensor(cfg)
   touch = run_touch_sites(checkpoint, saved_env=saved)
   set_touch_sites(cfg, touch.value)
   print(f"[INFO] OSL touch sites: {touch.value} (from {touch.source}).")

@@ -38,7 +38,8 @@ every sensor is registered as a :class:`~mjlab.sensor.BuiltinSensor`.
 
 One more sensor is the simulation's, not the device's: a scene contact sensor
 between the OSL and the biological left leg (:func:`leg_contact_sensor_cfg`), for
-the leg-crossing diagnostics.
+the leg-contact diagnostics and penalty. Every OSL imitation scene has it, stage 1's
+too, so it is defined in ``osl_mimic.leg_contact`` and re-exported here.
 """
 
 from __future__ import annotations
@@ -57,7 +58,12 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   R_TOES_TOUCH_SITE,
   TOUCH_SITE_SENSORS,
 )
-from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.tasks.osl_mimic.leg_contact import LEFT_LEG_BODY as LEFT_LEG_BODY
+from mjlab.tasks.osl_mimic.leg_contact import LEG_CONTACT_SENSOR as LEG_CONTACT_SENSOR
+from mjlab.tasks.osl_mimic.leg_contact import OSL_ROOT_BODY as OSL_ROOT_BODY
+from mjlab.tasks.osl_mimic.leg_contact import (
+  leg_contact_sensor_cfg as leg_contact_sensor_cfg,
+)
 
 OSL_IMU_SITE = "osl_imu"
 OSL_IMU_BODY = "OSL_KA_L1_osl_knee_assembly"
@@ -76,15 +82,6 @@ clamps to it; the MuJoCo sensor does not."""
 ACC_RANGE = 4.0 * 9.80665
 """The ActPack IMU's accelerometer range, +-4 g (m/s^2), per axis. The observation
 clamps to it; the MuJoCo sensor does not."""
-
-LEG_CONTACT_SENSOR = "osl_leg_contact"
-"""The scene contact sensor between the OSL and the biological left leg (a scene
-sensor: not prefixed)."""
-OSL_ROOT_BODY = "OSL_KA_L1_osl_generic_socket"
-"""The root of every OSL body in both sockets (its parent is ``femur_r``)."""
-LEFT_LEG_BODY = "femur_l"
-"""The root of the biological left leg: femur, patella, tibia, talus, calcaneus and
-toes."""
 
 # Entity-level sensor names; the scene registers each as "robot/<name>".
 IMU_GYRO = "osl_imu_gyro"
@@ -240,26 +237,6 @@ def with_osl_sensors(
     return add_osl_sensors(spec_fn())
 
   return spec_with_osl_sensors
-
-
-def leg_contact_sensor_cfg(substeps: int) -> ContactSensorCfg:
-  """The contact sensor between the OSL's subtree and the biological left leg's.
-
-  It reads the net force of every contact between the two subtrees (MuJoCo's
-  ``mjSENS_CONTACT``, which mujoco_warp computes too), kept for the last
-  ``substeps`` physics substeps, one control step, so a strike between two control
-  steps still shows. The six OSL hulls collide with the leg's capsules; the OSL
-  foot capsules do not (``conaffinity`` 0 on both sides), so a foot crossing the
-  biological leg makes no contact at all.
-  """
-  return ContactSensorCfg(
-    name=LEG_CONTACT_SENSOR,
-    primary=ContactMatch(mode="subtree", pattern=f"^{OSL_ROOT_BODY}$", entity="robot"),
-    secondary=ContactMatch(mode="subtree", pattern=LEFT_LEG_BODY, entity="robot"),
-    fields=("force",),
-    reduce="netforce",
-    history_length=substeps,
-  )
 
 
 def scene_sensor_name(name: str, entity: str = "robot") -> str:

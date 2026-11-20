@@ -7,7 +7,8 @@ A bundle is the self-contained folder osl_deploy runs in plain CPU MuJoCo:
   the reference settings, provenance and checksums of every file;
 * ``model.mjb``: the compiled scene with the task's simulation options and the OSL
   foot touch sites the run trained with (the manifest's ``touch_sites`` declares
-  them, read from this file);
+  them, read from this file), without the training scene's OSL/left-leg contact
+  sensor (``osl_mimic.leg_contact``);
 * ``reference.npz``: the library as the training command preprocessed it;
 * ``parity.npz``: observations and their ONNX means, for a consumer's own check;
 * ``README.md``: a summary for people (not checksummed).
@@ -57,6 +58,7 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   Socket,
 )
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
+from mjlab.tasks.osl_mimic.leg_contact import drop_leg_contact_sensor
 from mjlab.tasks.osl_mimic.rl.export import (
   Inference,
   PolicyParts,
@@ -312,6 +314,8 @@ def build_components(
   cfg = osl_gait_library_env_cfg(
     spec.model, spec.socket, spec.reward, "train", spec.variant
   )
+  # A training measurement: the bundle's model is the deployed plant.
+  drop_leg_contact_sensor(cfg)
   touch = run_touch_sites(checkpoint, saved_env=saved)
   set_touch_sites(cfg, touch.value)
   print(f"[INFO] OSL touch sites: {touch.value} (from {touch.source}).")

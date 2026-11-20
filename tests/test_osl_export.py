@@ -36,6 +36,7 @@ from mjlab.tasks.osl_gait_library.config.rl_cfg import (
   UNICYCLE_MSK_INIT_STD,
   osl_gait_library_runner_cfg,
 )
+from mjlab.tasks.osl_mimic.leg_contact import LEG_CONTACT_SENSOR
 from mjlab.tasks.osl_mimic.rl import export as policy_export
 from mjlab.tasks.osl_mimic.rl.models import MuscleMimicMLPModel
 from mjlab.tasks.osl_mimic.touch_sites import set_touch_sites
@@ -295,6 +296,10 @@ def test_bundle_contract(exported) -> None:
     assert ref["joint_pos"].shape[-1] == len(m["joint_names"])
   assert m["reference"]["clip_names"] == ["idle", "walk_bck", "walk_fwd", "walk_turn"]
   assert (bundle / "README.md").read_text().startswith(f"# {m['run']['task']}")
+  # The training scene's leg-contact sensor stays out of the deployed plant.
+  plant = mujoco.MjModel.from_binary_path(str(bundle / "model.mjb"))
+  names = [plant.sensor(i).name for i in range(plant.nsensor)]
+  assert not [name for name in names if name.startswith(LEG_CONTACT_SENSOR)]
 
 
 def test_bundle_files_and_onnx(exported) -> None:

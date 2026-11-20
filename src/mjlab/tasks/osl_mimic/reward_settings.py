@@ -13,7 +13,8 @@ reward (:func:`checkpoint_reward_record`, :func:`apply_reward_settings`).
 
 A run that records none of them (every run before 2026-11-18) trained with
 musclemimic's decrease condition (:data:`LEGACY_DECAY_FORM`), ``pen_scale`` 1 and no
-regularizers.
+regularizers; one that records no leg-contact penalty (every run before 2026-11-19)
+trained without it.
 """
 
 from __future__ import annotations
@@ -42,8 +43,16 @@ CLF_SETTINGS = (
   "vdot_window",
 )
 """The ``clf`` fields the settings record (``clf_<field>``)."""
-REGULARIZER_SETTINGS = ("scale", *REGULARIZERS, "joint_limit_joints")
-"""The ``regularizers`` fields they record (``reg_<field>``)."""
+REGULARIZER_SETTINGS = (
+  "scale",
+  *REGULARIZERS,
+  "joint_limit_joints",
+  "leg_contact_threshold",
+  "leg_contact_owner",
+)
+"""The ``regularizers`` fields they record (``reg_<field>``). The leg-contact owner
+is recorded for a stage-2 term only (one with reward channels): stage 1 ignores
+it."""
 REWARD_SETTING_KEYS: tuple[str, ...] = (
   *(f"clf_{name}" for name in CLF_SETTINGS),
   *(f"reg_{name}" for name in REGULARIZER_SETTINGS),
@@ -55,15 +64,18 @@ LEGACY_DECAY_FORM = "musclemimic"
 _PARAMS = "--env.rewards.mimic.params"
 
 
-def reward_settings(clf: Any, regularizers: Any) -> dict[str, Any]:
+def reward_settings(clf: Any, regularizers: Any, split: bool = False) -> dict[str, Any]:
   """The reward settings of a ``mimic`` term's ``clf`` and ``regularizers`` params
-  (config objects, or their env.yaml mappings), under :data:`REWARD_SETTING_KEYS`.
+  (config objects, or their env.yaml mappings), under :data:`REWARD_SETTING_KEYS`;
+  ``split`` for a stage-2 term (reward channels), whose leg-contact owner is
+  recorded (None otherwise).
 
   Without ``clf`` (MimicReward) every ``clf_*`` is None. A run that records no
   decrease condition or no regularizers (every run before 2026-11-18) gets what it
   trained with: :data:`LEGACY_DECAY_FORM`, ``pen_scale`` 1 and no regularizers
   (every coefficient 0, ``scale`` 1, no joints); one that records no V-dot window
-  (before 2026-11-19) differenced over 1 step.
+  (before 2026-11-19) differenced over 1 step; one that records no leg-contact
+  penalty (before it existed) had none (coefficient 0, no threshold or owner).
   """
 
   def get(owner: Any, name: str, default: Any = None) -> Any:
@@ -87,6 +99,11 @@ def reward_settings(clf: Any, regularizers: Any) -> dict[str, Any]:
   out["reg_scale"] = _number(scale)
   joints = get(regularizers, "joint_limit_joints", ()) if regularizers else ()
   out["reg_joint_limit_joints"] = [str(j) for j in joints or ()]
+  if regularizers is not None:
+    threshold = get(regularizers, "leg_contact_threshold", None)
+    out["reg_leg_contact_threshold"] = _number(threshold)
+    owner = get(regularizers, "leg_contact_owner", None) if split else None
+    out["reg_leg_contact_owner"] = None if owner is None else str(owner)
   return out
 
 
@@ -98,7 +115,9 @@ def env_reward_settings(cfg: Any) -> dict[str, Any] | None:
   if mimic is None:
     return None
   params = getattr(mimic, "params", None) or {}
-  return reward_settings(params.get("clf"), params.get("regularizers"))
+  return reward_settings(
+    params.get("clf"), params.get("regularizers"), split="channels" in params
+  )
 
 
 def saved_reward_settings(env: Any) -> dict[str, Any] | None:
@@ -107,7 +126,9 @@ def saved_reward_settings(env: Any) -> dict[str, Any] | None:
   params = _dig(env, "rewards", "mimic", "params")
   if not isinstance(params, Mapping):
     return None
-  return reward_settings(params.get("clf"), params.get("regularizers"))
+  return reward_settings(
+    params.get("clf"), params.get("regularizers"), split="channels" in params
+  )
 
 
 def reward_stage_setting(path: str) -> str | None:
@@ -170,10 +191,12 @@ def reward_mismatches(
   the reward computes: whether each uses the CLF at all (unless ``clf_presence`` is
   False: the warm start's reward switch handles that), the CLF penalty ``pen_w x
   pen_scale`` (when both use the CLF), the decrease condition's form (and the paper
-  form's rates) where both penalize it, each regularizer times ``scale``, and the
-  joints where both penalize joint limits. A record without these settings (from
-  before 2026-11-18) counts as what it trained with. Numbers print exactly, as
-  :func:`reward_flags` writes them."""
+  form's rates) where both penalize it, each regularizer times ``scale``, the
+  joints where both penalize joint limits, and where both penalize leg contacts its
+  threshold and (when both record one: stage 2) its owner. A record without these
+  settings (from before 2026-11-18, or before the leg-contact penalty) counts as
+  what it trained with. Numbers print exactly, as :func:`reward_flags` writes
+  them."""
   a, b = _with_legacy(a), _with_legacy(b)
   lines: list[str] = []
   if clf_presence and (a["clf_pen_w"] is None) != (b["clf_pen_w"] is None):
@@ -214,6 +237,15 @@ def reward_mismatches(
     joints = [sorted(s["reg_joint_limit_joints"] or ()) for s in (a, b)]
     if joints[0] != joints[1]:
       lines.append(f"joint_limit_joints {joints[0]} vs {joints[1]}")
+  if min(effective["leg_contact"]) > 0.0:
+    threshold = [s["reg_leg_contact_threshold"] for s in (a, b)]
+    if differs(*threshold):
+      lines.append(
+        f"leg_contact_threshold {_exact(threshold[0])} vs {_exact(threshold[1])}"
+      )
+    owner = [s["reg_leg_contact_owner"] for s in (a, b)]
+    if None not in owner and owner[0] != owner[1]:
+      lines.append(f"leg_contact_owner {owner[0]!r} vs {owner[1]!r}")
   return lines
 
 
@@ -234,13 +266,19 @@ def describe_reward_settings(settings: Mapping[str, Any]) -> str:
       f"CLF decay form {form}{rates}, pen_w {s['clf_pen_w']:g} x pen_scale "
       f"{_shown(s['clf_pen_scale'])}"
     )
-  active = [f"{name} {s[f'reg_{name}']:g}" for name in REGULARIZERS if s[f"reg_{name}"]]
+  details = {"joint_limits": f"{len(s['reg_joint_limit_joints'] or ())} joints"}
+  owner = s["reg_leg_contact_owner"]
+  details["leg_contact"] = f"over {_shown(s['reg_leg_contact_threshold'])} N" + (
+    f", {owner} channel{'s' if owner == 'both' else ''}" if owner else ""
+  )
+  active = [
+    f"{name} {s[f'reg_{name}']:g}" + (f" ({details[name]})" if name in details else "")
+    for name in REGULARIZERS
+    if s[f"reg_{name}"]
+  ]
   if not active:
     return f"{text}; no regularizers"
-  joints = len(s["reg_joint_limit_joints"] or ())
-  return f"{text}; regularizers x {_shown(s['reg_scale'])}: {', '.join(active)}" + (
-    f" ({joints} joints)" if s["reg_joint_limits"] else ""
-  )
+  return f"{text}; regularizers x {_shown(s['reg_scale'])}: {', '.join(active)}"
 
 
 def reward_flags(
@@ -270,6 +308,12 @@ def reward_flags(
   joints = s["reg_joint_limit_joints"]
   if s["reg_joint_limits"] and joints:
     flags.append(f'{_PARAMS}.regularizers.joint-limit-joints "{tuple(joints)!r}"')
+  if s["reg_leg_contact_threshold"] is not None:
+    threshold = _exact(s["reg_leg_contact_threshold"])
+    flags.append(f"{_PARAMS}.regularizers.leg-contact-threshold {threshold}")
+  if s["reg_leg_contact_owner"] is not None:
+    owner = s["reg_leg_contact_owner"]
+    flags.append(f"{_PARAMS}.regularizers.leg-contact-owner {owner}")
   if env_stages is not None:
     stages = tuple((int(u), str(p), float(v)) for u, p, v in env_stages)
     flags.append(f'--agent.env-stages "{stages!r}"')
@@ -359,6 +403,10 @@ def apply_reward_settings(cfg: Any, settings: Mapping[str, Any]) -> None:
     changes["scale"] = _or(s["reg_scale"], 1.0)
     if s["reg_joint_limit_joints"]:
       changes["joint_limit_joints"] = tuple(s["reg_joint_limit_joints"])
+    if s["reg_leg_contact_threshold"] is not None:
+      changes["leg_contact_threshold"] = float(s["reg_leg_contact_threshold"])
+    if s["reg_leg_contact_owner"] is not None:
+      changes["leg_contact_owner"] = str(s["reg_leg_contact_owner"])
     params["regularizers"] = replace(regs, **changes)
   elif any(s[f"reg_{name}"] for name in REGULARIZERS):
     raise ValueError("The env config's 'mimic' term has no regularizers to set.")

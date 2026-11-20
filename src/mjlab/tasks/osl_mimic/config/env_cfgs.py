@@ -19,18 +19,26 @@ What carries over unchanged:
 The CLF tasks add CLF-RL's decrease condition and regularizers to musclemimic's
 reward (``mdp.clf_cfg``: ``decay_form="paper"``, ``pen_w`` 0.5, and a 10-step V-dot
 window on the robot; ``mdp.clf_regularizers``: the OSL action rate and the leg and
-OSL joint limits, plus the servos' action rate on the robot, which also logs its
-servo torque costs), ramped in by the runner's env stages (``config/rl_cfg.py``).
-musclemimic's ``CLFReward`` comes back with all of
-``--env.rewards.mimic.params.clf.decay-form musclemimic``,
+OSL joint limits, the OSL striking the left leg (0.25 over 10 N), plus the servos'
+action rate on the robot, which also logs its servo torque costs), ramped in by the
+runner's env stages (``config/rl_cfg.py``). musclemimic's ``CLFReward`` comes back
+with all of ``--env.rewards.mimic.params.clf.decay-form musclemimic``,
 ``--env.rewards.mimic.params.clf.pen-w 0.25``, every regularizer at 0
-(``--env.rewards.mimic.params.regularizers.<name> 0``) and the old env stages:
+(``--env.rewards.mimic.params.regularizers.<name> 0``: ``osl-action-rate``,
+``servo-action-rate``, ``joint-limits`` and ``leg-contact``) and the old env stages:
 ``--agent.env-stages "()"`` here. Without that last flag the ramps still scale
 ``pen_w`` (0, then 0.125, until update 1000). The gait-library unicycle MSK tasks
 take ``pen-w 0`` and keep their recipe's own stages instead (its
 ``UNICYCLE_MSK_ENV_STAGES`` as the ``--agent.env-stages`` literal); stage 2 takes
 ``--agent.env-stages "()"``. The MimicReward tasks keep musclemimic's reward: every
 regularizer is 0 there.
+
+Every scene carries a contact sensor between the OSL and the biological left leg
+(``osl_mimic.leg_contact``; a sensor changes no physics): the reward reports the
+contact rate and the hardest strike (``leg_contact``, ``leg_contact_force``), and
+the CLF tasks charge strikes (``--env.rewards.mimic.params.regularizers.leg-contact``,
+0.25 by default; ``...regularizers.leg-contact-threshold``, 10 N; in stage 2
+``...regularizers.leg-contact-owner``, both channels).
 """
 
 from __future__ import annotations
@@ -66,6 +74,10 @@ from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.tasks.osl_mimic import mdp
+from mjlab.tasks.osl_mimic.leg_contact import (
+  LEG_CONTACT_DIAGNOSTICS,
+  leg_contact_sensor_cfg,
+)
 from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
 from mjlab.terrains import TerrainEntityCfg
 from mjlab.viewer import ViewerConfig
@@ -307,6 +319,11 @@ def osl_mimic_env_cfg(
     name: MetricsTermCfg(func=mdp.mimic_component, params={"name": name})
     for name in names
   }
+  # Per episode: the share of steps with a leg contact, and the hardest strike.
+  for name, reduce in zip(LEG_CONTACT_DIAGNOSTICS, ("mean", "max"), strict=True):
+    metrics[name] = MetricsTermCfg(
+      func=mdp.mimic_component, params={"name": name}, reduce=reduce
+    )
 
   return OslEnvCfg(
     decimation=DECIMATION,
@@ -314,6 +331,7 @@ def osl_mimic_env_cfg(
       terrain=TerrainEntityCfg(terrain_type="plane"),
       entities={"robot": entity},
       num_envs=NUM_ENVS if mode == "train" else 1,
+      sensors=(leg_contact_sensor_cfg(DECIMATION),),
     ),
     observations=_observations(model),
     actions=_actions(model),

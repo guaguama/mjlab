@@ -1,9 +1,9 @@
 """The robot recipe (round 7) and what it must leave alone (CPU).
 
-* Every OSL config outside the robot unicycle recipe is the CLF-RL reward commit's,
-  bit for bit (digests in ``fixtures/osl_cfg_digests.json``, see
-  ``osl_cfg_snapshot.py``): every musculoskeletal task, and the robot's stairs, FSM
-  runner and split-stairs.
+* Every OSL config outside the robot unicycle recipe is the digest fixture's, bit
+  for bit (``fixtures/osl_cfg_digests.json``, see ``osl_cfg_snapshot.py``; its
+  ``source`` names the commit): every musculoskeletal task, and the robot's stairs,
+  FSM runner and split-stairs.
 * The robot unicycle stage 1 and stage 2 defaults, value by value.
 * The gait library a process's envs share: one copy, never written, serving what a
   fresh load serves.
@@ -104,7 +104,7 @@ RECIPE_CHANGES: dict[str, dict[str, frozenset[str]]] = {
   },
 }
 """Config fields the robot recipe may change, per task and config (every other one
-must be the reward commit's)."""
+must be the fixture's)."""
 DT = 0.01
 
 
@@ -124,7 +124,7 @@ def test_the_digests_cover_every_osl_task() -> None:
 @pytest.mark.parametrize("task", osl_tasks())
 def test_configs_outside_the_recipe_are_the_reward_commits(task: str) -> None:
   """Every musculoskeletal task, and every robot config the recipe does not set,
-  equals the reward commit's field for field; the recipe's own changes stay in their
+  equals the fixture's field for field; the recipe's own changes stay in their
   fields."""
   want = _fixture()["tasks"][task]
   got = task_digests(task)
@@ -134,7 +134,7 @@ def test_configs_outside_the_recipe_are_the_reward_commits(task: str) -> None:
     changed = sorted(f for f in fields if want[kind].get(f) != got[kind].get(f))
     unexpected = sorted(set(changed) - allowed.get(kind, frozenset()))
     assert not unexpected, (
-      f"{task} {kind}: {unexpected} differ from the reward commit's configs. If the "
+      f"{task} {kind}: {unexpected} differ from the fixture's configs. If the "
       "base commit changed them, regenerate the digests from it (osl_cfg_snapshot)."
     )
     if "-MSK" in task:

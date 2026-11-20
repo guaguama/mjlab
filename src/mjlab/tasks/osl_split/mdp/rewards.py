@@ -37,7 +37,10 @@ stage-1 imitation reward, apart from the owner penalty split
 * the regularizers (``osl_mimic``'s ``RegularizerCfg``) go to their owners, inside
   each channel's floor: the OSL action rate and the OSL joints' limit excess to the
   OSL channel; the servo action rate, the human joints' limit excess and the servo
-  torque terms to the human channel.
+  torque terms to the human channel. The OSL/left-leg contact penalty goes where
+  ``RegularizerCfg.leg_contact_owner`` says: by default to both channels, each
+  charged in full, since both agents make the contact (the OSL's knee and ankle
+  angles, the human's hip and intact leg); ``"human"`` or ``"osl"`` charges one.
 
 Under the CLF's ``"paper"`` decrease condition each channel differences its own V
 over the V-dot window (``ClfCfg.vdot_window`` steps). It keeps the window's
@@ -49,9 +52,10 @@ boundary while they do.
 The additive terms (the twist reward) are separate manager terms; the runner adds
 them to the channels.
 
-When the scene has the OSL/left-leg contact sensor (the split env config adds it),
-the term also reports the leg-crossing diagnostics :data:`SPLIT_CONTACT_DIAGNOSTICS`.
-No reward uses them yet.
+When the scene has the OSL/left-leg contact sensor (every OSL env config has it),
+the term also reports the leg-contact diagnostics :data:`SPLIT_CONTACT_DIAGNOSTICS`
+(stage 1's ``leg_contact`` and ``leg_contact_force`` under stage 2's names, kept
+for continuity with earlier runs).
 """
 
 from __future__ import annotations
@@ -66,6 +70,7 @@ import torch
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import OSL_TORQUE_JOINTS
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.tasks.osl_mimic.leg_contact import substep_forces
 from mjlab.tasks.osl_mimic.mdp.reference import MimicReferenceSource
 from mjlab.tasks.osl_mimic.mdp.rewards import (
   CLF_GROUPS,
@@ -74,7 +79,6 @@ from mjlab.tasks.osl_mimic.mdp.rewards import (
   RegularizerCfg,
   mimic_reward,
 )
-from mjlab.tasks.osl_split.config.sensors import LEG_CONTACT_SENSOR
 from mjlab.tasks.osl_split.rl.layout import AGENTS, ActionLayout
 
 if TYPE_CHECKING:
@@ -96,7 +100,15 @@ REGULARIZER_OWNERS: dict[str, tuple[str, ...]] = {
 """The channel each single-owner regularizer goes to (``RegularizerCfg``): the
 servo rows belong to the human actor, the OSL rows to the OSL actor. The joint
 limits split by joint: the OSL knee and ankle to the OSL channel, every other
-watched joint to the human's."""
+watched joint to the human's. The leg contact goes to
+:data:`LEG_CONTACT_CHANNELS` of ``RegularizerCfg.leg_contact_owner``."""
+LEG_CONTACT_CHANNELS: dict[str, tuple[str, ...]] = {
+  "both": CHANNELS,
+  "human": ("human",),
+  "osl": ("osl",),
+}
+"""The channels each ``RegularizerCfg.leg_contact_owner`` charges the leg-contact
+cost to, each in full."""
 
 SITE_KERNELS = ("rpos", "rquat", "rvel_rot", "rvel_lin")
 """MimicReward's site kernels: per-site means over the axes, then the weighted mean
@@ -145,6 +157,8 @@ SPLIT_DIAGNOSTICS: tuple[str, ...] = (
   "split_regularizers_osl",
   "split_reg_joint_limits_human",
   "split_reg_joint_limits_osl",
+  "split_reg_leg_contact_human",
+  "split_reg_leg_contact_osl",
   *SPLIT_CLF_DIAGNOSTICS,
 )
 """Every key :class:`split_mimic_reward` adds to ``components``, (B,) each, read by
@@ -153,16 +167,18 @@ regularizers, as stage 1's ``penalty_total`` does; ``split_err_osl_*`` are ``|q 
 q_ref|`` in rad. ``split_regularizers_<channel>`` is the scaled regularizer cost
 inside the channel's floor (the team's for both channels without owner penalties),
 ``split_reg_joint_limits_<channel>`` the channel's joints' limit cost at its
-coefficient, before the scale."""
+coefficient, before the scale, and ``split_reg_leg_contact_<channel>`` the
+leg-contact cost the channel pays, at its coefficient, before the scale."""
 SPLIT_CONTACT_DIAGNOSTICS: tuple[str, ...] = (
   "split_leg_contact",
   "split_leg_contact_force",
 )
-"""The leg-crossing diagnostics, added to ``components`` when the scene has the
+"""The leg-contact diagnostics, added to ``components`` when the scene has the
 :data:`~..config.sensors.LEG_CONTACT_SENSOR`: ``split_leg_contact`` is 1 where an OSL
 collision geom touched the biological left leg in any physics substep of the step
 (its mean is a contact rate), ``split_leg_contact_force`` the largest net contact
-force over those substeps (N)."""
+force over those substeps (N). Stage 1's ``leg_contact`` and ``leg_contact_force``
+(``osl_mimic.leg_contact.LEG_CONTACT_DIAGNOSTICS``), equal to these."""
 
 Weights = dict[str, dict[str, float]]
 
@@ -330,7 +346,12 @@ class split_mimic_reward(mimic_reward):
       self._setup_clf_split(self._clf, len(relative), osl_sites, env)
 
     self.channel_rewards = torch.zeros(env.num_envs, len(CHANNELS), device=device)
-    self._leg_contact = _scene_sensor(env, LEG_CONTACT_SENSOR)
+    regularizers = self._regularizers
+    self._leg_contact_channels = (
+      LEG_CONTACT_CHANNELS[regularizers.leg_contact_owner]
+      if regularizers is not None
+      else CHANNELS
+    )
     self._group_weights: Weights = {}
     initial = channels.initial_weights
     self.set_group_weights(
@@ -566,6 +587,7 @@ class split_mimic_reward(mimic_reward):
     diagnostics["split_err_osl_ankle"] = osl_err[:, 1]
     zeros = torch.zeros_like(team)
     limits = self._reg_cache.get("joint_limits")
+    leg = self._reg_cache.get("leg_contact")
     for channel in CHANNELS:
       cost = regularized[channel]
       diagnostics[f"split_regularizers_{channel}"] = zeros if cost is None else cost
@@ -575,8 +597,12 @@ class split_mimic_reward(mimic_reward):
         if limits is not None and index.numel()
         else zeros
       )
-    if self._leg_contact is not None:
-      diagnostics.update(leg_contact_diagnostics(self._leg_contact.data))
+      diagnostics[f"split_reg_leg_contact_{channel}"] = (
+        leg if leg is not None and self._pays_leg_contact(channel) else zeros
+      )
+    if self._leg_contact_sensor is not None:
+      diagnostics["split_leg_contact"] = self.components["leg_contact"]
+      diagnostics["split_leg_contact_force"] = self.components["leg_contact_force"]
     self.components.update(diagnostics)
 
   ##
@@ -772,10 +798,16 @@ class split_mimic_reward(mimic_reward):
       out[agent] = penalty.clamp(min=-1.0)
     return out, regularized
 
+  def _pays_leg_contact(self, channel: str) -> bool:
+    """Whether ``channel``'s penalty holds the leg-contact cost: each owner's
+    without owner penalties, both channels pay the team's."""
+    return not self._split.owner_penalties or channel in self._leg_contact_channels
+
   def _channel_regularizers(self) -> dict[str, torch.Tensor | None]:
     """Per channel, its regularizers' cost times ``scale`` (None without one): the
     stage-1 term's costs (``_reg_cache``) by owner (:data:`REGULARIZER_OWNERS`), the
-    joint limits by joint."""
+    joint limits by joint, the leg contact by ``leg_contact_owner``
+    (:data:`LEG_CONTACT_CHANNELS`)."""
     out: dict[str, torch.Tensor | None] = dict.fromkeys(CHANNELS)
     cfg, costs = self._regularizers, self._reg_cache
     if cfg is None or not costs or float(cfg.scale) == 0.0:
@@ -786,6 +818,8 @@ class split_mimic_reward(mimic_reward):
       index = self._limit_index[channel]
       if limits is not None and index.numel():
         parts.append(limits.index_select(-1, index).sum(-1))
+      if "leg_contact" in costs and channel in self._leg_contact_channels:
+        parts.append(costs["leg_contact"])
       if parts:
         total = parts[0]
         for part in parts[1:]:
@@ -799,20 +833,11 @@ class split_mimic_reward(mimic_reward):
 ##
 
 
-def _scene_sensor(env: Any, name: str) -> Any | None:
-  """The scene's sensor ``name``, or None (a scene without it, or a fake env)."""
-  sensors = getattr(getattr(env, "scene", None), "sensors", None)
-  return sensors.get(name) if isinstance(sensors, Mapping) else None
-
-
 def leg_contact_diagnostics(data: Any) -> dict[str, torch.Tensor]:
   """:data:`SPLIT_CONTACT_DIAGNOSTICS` from the leg-contact sensor's
   ``ContactData``: the largest net-force magnitude over its substep history (the
-  current force without one) and over its primaries, and whether it is non-zero."""
-  history = getattr(data, "force_history", None)  # (B, P, H, 3)
-  if history is not None:
-    force = history.norm(dim=-1).amax(dim=-1)
-  else:
-    force = data.force.norm(dim=-1)  # (B, P, 3) -> (B, P)
-  force = force.amax(dim=-1)
+  current force without one) and over its primaries, and whether it is non-zero.
+  The term itself reports stage 1's equal ``leg_contact`` diagnostics under these
+  names."""
+  force = substep_forces(data).amax(dim=-1)
   return {"split_leg_contact": (force > 0.0).float(), "split_leg_contact_force": force}

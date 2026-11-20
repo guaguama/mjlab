@@ -1146,9 +1146,9 @@ def test_env_cfg_contract(
   for name in split:
     assert cfg.metrics[name].func is mimic_component
     assert cfg.metrics[name].params == {"name": name}
-  # The scene adds the leg-contact sensor only (test_leg_contact_sensor).
+  # The scene keeps stage 1's leg-contact sensor, once (test_leg_contact_sensor).
   assert [sensor.name for sensor in cfg.scene.sensors] == [sensors.LEG_CONTACT_SENSOR]
-  assert base.scene.sensors == ()
+  assert cfg.scene.sensors == base.scene.sensors
 
   # Everything else is stage 1's: physics randomization (actuator delays included),
   # terminations, command, simulation, actions.

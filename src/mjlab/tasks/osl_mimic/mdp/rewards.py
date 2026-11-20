@@ -18,8 +18,8 @@ it could make a step's reward negative, which rewards ending episodes early):
   ``decay_form="paper"``, the default; ``"musclemimic"`` is ``CLFReward``'s own);
 * regularizers (:class:`RegularizerCfg`), subtracted with the action penalties
   inside the -1 floor: the action rate of the OSL motors and of the robot model's
-  servos, the hard joint-limit excess of the legs and the OSL, and the robot
-  servos' torque and torque saturation.
+  servos, the hard joint-limit excess of the legs and the OSL, the robot servos'
+  torque and torque saturation, and the OSL striking the biological left leg.
 
 The total is ``max(0, imitation + max(-1, penalties - scale x regularizers) -
 pen_scale x pen_w x violation)``. With ``decay_form="musclemimic"``, musclemimic's
@@ -41,6 +41,12 @@ from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply_inverse
 
+from ..leg_contact import (
+  LEG_CONTACT_SENSOR,
+  contact_fraction,
+  scene_sensor,
+  substep_forces,
+)
 from .kinematics import (
   di_care_block,
   exact_decay_rate,
@@ -103,9 +109,20 @@ REGULARIZERS: tuple[str, ...] = (
   "joint_limits",
   "servo_torque",
   "servo_saturation",
+  "leg_contact",
 )
 """:class:`RegularizerCfg`'s coefficients, in the order of the ``reg_<name>``
 diagnostics."""
+LegContactOwner = Literal["both", "human", "osl"]
+LEG_CONTACT_OWNERS: tuple[str, ...] = get_args(LegContactOwner)
+LEG_CONTACT_THRESHOLD = 10.0
+"""Newtons: the default net contact force over which a substep counts as an OSL
+strike on the left leg (``RegularizerCfg.leg_contact_threshold``)."""
+_NO_LEG_CONTACT_SENSOR = (
+  f"regularizers.leg_contact is on, but the scene has no {LEG_CONTACT_SENSOR!r} "
+  "contact sensor to read (every OSL imitation config adds it: "
+  "osl_mimic.leg_contact.add_leg_contact_sensor)."
+)
 SERVO_LOG_DIAGNOSTICS: tuple[str, ...] = ("servo_torque_cost", "servo_saturation_cost")
 """``RegularizerCfg.log_servo_terms``'s diagnostics: the robot servos' ``servo_torque``
 and ``servo_saturation`` costs, unweighted (``reg_servo_*`` are the weighted costs
@@ -231,6 +248,13 @@ class RegularizerCfg:
     servo before its force limit: ``Kp (ctrl - q) - Kd qd`` from ``data.ctrl`` (the
     applied, possibly delayed, target), each world's (randomized) gains, and the
     servo's length and velocity (``q``, ``qd`` at gear 1).
+  * ``leg_contact``: the share of the step's physics substeps (0 to 1) in which the
+    net contact force between the OSL and the biological left leg exceeds
+    ``leg_contact_threshold``, from the scene's leg-contact sensor
+    (``osl_mimic.leg_contact``): robot_rl's ``undesired_contacts`` narrowed to the
+    one contact that matters here, and mjlab's ``self_collision_cost`` normalized.
+    The OSL foot never touches the leg (no ``conaffinity``), so foot crossings cost
+    nothing. In stage 2 it goes to the channels ``leg_contact_owner`` names.
 
   The servo terms are 0 on a model without servos. No term reads the OSL motors'
   actuator force, whose units differ between the models (the robot gears them).
@@ -247,6 +271,18 @@ class RegularizerCfg:
   """The joints ``joint_limits`` watches (:data:`LIMIT_JOINTS` by default)."""
   servo_torque: float = 0.0
   servo_saturation: float = 0.0
+  leg_contact: float = 0.0
+  """Per unit share of the step's substeps with an OSL strike on the left leg (a
+  strike in every substep costs the whole coefficient). The CLF tasks take
+  :data:`LEG_CONTACT_COEFFICIENT` (:func:`clf_regularizers`)."""
+  leg_contact_threshold: float = LEG_CONTACT_THRESHOLD
+  """Newtons: a substep counts when the OSL/left-leg net contact force exceeds it
+  (read at build)."""
+  leg_contact_owner: LegContactOwner = "both"
+  """Stage 2: the reward channel the leg-contact cost goes to (read at build).
+  ``"both"``, the default, charges it in full to each: the OSL actor's knee and
+  ankle and the human's hip and intact leg both make the contact. ``"human"`` or
+  ``"osl"`` charges one. Stage 1 has one reward and ignores it."""
   log_servo_terms: bool = False
   """Report the servo terms' costs, unweighted, as the diagnostics
   :data:`SERVO_LOG_DIAGNOSTICS` on every step, whatever their coefficients: a
@@ -264,14 +300,25 @@ def clf_cfg(model: str) -> ClfCfg:
   return ClfCfg(vdot_window=ROBOT_VDOT_WINDOW if model == "robot" else 1)
 
 
+LEG_CONTACT_COEFFICIENT = 0.25
+"""The CLF tasks' leg-contact coefficient: a strike over the whole step costs 0.25.
+Calibrated on round-6 and round-7 policies (2026-11-19): strikes are 100-200 N
+(median), on 0.1-1.6% of stress-validation steps, and last the whole step on 53-71%
+of them; 0.25 adds 5-17 points to the share of those steps the clip at 0 holds (at
+0.5, 9-45; at 1.0, 74-93% clip)."""
+
+
 def clf_regularizers(model: str) -> RegularizerCfg:
   """The CLF tasks' regularizers: the OSL action rate and the joint limits at 1,
-  and on the robot model its servos' action rate at 1. The servo torque terms stay
-  0 (opt-in), but the robot model logs their costs (``log_servo_terms``)."""
+  on the robot model its servos' action rate at 1, and the OSL/left-leg contact at
+  :data:`LEG_CONTACT_COEFFICIENT` over :data:`LEG_CONTACT_THRESHOLD`, charged to both
+  stage-2 channels. The servo torque terms stay 0 (opt-in), but the robot model logs
+  their costs (``log_servo_terms``)."""
   return RegularizerCfg(
     osl_action_rate=1.0,
     servo_action_rate=1.0 if model == "robot" else 0.0,
     joint_limits=1.0,
+    leg_contact=LEG_CONTACT_COEFFICIENT,
     log_servo_terms=model == "robot",
   )
 
@@ -395,6 +442,9 @@ class mimic_reward(ManagerTermBase):
     # or (B, J) per joint for the joint limits.
     self._reg_cache: dict[str, torch.Tensor] = {}
 
+    # The scene's OSL/left-leg contact sensor, for the leg-contact diagnostics and
+    # regularizer (None in a scene without it).
+    self._leg_contact_sensor = scene_sensor(env, LEG_CONTACT_SENSOR)
     self._clf: ClfCfg | None = params.get("clf")
     if self._clf is not None:
       self._setup_clf(self._clf, cmd, env)
@@ -479,6 +529,23 @@ class mimic_reward(ManagerTermBase):
       [names.index(j) for j in joints], dtype=torch.long, device=device
     )
     self._servo_ids, self._servo_problem = _position_servos(env, cmd.robot)
+    threshold = cfg.leg_contact_threshold
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+      raise TypeError(
+        f"regularizers.leg_contact_threshold must be a number, got {threshold!r}"
+      )
+    if not (math.isfinite(threshold) and threshold >= 0.0):
+      raise ValueError(
+        f"regularizers.leg_contact_threshold must be finite and >= 0, got {threshold}"
+      )
+    if cfg.leg_contact_owner not in LEG_CONTACT_OWNERS:
+      raise ValueError(
+        f"regularizers.leg_contact_owner must be one of {LEG_CONTACT_OWNERS}, got "
+        f"{cfg.leg_contact_owner!r}"
+      )
+    self._leg_contact_threshold = float(threshold)
+    if cfg.leg_contact != 0.0 and self._leg_contact_sensor is None:
+      raise ValueError(_NO_LEG_CONTACT_SENSOR)
 
   def __call__(
     self,
@@ -567,10 +634,13 @@ class mimic_reward(ManagerTermBase):
     if self._torque_dofs.numel():
       qfrc = env.sim.data.qfrc_actuator[:, self._torque_dofs]
       penalty = penalty - (self._torque_weights * qfrc.square()).sum(-1)
+    # (B, H) the OSL/left-leg contact force in each substep of the step.
+    sensor = self._leg_contact_sensor
+    leg_forces = None if sensor is None else substep_forces(sensor.data)
     reg_total = None
     servo_log: dict[str, torch.Tensor] = {}
     if self._regularizers is not None:
-      self._reg_cache, servo_log = self._regularizer_costs(env, cmd, action)
+      self._reg_cache, servo_log = self._regularizer_costs(env, cmd, action, leg_forces)
       scale = float(self._regularizers.scale)
       if self._reg_cache and scale != 0.0:
         reg_total = scale * _summed(self._reg_cache.values())
@@ -630,6 +700,10 @@ class mimic_reward(ManagerTermBase):
         self.components[f"reg_{name}"] = zeros if cost is None else cost
       self.components["reg_total"] = zeros if reg_total is None else reg_total
     self.components.update(servo_log)  # Log only: never in the reward.
+    if leg_forces is not None:
+      strike = leg_forces.amax(dim=-1)
+      self.components["leg_contact"] = (strike > 0.0).float()
+      self.components["leg_contact_force"] = strike
     if self._muscle_acts is not None:
       act = env.sim.data.act[:, self._muscle_acts]
       self.components[ACTIVATION_DIAGNOSTIC] = act.square().mean(-1)
@@ -663,11 +737,17 @@ class mimic_reward(ManagerTermBase):
   ##
 
   def _regularizer_costs(
-    self, env: ManagerBasedRlEnv, cmd: MimicReferenceSource, action: torch.Tensor
+    self,
+    env: ManagerBasedRlEnv,
+    cmd: MimicReferenceSource,
+    action: torch.Tensor,
+    leg_forces: torch.Tensor | None = None,
   ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Each regularizer with a non-zero coefficient (and something to act on), at
     its coefficient and before ``scale``: (B,), the joint limits (B, J) per joint;
-    and, with ``log_servo_terms``, the servo terms' unweighted costs (log only)."""
+    and, with ``log_servo_terms``, the servo terms' unweighted costs (log only).
+    ``leg_forces`` is the step's (B, H) OSL/left-leg contact force per substep
+    (None without the sensor)."""
     cfg = self._regularizers
     assert cfg is not None
     costs: dict[str, torch.Tensor] = {}
@@ -693,6 +773,13 @@ class mimic_reward(ManagerTermBase):
           costs[name] = want[name] * value
       if log:
         logged = {f"{name}_cost": value for name, value in raw.items()}
+    c = float(cfg.leg_contact)
+    if c != 0.0:
+      if leg_forces is None:  # Staged on in a scene without the sensor.
+        raise RuntimeError(_NO_LEG_CONTACT_SENSOR)
+      costs["leg_contact"] = c * contact_fraction(
+        leg_forces, self._leg_contact_threshold
+      )
     return costs, logged
 
   @staticmethod

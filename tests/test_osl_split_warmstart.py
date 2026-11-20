@@ -36,6 +36,8 @@ from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward, _actions
 from mjlab.tasks.osl_mimic.config.rl_cfg import CLF_ENV_STAGES, MuscleMimicPpoCfg
 from mjlab.tasks.osl_mimic.mdp.rewards import (
+  LEG_CONTACT_COEFFICIENT,
+  LEG_CONTACT_THRESHOLD,
   LIMIT_JOINTS,
   ClfCfg,
   RegularizerCfg,
@@ -824,6 +826,9 @@ def test_stage1_env_settings(tmp_path: Path) -> None:
     "reg_servo_torque": 0.0,
     "reg_servo_saturation": 0.0,
     "reg_joint_limit_joints": list(LIMIT_JOINTS),
+    "reg_leg_contact": LEG_CONTACT_COEFFICIENT,
+    "reg_leg_contact_threshold": LEG_CONTACT_THRESHOLD,
+    "reg_leg_contact_owner": None,  # Stage 1 has no reward channels.
   }
   regions = [list(map(list, box[:2])) + [box[2]] for box in UNICYCLE_FWD_ARC_REGIONS]
   sampling = {"sampling": "library", "fwd_arc_regions": regions}
@@ -934,6 +939,7 @@ def test_reward_settings_of_old_runs_and_their_mismatches() -> None:
     "CLF penalty pen_w x pen_scale 0.0 vs 0.5",
     "regularizer osl_action_rate (x scale) 0.0 vs 1.0",
     "regularizer joint_limits (x scale) 0.0 vs 1.0",
+    "regularizer leg_contact (x scale) 0.0 vs 0.25",
   ]
   assert reward_mismatches(legacy, new) == lines
   # A lineage converted before the reward settings were recorded reads the same.
@@ -971,9 +977,11 @@ def test_reward_settings_of_old_runs_and_their_mismatches() -> None:
     == []
   )
   # The effective regularizer counts, whatever scale reaches it.
-  half = RegularizerCfg(scale=0.5, osl_action_rate=2.0, joint_limits=2.0)
+  half = RegularizerCfg(
+    scale=0.5, osl_action_rate=2.0, joint_limits=2.0, leg_contact=0.5
+  )
   assert reward_mismatches(reward_settings(ClfCfg(), half), new) == []
-  knee = RegularizerCfg(joint_limits=1.0, osl_action_rate=1.0)
+  knee = RegularizerCfg(joint_limits=1.0, osl_action_rate=1.0, leg_contact=0.25)
   knee.joint_limit_joints = ("knee_angle_l",)
   assert reward_mismatches(reward_settings(ClfCfg(), knee), new) == [
     f"joint_limit_joints ['knee_angle_l'] vs {sorted(LIMIT_JOINTS)}"

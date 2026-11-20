@@ -260,6 +260,34 @@ Added
 - The stage-2 warm start records stage 1's command sampling (``sampling`` and
   ``fwd_arc_regions`` of its last launch) and warns, naming stage 1's flags, when
   stage 2 samples commands otherwise.
+- An OSL/left-leg contact penalty (robot_rl's ``undesired_contacts``, narrowed to the
+  prosthesis striking the intact leg) and its sensor, in every OSL imitation task
+  (stage 1, stairs, stage 2, stage 1.5; both models). Every scene now carries stage
+  2's contact sensor between the OSL's subtree and the biological left leg
+  (``osl_mimic.leg_contact``), and the reward reports the contact rate and the
+  hardest strike as ``leg_contact`` and ``leg_contact_force`` (stage 2 keeps
+  ``split_leg_contact`` and ``split_leg_contact_force``). The regularizer
+  ``leg_contact`` (``--env.rewards.mimic.params.regularizers.leg-contact``) charges
+  the share of the step's physics substeps whose net contact force exceeds
+  ``leg_contact_threshold`` (``...regularizers.leg-contact-threshold``) inside the -1
+  floor with the other regularizers, times their ``scale``, so the task's env stages
+  ramp it in with them; it can be staged. **It is on in every CLF task: 0.25 over
+  10 N** (a strike through the whole step costs 0.25; on round-6 and round-7 policies
+  strikes are 100-200 N and last the whole step on 53-71% of them); the MimicReward
+  tasks keep it at 0. In stage 2 it goes in full to both reward channels, since both
+  agents make the contact (the OSL's knee and ankle, the human's hip and intact leg);
+  ``...regularizers.leg-contact-owner`` ``human`` or ``osl`` charges one. New
+  diagnostics ``reg_leg_contact`` and ``split_reg_leg_contact_<channel>``. The reward
+  settings record the coefficient, the threshold and (stage 2) the owner; a run that
+  records none trained without the penalty, so resuming it on a CLF task's defaults
+  is refused unless ``--env.rewards.mimic.params.regularizers.leg-contact 0`` (its
+  reward) or ``--agent.allow-reward-mismatch True``, and warm-starting the default
+  stage 2 from such a stage-1 run needs
+  ``--agent.warm-start.allow-reward-mismatch True`` (or ``...leg-contact 0`` in
+  stage 2). The OSL foot does not collide with the leg, so foot crossings cost
+  nothing. A sensor changes no physics: at ``...leg-contact 0`` every reward is the
+  previous one, bit for bit, and the stage-1 exporters leave the sensor out of a
+  bundle's ``model.mjb``.
 
 Changed
 ^^^^^^^
@@ -414,7 +442,8 @@ Changed
   (``--env.rewards.mimic.params.clf.pen-w``: 0 for the musculoskeletal unicycle
   tasks and everything built on them, 0.25 elsewhere), every regularizer at 0
   (``--env.rewards.mimic.params.regularizers.osl-action-rate 0``,
-  ``...servo-action-rate 0``, ``...joint-limits 0``) and the old env stages
+  ``...servo-action-rate 0``, ``...joint-limits 0``, and since the leg-contact
+  penalty ``...leg-contact 0``) and the old env stages
   (``--agent.env-stages``: stage 1's recipe stages alone, ``"()"`` in stage 2); the
   V-dot window and the servo-cost log leave that reward untouched.
 - The stage-2 warm start records stage 1's reward settings (the CLF decrease

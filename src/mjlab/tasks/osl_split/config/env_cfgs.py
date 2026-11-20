@@ -17,9 +17,11 @@ observation, unchanged. The changes:
 * the imitation reward becomes :class:`~..mdp.split_mimic_reward` under the same name,
   ``mimic``, so the stage-1 diagnostics keep their keys: it returns the same team
   reward, exposes the two agents' reward channels, and adds their diagnostics;
-* the scene gains a contact sensor between the OSL and the biological left leg
-  (:func:`~.sensors.leg_contact_sensor_cfg`), which the split reward reports as
-  leg-crossing diagnostics (no penalty): a sensor changes no physics.
+* the scene keeps stage 1's contact sensor between the OSL and the biological left
+  leg (:func:`~.sensors.leg_contact_sensor_cfg`; added here to a stage-1 config
+  without one), which the split reward reports as leg-contact diagnostics and, with
+  ``regularizers.leg_contact`` above 0, charges to the channels
+  ``regularizers.leg_contact_owner`` names: a sensor changes no physics.
 
 The stage-1 perception switches (``OslDrCfg.encoder_bias`` and ``obs_noise``) edit
 the ``actor`` group, which is now the human's observation, so they are refused.
@@ -48,13 +50,14 @@ from mjlab.tasks.osl_gait_library.config.dr import OslDrCfg
 from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
 from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward
+from mjlab.tasks.osl_mimic.leg_contact import add_leg_contact_sensor
 from mjlab.tasks.osl_mimic.mdp import mimic_component
 from mjlab.tasks.osl_mimic.touch_sites import CLI_FLAG as TOUCH_SITES_FLAG
 from mjlab.tasks.osl_mimic.touch_sites import ENV_FIELD as TOUCH_SITES_FIELD
 from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
 from mjlab.tasks.osl_split import mdp
 
-from .sensors import leg_contact_sensor_cfg, with_osl_sensors
+from .sensors import with_osl_sensors
 
 REWARD_NAME = "mimic"
 """The imitation reward's term name, kept from stage 1."""
@@ -233,8 +236,9 @@ def apply_split_stage(
   osl_obs: mdp.OslObsCfg | None = None,
 ) -> None:
   """Turn a stage-1 OSL config into its stage-2 split counterpart, in place (the
-  module docstring's changes): the OSL sensors, the leg-contact sensor, no
-  ``critic`` group, the ``osl`` group, and the split reward with its metrics.
+  module docstring's changes): the OSL sensors, the leg-contact sensor (unless
+  stage 1's config has it), no ``critic`` group, the ``osl`` group, and the split
+  reward with its metrics.
 
   The ``osl`` group is :func:`~..mdp.osl_observation_group` of ``mode`` and
   ``osl_obs``; :func:`sync_osl_group` checks it against the touch sites once the
@@ -255,7 +259,7 @@ def apply_split_stage(
   cfg.scene.entities["robot"] = replace(
     entity, spec_fn=with_osl_sensors(entity.spec_fn)
   )
-  cfg.scene.sensors = (*cfg.scene.sensors, leg_contact_sensor_cfg(cfg.decimation))
+  add_leg_contact_sensor(cfg)
 
   del cfg.observations["critic"]
   cfg.observations[mdp.OSL_OBS_GROUP] = mdp.osl_observation_group(mode, osl_obs)
