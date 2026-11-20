@@ -46,8 +46,9 @@ from __future__ import annotations
 
 import inspect
 import os
+import shlex
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -66,7 +67,11 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.osl_mimic.mdp import MimicMotionCommandCfg, mimic_reward
 from mjlab.tasks.osl_mimic.reward_settings import CHECKPOINT_KEY as REWARD_KEY
-from mjlab.tasks.osl_mimic.reward_settings import check_resume_reward, reward_record
+from mjlab.tasks.osl_mimic.reward_settings import (
+  check_resume_reward,
+  read_params_yaml,
+  reward_record,
+)
 from mjlab.tasks.osl_mimic.touch_sites import (
   CHECKPOINT_KEY,
   check_checkpoint_file,
@@ -211,6 +216,79 @@ def _live_params(func: Any) -> frozenset[str] | None:
   if inspect.isfunction(func) or inspect.ismethod(func):
     return None
   return frozenset()
+
+
+NETWORKS = ("actor", "critic", "osl_actor", "osl_critic")
+"""The runner configs' model blocks a checkpoint's run may have sized (stage 1 has
+the first two)."""
+
+
+def run_hidden_dims(checkpoint: str | Path) -> dict[str, tuple[int, ...]]:
+  """Each network's ``hidden_dims`` as ``checkpoint``'s run built it, from the run's
+  ``params/agent.yaml`` beside it; empty when that file is missing or unreadable."""
+  agent = read_params_yaml(Path(checkpoint).parent / "params" / "agent.yaml")
+  if not isinstance(agent, Mapping):
+    return {}
+  dims: dict[str, tuple[int, ...]] = {}
+  for name in NETWORKS:
+    block = agent.get(name)
+    if isinstance(block, Mapping) and block.get("hidden_dims"):
+      dims[name] = tuple(int(dim) for dim in block["hidden_dims"])
+  return dims
+
+
+def configure_networks_for_checkpoint(
+  agent_cfg: Any, checkpoint: str | Path
+) -> dict[str, tuple[int, ...]]:
+  """Size ``agent_cfg``'s networks as ``checkpoint``'s run did
+  (:func:`run_hidden_dims`), in place, for a tool that rebuilds the checkpoint's
+  policy from the task's config: robot runs from before 2026-11-19 trained larger
+  networks than today's robot default. Returns the networks it changed, with their
+  dims."""
+  changed: dict[str, tuple[int, ...]] = {}
+  for name, dims in run_hidden_dims(checkpoint).items():
+    model = getattr(agent_cfg, name, None)
+    if model is not None and tuple(model.hidden_dims) != dims:
+      model.hidden_dims = dims
+      changed[name] = dims
+  return changed
+
+
+UNQUOTED_FLAGS_NOTE = (
+  "Inside R7_EXTRA (split on whitespace, no quotes) pass the same flags without "
+  "the quotes."
+)
+"""The sentence the refusals add after the :func:`agent_flag` flags they name: the
+round-7 launchers split ``R7_EXTRA`` on whitespace and pass the words on unquoted."""
+
+
+def agent_flag(path: Sequence[str], value: Any) -> str:
+  """The ``--agent`` flag that sets the config field at ``path`` (``("actor",
+  "hidden_dims")``) to ``value``, shell-ready: a collection as a Python literal
+  without spaces (mjlab's command line takes collections that way), and the value
+  quoted for the shell, so a collection is single-quoted, e.g.
+  ``--agent.actor.hidden-dims '(1024,1024,512,512)'``."""
+  if isinstance(value, (list, tuple)):
+    items = ",".join(repr(item) for item in value)
+    text = f"({items},)" if len(value) == 1 else f"({items})"
+  else:
+    text = value if isinstance(value, str) else repr(value)
+  flag = ".".join(part.replace("_", "-") for part in ("agent", *path))
+  return f"--{flag} {shlex.quote(text)}"
+
+
+def hidden_dims_flags(
+  checkpoint: str | Path, train_cfg: Mapping[str, Any]
+) -> list[str]:
+  """The ``--agent`` flags (:func:`agent_flag`) that size ``train_cfg``'s networks
+  as ``checkpoint``'s run did (:func:`run_hidden_dims`), one per network that
+  differs."""
+  flags = []
+  for name, dims in run_hidden_dims(checkpoint).items():
+    block = train_cfg.get(name)
+    if isinstance(block, Mapping) and tuple(block.get("hidden_dims") or ()) != dims:
+      flags.append(agent_flag((name, "hidden_dims"), dims))
+  return flags
 
 
 def resumes_training(load_cfg: Mapping[str, Any] | None) -> bool:
@@ -401,11 +479,23 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
 
     Raises:
       ValueError: On a touch-site mismatch, naming the ``--env.osl-touch-sites``
-        value that fixes it.
+        value that fixes it, or for a state-dict size mismatch with networks sized
+        otherwise than the checkpoint's run sized them, naming the ``--agent``
+        flags that build them. Any other load error is re-raised unchanged.
     """
     env = self.env.unwrapped
     check_checkpoint_file(path, env)
-    infos = super().load(path, load_cfg, strict, map_location)
+    try:
+      infos = super().load(path, load_cfg, strict, map_location)
+    except RuntimeError as err:
+      flags = hidden_dims_flags(path, self.cfg) if "size mismatch" in str(err) else []
+      if not flags:
+        raise
+      raise ValueError(
+        f"{path} holds networks of other sizes than this run builds (a robot run "
+        "from before 2026-11-19 trained larger ones).\n"
+        f"Build them as its run did: {' '.join(flags)}\n{UNQUOTED_FLAGS_NOTE}\n{err}"
+      ) from err
     self._resumed = (path, infos) if resumes_training(load_cfg) else None
     return infos
 
@@ -449,6 +539,18 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     exists: its OSL touch sites (``play`` calls this; it takes no ``--env``
     overrides)."""
     configure_for_checkpoint(env_cfg, checkpoint)
+
+  @classmethod
+  def configure_agent_for_checkpoint(
+    cls, agent_cfg: Any, checkpoint: str | Path
+  ) -> None:
+    """Make ``agent_cfg`` size the networks as ``checkpoint``'s run did, before the
+    runner exists (:func:`configure_networks_for_checkpoint`; ``play`` calls this,
+    it takes no ``--agent`` overrides), and say what changed."""
+    changed = configure_networks_for_checkpoint(agent_cfg, checkpoint)
+    if changed:
+      text = ", ".join(f"{name} {dims}" for name, dims in changed.items())
+      print(f"[INFO] Networks as the checkpoint's run built them: {text}.")
 
   ##
   # Validation.

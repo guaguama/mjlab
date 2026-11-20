@@ -13,7 +13,8 @@ task is rebuilt from code (as the exporter does), with the OSL foot touch sites 
 checkpoint was trained with (``touch_sites.run_touch_sites``) and its run's reward
 settings (``reward_settings.checkpoint_reward_record``: a run from before 2026-11-18
 scores under its own reward, not today's defaults), the checkpoint is loaded into
-the task's runner, and the runner's passes run once per inference mode:
+the task's runner, its networks sized as the run's ``params/agent.yaml`` records,
+and the runner's passes run once per inference mode:
 
 * validation (``Validation*/``): every library clip in its own env from phase 0 at
   its own twist, on the nominal plant with mid-range actuator delays, for one 20 s
@@ -119,6 +120,7 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
   )
   from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
   from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
+  from mjlab.tasks.osl_mimic.rl.runner import configure_networks_for_checkpoint
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
   from mjlab.utils.torch import configure_torch_backends
 
@@ -166,7 +168,10 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
     print(f"[WARN] Differs from the run's env.yaml: {issue}", file=sys.stderr)
   env_cfg.scene.num_envs = 2  # The runner needs a training env; the evals own theirs.
 
-  agent_cfg = asdict(load_rl_cfg(task_id))
+  rl_cfg = load_rl_cfg(task_id)
+  # A robot run from before 2026-11-19 trained larger networks than today's default.
+  configure_networks_for_checkpoint(rl_cfg, checkpoint)
+  agent_cfg = asdict(rl_cfg)
   agent_cfg["logger"] = "tensorboard"
   agent_cfg["video"] = {**agent_cfg.get("video", {}), "enabled": False}
   # The checkpoint's own std, untouched by any training-time bound.

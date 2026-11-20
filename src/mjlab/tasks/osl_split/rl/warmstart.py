@@ -43,8 +43,9 @@ stage-1 weights: another activation or layer-norm epsilon loads strictly but
 computes something else (:func:`architecture_mismatches`).
 
 Everything here runs on CPU and never touches CUDA. A stage-1 checkpoint (about
-0.4 GB, half of it optimizer state) is loaded memory-mapped, and the verification
-rebuilds both networks from the run's ``params/agent.yaml``.
+0.4 GB for MSK, half of it optimizer state; a robot one about a tenth of that) is
+loaded memory-mapped, and the verification rebuilds both networks from the run's
+``params/agent.yaml``.
 """
 
 from __future__ import annotations

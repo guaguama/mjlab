@@ -34,6 +34,7 @@ from mjlab.tasks.osl_mimic.config.env_cfgs import (
 from mjlab.tasks.osl_mimic.config.rl_cfg import (
   HIDDEN_DIMS,
   NUM_UPDATES,
+  ROBOT_HIDDEN_DIMS,
   MuscleMimicPpoCfg,
   OslMimicRunnerCfg,
 )
@@ -138,7 +139,9 @@ def test_task_contract(task: str) -> None:
   assert alg.learning_rate == 4e-4 and alg.entropy_coef == 0.0
   assert alg.value_loss_coef == 0.25
   assert alg.actor_bias_init == ("qpos0" if model == "robot" else "none")
-  assert rl.actor.hidden_dims == HIDDEN_DIMS
+  # musclemimic's 16 layers for the muscles; the robot's networks are smaller.
+  dims = ROBOT_HIDDEN_DIMS if model == "robot" else HIDDEN_DIMS
+  assert rl.actor.hidden_dims == rl.critic.hidden_dims == dims
   assert rl.actor.distribution_cfg is not None
   assert rl.actor.distribution_cfg["init_std"] == (0.2 if model == "robot" else 3.0)
   assert rl.validation.interval == 30

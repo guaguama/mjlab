@@ -29,7 +29,8 @@ The robot's unicycle split tasks train with the robot recipe
 cadence as defaults, on the robot stage-1 recipe's inherited settings (8192 envs,
 bfloat16 Newton-Schulz). The tasks that reuse this config on another stage 1 (stage
 1.5, stairs stage 2) build it with ``robot_recipe=False`` and keep the robot's
-settings from before that recipe.
+settings from before that recipe, networks aside: every robot config builds
+``ROBOT_HIDDEN_DIMS``.
 """
 
 from __future__ import annotations
@@ -64,8 +65,9 @@ ROBOT_STAGE2_VALIDATION_INTERVAL = 60
 """Round 6's stage-2 cadence, set explicitly: the validation interval is otherwise
 copied from the robot's stage-1 recipe (125)."""
 SAVE_INTERVAL = 250
-"""Stage-local iterations between checkpoints (about 0.7 GB each: the human actor and
-two 24M-parameter critics with their optimizer states)."""
+"""Stage-local iterations between checkpoints (about 0.7 GB each for MSK: the human
+actor and two 27M-parameter critics with their optimizer states; a tenth of that for
+the robot)."""
 STRESS_INTERVAL = 120
 """Stage-local iterations between stress validations (stage 1's)."""
 OSL_HIDDEN_DIMS = (256, 256, 256)
@@ -502,9 +504,10 @@ def osl_split_runner_cfg(
     model, socket, reward, experiment_name: As the stage-1 task's.
     robot_recipe: The robot's unicycle recipe, stage 1's and stage 2's
       (:func:`apply_unicycle_robot_split_recipe`); False keeps the robot's settings
-      from before it, for the tasks that reuse this config on another stage 1 (stage
-      1.5's FSM, stairs stage 2). The musculoskeletal model's settings are the same
-      either way.
+      from before it, networks aside (every robot config builds
+      ``ROBOT_HIDDEN_DIMS``), for the tasks that reuse this config on another stage
+      1 (stage 1.5's FSM, stairs stage 2). The musculoskeletal model's settings are
+      the same either way.
   """
   base = osl_gait_library_runner_cfg(
     model,
@@ -528,16 +531,19 @@ def osl_split_runner_cfg(
   cfg.algorithm = SplitPpoCfg(
     **{name: getattr(base.algorithm, name) for name in INHERITED_PPO_FIELDS}
   )
+  # The networks that take stage-1 weights are built as stage 1 builds them (the
+  # model's MODEL_HIDDEN_DIMS); the OSL actor is stage 2's own.
   cfg.actor = MuscleMimicModelCfg(
+    hidden_dims=base.actor.hidden_dims,
     distribution_cfg={
       "class_name": "GaussianDistribution",
       "init_std": INIT_STD[model],  # Replaced by the warm start's.
       "std_type": "log",
-    }
+    },
   )
-  cfg.critic = MuscleMimicModelCfg()
+  cfg.critic = MuscleMimicModelCfg(hidden_dims=base.critic.hidden_dims)
   cfg.osl_actor = OslActorModelCfg()
-  cfg.osl_critic = MuscleMimicModelCfg()
+  cfg.osl_critic = MuscleMimicModelCfg(hidden_dims=base.critic.hidden_dims)
   cfg.obs_groups = dict(OBS_GROUPS)
   cfg.max_iterations = STAGE2_ITERATIONS
   cfg.save_interval = SAVE_INTERVAL

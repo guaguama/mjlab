@@ -35,6 +35,7 @@ from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import (
   get_spec,
 )
 from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.rl import MjlabOnPolicyRunner
 from mjlab.scripts.play import strip_disturbances
 from mjlab.tasks.osl_fsm.config.env_cfgs import osl_fsm_env_cfg
 from mjlab.tasks.osl_fsm.config.rl_cfg import osl_fsm_runner_cfg
@@ -100,7 +101,7 @@ from mjlab.tasks.osl_mimic.config.rl_cfg import (
 from mjlab.tasks.osl_mimic.mdp import REGULARIZERS, RegularizerCfg, clf_regularizers
 from mjlab.tasks.osl_mimic.mdp.kinematics import relative_site_quantities
 from mjlab.tasks.osl_mimic.reward_settings import env_reward_settings
-from mjlab.tasks.osl_mimic.rl.runner import stage_accessors
+from mjlab.tasks.osl_mimic.rl.runner import UNQUOTED_FLAGS_NOTE, stage_accessors
 from mjlab.tasks.osl_split.config.env_cfgs import osl_split_env_cfg
 from mjlab.tasks.osl_split.config.rl_cfg import osl_split_runner_cfg
 from mjlab.tasks.osl_split.mdp import LEGACY_OSL_SENSORS, OslObsCfg
@@ -1185,6 +1186,62 @@ def _resume_cfg(**changes: Any) -> dict[str, Any]:
   cfg["validation"].update(interval=0, stress_interval=0)
   cfg.update(changes)
   return cfg
+
+
+def test_a_checkpoint_of_other_network_sizes_names_the_flags(
+  tmp_path: Path,
+  capsys: pytest.CaptureFixture[str],
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """A load into networks sized otherwise than the checkpoint's run sized them (a
+  robot run from before 2026-11-19 under today's smaller default) is refused with
+  the flags that build them, read from the run's params/agent.yaml, quoted for the
+  shell; any other load error is the load's own, unchanged. Sized from that file,
+  as play and the evaluation size it, the checkpoint loads."""
+  cfg = _resume_cfg()
+  GaitLibraryOnPolicyRunner(
+    cast(Any, _reward_env()), cfg, str(tmp_path / "old"), "cpu"
+  ).learn(1)
+  checkpoint = str(tmp_path / "old" / "model_0.pt")
+  dump_yaml(tmp_path / "old" / "params" / "agent.yaml", cfg)
+  other = _resume_cfg()
+  for key in ("actor", "critic"):
+    other[key]["hidden_dims"] = (12, 10)
+  runner = GaitLibraryOnPolicyRunner(cast(Any, _reward_env()), other, None, "cpu")
+  with pytest.raises(ValueError, match="networks of other sizes") as refused:
+    runner.load(checkpoint)
+  dims = ",".join(str(dim) for dim in HIDDEN)
+  flags = f"--agent.actor.hidden-dims '({dims})' --agent.critic.hidden-dims '({dims})'"
+  # The flags end their line, so copying them takes no punctuation along; the
+  # R7_EXTRA note follows on its own line.
+  lines = str(refused.value).splitlines()
+  assert lines[1] == f"Build them as its run did: {flags}"
+  assert lines[2] == UNQUOTED_FLAGS_NOTE
+  assert "size mismatch" in str(refused.value.__cause__)
+  # A load error that is not a size mismatch (missing keys, a device) is not
+  # blamed on the sizes, though they differ.
+  error = RuntimeError("Error(s) in loading state_dict: Missing key(s): 'mlp.0'")
+
+  def fail(*args: Any, **kwargs: Any) -> Any:
+    raise error
+
+  with monkeypatch.context() as patch:
+    patch.setattr(MjlabOnPolicyRunner, "load", fail)
+    with pytest.raises(RuntimeError) as raised:
+      runner.load(checkpoint)
+  assert raised.value is error
+
+  agent = SimpleNamespace(
+    actor=SimpleNamespace(hidden_dims=(12, 10)),
+    critic=SimpleNamespace(hidden_dims=(12, 10)),
+  )
+  capsys.readouterr()
+  GaitLibraryOnPolicyRunner.configure_agent_for_checkpoint(agent, checkpoint)
+  assert "Networks as the checkpoint's run built them" in capsys.readouterr().out
+  for key in ("actor", "critic"):
+    other[key]["hidden_dims"] = getattr(agent, key).hidden_dims
+  sized = GaitLibraryOnPolicyRunner(cast(Any, _reward_env()), other, None, "cpu")
+  sized.load(checkpoint)
 
 
 def test_a_resume_onto_another_reward_is_refused(

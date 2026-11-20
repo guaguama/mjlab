@@ -5,6 +5,9 @@
   ``source`` names the commit): every musculoskeletal task, and the robot's stairs,
   FSM runner and split-stairs.
 * The robot unicycle stage 1 and stage 2 defaults, value by value.
+* The robot's networks (2026-11-19): every robot task's actor and critic, stage 2's
+  included, at ``ROBOT_HIDDEN_DIMS``; a stage-1 run with musclemimic's networks
+  still resumes, starts stage 2 and plays through the flags or its params/.
 * The gait library a process's envs share: one copy, never written, serving what a
   fresh load serves.
 """
@@ -16,8 +19,9 @@ import hashlib
 import json
 import math
 import os
+import shlex
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -26,11 +30,19 @@ import mujoco
 import numpy as np
 import pytest
 import torch
+import tyro
 from osl_cfg_snapshot import FIXTURE, KINDS, osl_tasks, task_digests
 
+import mjlab
+import mjlab.envs
+import mjlab.rl
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Socket, get_spec
 from mjlab.envs import ManagerBasedRlEnv
+from mjlab.rl import RslRlOnPolicyRunnerCfg
+from mjlab.scripts import play
+from mjlab.scripts.train import TrainConfig
 from mjlab.tasks.osl_gait_library.config.env_cfgs import (
+  UNICYCLE_LIBRARY_ENV_VAR,
   UNICYCLE_ROBOT_NUM_ENVS,
   UNICYCLE_ROBOT_ROOT_DEVIATION,
   UNICYCLE_ROBOT_TWIST_WEIGHT,
@@ -43,25 +55,39 @@ from mjlab.tasks.osl_gait_library.config.rl_cfg import (
   GaitLibraryRunnerCfg,
   osl_gait_library_runner_cfg,
 )
+from mjlab.tasks.osl_gait_library.evaluate import EvaluateConfig, evaluate
 from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
 from mjlab.tasks.osl_gait_library.mdp import commands as library_commands
 from mjlab.tasks.osl_gait_library.mdp.commands import (
   GaitLibraryCommand,
   clear_library_cache,
 )
+from mjlab.tasks.osl_gait_library.rl import runner as library_runner
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.config.rl_cfg import (
   CLF_ENV_STAGES,
   HIDDEN_DIMS,
+  ROBOT_HIDDEN_DIMS,
   MuscleMimicPpoCfg,
+  OslMimicRunnerCfg,
 )
 from mjlab.tasks.osl_mimic.reward_settings import env_stages_in_force
+from mjlab.tasks.osl_mimic.rl.runner import (
+  UNQUOTED_FLAGS_NOTE,
+  configure_networks_for_checkpoint,
+  hidden_dims_flags,
+  run_hidden_dims,
+)
+from mjlab.tasks.osl_mimic.touch_sites import CHECKPOINT_KEY as TOUCH_SITES_KEY
 from mjlab.tasks.osl_split.config.rl_cfg import (
+  OSL_HIDDEN_DIMS,
   SPLIT_CLF_ENV_STAGES,
   SplitRunnerCfg,
   osl_split_runner_cfg,
 )
+from mjlab.tasks.osl_split.rl.runner import _check_architecture
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
+from mjlab.utils.os import dump_yaml
 
 SOCKETS: tuple[Socket, ...] = ("rigid", "compliant")
 REWARDS: tuple[Reward, ...] = ("mimic", "clf")
@@ -203,7 +229,7 @@ def test_robot_stage1_recipe(socket: Socket, reward: Reward) -> None:
   assert alg.std_floor == 0.03 <= alg.std_cap_end
   assert alg.actor_bias_init == "qpos0" and alg.muon_ns_dtype == "bfloat16"
   assert (alg.num_mini_batches, rl.num_steps_per_env) == (128, 80)
-  assert rl.actor.hidden_dims == rl.critic.hidden_dims == HIDDEN_DIMS
+  assert rl.actor.hidden_dims == rl.critic.hidden_dims == ROBOT_HIDDEN_DIMS
   v = rl.validation
   assert (v.interval, v.inference) == (125, ("mean",))
   assert (v.stress_interval, v.stress_inference) == (250, ("mean",))
@@ -271,6 +297,199 @@ def test_robot_stage2_recipe(socket: Socket, reward: Reward) -> None:
   assert (rl.freeze, rl.blend, rl.channels) == (msk.freeze, msk.blend, msk.channels)
   assert rl.osl_actor == msk.osl_actor
   assert replace(rl.algorithm, schedule_iterations=0) == msk.algorithm
+
+
+##
+# The robot's networks.
+##
+
+MUSCLEMIMIC_MODEL = "mjlab.tasks.osl_mimic.rl.models:MuscleMimicMLPModel"
+STAIRS = "Mjlab-Stairs-OSL-Fullbody-ROBOT"
+OLD_DIMS = "'(" + ",".join(str(dim) for dim in HIDDEN_DIMS) + ")'"
+"""musclemimic's dims as the refusals print them: no spaces, quoted for the shell."""
+
+
+@pytest.mark.parametrize("task", osl_tasks())
+def test_robot_tasks_train_the_small_networks(task: str) -> None:
+  """Every robot task on musclemimic's networks trains its actor and critic at
+  ``ROBOT_HIDDEN_DIMS``, stage 2's and stage 1.5's OSL critic too, the OSL actor
+  unchanged; every musculoskeletal task keeps musclemimic's 16 layers. The G1-style
+  tracking tasks build rsl_rl's MLP, not these networks."""
+  assert ROBOT_HIDDEN_DIMS == (1024, 1024, 512, 512)
+  assert HIDDEN_DIMS == (1024,) * 12 + (2048,) * 3 + (1024,)
+  rl = load_rl_cfg(task)
+  assert isinstance(rl, RslRlOnPolicyRunnerCfg)
+  if rl.actor.class_name != MUSCLEMIMIC_MODEL:
+    assert "-Tracking-" in task
+    return
+  want = ROBOT_HIDDEN_DIMS if "-ROBOT" in task else HIDDEN_DIMS
+  networks = [rl.actor, rl.critic]
+  if isinstance(rl, SplitRunnerCfg):
+    networks.append(rl.osl_critic)
+    assert rl.osl_actor.hidden_dims == OSL_HIDDEN_DIMS
+  assert [tuple(n.hidden_dims) for n in networks] == [want] * len(networks)
+
+
+def _train_cfg(task: str, *argv: str) -> TrainConfig:
+  """The config ``train.py`` builds: the task's, with ``argv`` applied by tyro."""
+  return tyro.cli(
+    TrainConfig,
+    args=list(argv),
+    default=TrainConfig.from_task(task),
+    config=mjlab.TYRO_FLAGS,
+  )
+
+
+def _lineage(stage1: Any, hidden_dims: tuple[int, ...]) -> dict[str, Any]:
+  """What a warm start records of a stage-1 run with these networks: its
+  agent.yaml's model blocks, as plain data."""
+  blocks = {
+    key: dict(asdict(getattr(stage1, name)), hidden_dims=list(hidden_dims))
+    for key, name in (("actor_cfg", "actor"), ("critic_cfg", "critic"))
+  }
+  return {"stage1_checkpoint": "/runs/stage1/model_1000.pt", **blocks}
+
+
+@pytest.mark.parametrize(
+  ("stage2", "stage1"), [(STAGE2, STAGE1), (FSM, STAGE1), (SPLIT_STAIRS, STAIRS)]
+)
+def test_robot_stage2_builds_its_teachers_networks(stage2: str, stage1: str) -> None:
+  """Stage 2 (and stage 1.5, stairs stage 2) builds the networks it copies from
+  stage 1 at today's robot stage-1 size: a teacher of that size passes the
+  architecture check with no flag. A teacher with musclemimic's networks (every
+  robot run before 2026-11-19) is refused, naming the flags that build them, and
+  those flags, parsed as ``train`` parses them (pasted into a shell, or unquoted
+  inside R7_EXTRA), pass."""
+  tag = "-CLF-Compliant"
+  teacher = load_rl_cfg(stage1 + tag)
+  assert isinstance(teacher, OslMimicRunnerCfg)
+  assert teacher.actor.hidden_dims == teacher.critic.hidden_dims == ROBOT_HIDDEN_DIMS
+  task = stage2 + tag
+  rl = asdict(load_rl_cfg(task))
+  _check_architecture(_lineage(teacher, ROBOT_HIDDEN_DIMS), rl, reward_switch=False)
+  old = _lineage(teacher, HIDDEN_DIMS)
+  with pytest.raises(ValueError, match="another architecture") as refused:
+    _check_architecture(old, rl, reward_switch=False)
+  message = str(refused.value)
+  flags = message.split("Build stage 1's architecture: ", 1)[1].splitlines()[0]
+  for module in ("actor", "critic", "osl-critic"):
+    assert f"--agent.{module}.hidden-dims {OLD_DIMS}" in flags
+  assert UNQUOTED_FLAGS_NOTE in message
+  for argv in (shlex.split(flags), flags.replace("'", "").split()):
+    parsed = cast(Any, _train_cfg(task, *argv).agent)
+    assert parsed.osl_actor.hidden_dims == OSL_HIDDEN_DIMS
+    _check_architecture(old, asdict(parsed), reward_switch=False)
+
+
+def _stage1(task: str) -> GaitLibraryRunnerCfg:
+  cfg = load_rl_cfg(task)
+  assert isinstance(cfg, GaitLibraryRunnerCfg)
+  return cfg
+
+
+def test_an_old_robot_run_is_rebuilt_from_its_params(tmp_path: Path) -> None:
+  """A robot run from before 2026-11-19 records musclemimic's networks in its
+  params/agent.yaml. The resume error's flags (quoted for the shell, with no
+  spaces: the round-7 launchers split R7_EXTRA on whitespace and take them
+  unquoted) parse back to them either way, and play's and the evaluation's hook
+  sizes today's config from that file; a run without params/ changes nothing."""
+  task = STAGE1 + "-CLF-Compliant"
+  old = _stage1(task)
+  old.actor.hidden_dims = old.critic.hidden_dims = HIDDEN_DIMS
+  run = tmp_path / "2026-11-19_11-00-43_r7_robot_s1_seed42_A"
+  dump_yaml(run / "params" / "agent.yaml", asdict(old))  # As train.py writes it.
+  checkpoint = run / "model_1000.pt"
+  assert run_hidden_dims(checkpoint) == {"actor": HIDDEN_DIMS, "critic": HIDDEN_DIMS}
+
+  today = _stage1(task)
+  flags = hidden_dims_flags(checkpoint, asdict(today))
+  assert flags == [
+    f"--agent.actor.hidden-dims {OLD_DIMS}",
+    f"--agent.critic.hidden-dims {OLD_DIMS}",
+  ]
+  text = " ".join(flags)
+  for argv in (shlex.split(text), text.replace("'", "").split()):
+    parsed = cast(Any, _train_cfg(task, *argv).agent)
+    assert parsed.actor.hidden_dims == parsed.critic.hidden_dims == HIDDEN_DIMS
+    assert hidden_dims_flags(checkpoint, asdict(parsed)) == []
+
+  changed = configure_networks_for_checkpoint(today, checkpoint)
+  assert changed == {"actor": HIDDEN_DIMS, "critic": HIDDEN_DIMS}
+  assert today.actor.hidden_dims == today.critic.hidden_dims == HIDDEN_DIMS
+  bare = _stage1(task)
+  assert configure_networks_for_checkpoint(bare, tmp_path / "model_0.pt") == {}
+  assert bare.actor.hidden_dims == ROBOT_HIDDEN_DIMS
+
+
+class _Built(Exception):
+  """Raised where the tool would build its env or runner: what it configured
+  before is checked then."""
+
+
+def _built(*args: Any, **kwargs: Any) -> Any:
+  raise _Built
+
+
+def _old_robot_run(tmp_path: Path, task: str) -> Path:
+  """A checkpoint of a robot run from before 2026-11-19: musclemimic's networks in
+  its params/agent.yaml, the task's env in its params/env.yaml, and nothing in
+  the checkpoint but the touch sites (neither tool here gets to load it)."""
+  run = tmp_path / "2026-11-19_11-00-43_r7_robot_s1_seed42_A"
+  old = _stage1(task)
+  old.actor.hidden_dims = old.critic.hidden_dims = HIDDEN_DIMS
+  env = load_env_cfg(task)
+  dump_yaml(run / "params" / "agent.yaml", asdict(old))
+  dump_yaml(run / "params" / "env.yaml", asdict(env))
+  checkpoint = run / "model_1000.pt"
+  payload = {"actor_state_dict": {}, "iter": 1000, "infos": None}
+  torch.save({**payload, TOUCH_SITES_KEY: cast(Any, env).osl_touch_sites}, checkpoint)
+  return checkpoint
+
+
+def test_play_builds_the_networks_of_the_checkpoints_run(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """play.py takes no --agent overrides: before it builds anything, the task's
+  runner sizes the networks from the checkpoint's run
+  (``configure_agent_for_checkpoint``)."""
+  task = STAGE1 + "-CLF-Compliant"
+  checkpoint = _old_robot_run(tmp_path, task)
+  loaded: list[Any] = []
+
+  def load(task_id: str) -> Any:
+    loaded.append(load_rl_cfg(task_id))
+    return loaded[-1]
+
+  monkeypatch.setattr(play, "load_rl_cfg", load)
+  monkeypatch.setattr(play, "ManagerBasedRlEnv", _built)
+  cfg = play.PlayConfig(checkpoint_file=str(checkpoint), device="cpu")
+  with pytest.raises(_Built):
+    play.run_play(task, cfg)
+  (agent,) = loaded
+  assert agent.actor.hidden_dims == agent.critic.hidden_dims == HIDDEN_DIMS
+
+
+def test_evaluation_builds_the_networks_of_the_checkpoints_run(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  """The gait-library evaluation hands its runner the networks the checkpoint's
+  run trained, read from its params/agent.yaml."""
+  task = STAGE1 + "-CLF-Compliant"
+  checkpoint = _old_robot_run(tmp_path, task)
+  monkeypatch.setenv(UNICYCLE_LIBRARY_ENV_VAR, "")  # The evaluation sets it.
+  agents: list[dict[str, Any]] = []
+
+  def runner(env: Any, train_cfg: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+    agents.append(train_cfg)
+    raise _Built
+
+  monkeypatch.setattr(mjlab.envs, "ManagerBasedRlEnv", lambda **kwargs: None)
+  monkeypatch.setattr(mjlab.rl, "RslRlVecEnvWrapper", lambda env: env)
+  monkeypatch.setattr(library_runner, "GaitLibraryOnPolicyRunner", runner)
+  with pytest.raises(_Built):
+    evaluate(EvaluateConfig(checkpoint, library=tmp_path, device="cpu"))
+  (agent,) = agents
+  assert agent["actor"]["hidden_dims"] == agent["critic"]["hidden_dims"] == HIDDEN_DIMS
 
 
 ##

@@ -488,11 +488,18 @@ def test_checkpoints_record_their_touch_sites(
 
 def test_every_osl_runner_lets_play_build_the_checkpoints_touch_sites() -> None:
   """play.py asks the task's runner class to configure the env for the checkpoint
-  before building it (play takes no --env overrides)."""
+  before building it (play takes no --env overrides), and every runner on
+  musclemimic's networks to size them as the checkpoint's run did (nor --agent
+  overrides; the G1-style tracking runner builds rsl_rl's MLP at the task's
+  sizes)."""
   classes = {load_runner_cls(task) for task in OSL_TASKS}
   assert classes == {load_runner_cls(task) for task in RUNNER_TASKS}
   for cls in classes:
     assert callable(getattr(cls, "configure_env_for_checkpoint", None)), cls
+  for task in RUNNER_TASKS:
+    if task != TRACKING:
+      cls = load_runner_cls(task)
+      assert callable(getattr(cls, "configure_agent_for_checkpoint", None)), cls
 
 
 @pytest.mark.parametrize("task", RUNNER_TASKS)

@@ -18,6 +18,21 @@ TOTAL_TIMESTEPS = 1_000_000_000
 NUM_UPDATES = TOTAL_TIMESTEPS // NUM_STEPS // NUM_ENVS
 NUM_VALIDATIONS = 100
 HIDDEN_DIMS = (1024,) * 12 + (2048,) * 3 + (1024,)
+"""musclemimic's actor and critic: the musculoskeletal tasks' networks (about 27M
+parameters each on their inputs, 25M on the robot's)."""
+ROBOT_HIDDEN_DIMS = (1024, 1024, 512, 512)
+"""The robot tasks' actor and critic (about 2.5M parameters each) in every robot
+task family, stage 2's human actor and critics included (user decision
+2026-11-19). Robot runs from before then trained :data:`HIDDEN_DIMS`: resuming one,
+or starting stage 2 from one, takes ``--agent.actor.hidden-dims`` and
+``--agent.critic.hidden-dims`` (stage 2 also ``--agent.osl-critic.hidden-dims``)
+set to its recorded dims; play, evaluation and the exporters read them from the
+run's ``params/agent.yaml``."""
+MODEL_HIDDEN_DIMS: dict[Model, tuple[int, ...]] = {
+  "robot": ROBOT_HIDDEN_DIMS,
+  "msk": HIDDEN_DIMS,
+}
+"""Each model's actor and critic hidden dims."""
 INIT_STD = {"robot": 0.2, "msk": 3.0}
 
 
@@ -27,6 +42,7 @@ class MuscleMimicModelCfg(RslRlModelCfg):
 
   class_name: str = "mjlab.tasks.osl_mimic.rl.models:MuscleMimicMLPModel"
   hidden_dims: tuple[int, ...] = HIDDEN_DIMS
+  """musclemimic's; the tasks build their model's (:data:`MODEL_HIDDEN_DIMS`)."""
   activation: str = "swish"
   """SiLU, musclemimic's ``silu``; rsl_rl names it ``swish``."""
   obs_normalization: bool = True
@@ -193,15 +209,17 @@ def osl_mimic_runner_cfg(
   model: Model, socket: Socket, reward: Reward, experiment_name: str
 ) -> OslMimicRunnerCfg:
   init_std = INIT_STD[model]
+  hidden_dims = MODEL_HIDDEN_DIMS[model]
   return OslMimicRunnerCfg(
     actor=MuscleMimicModelCfg(
+      hidden_dims=hidden_dims,
       distribution_cfg={
         "class_name": "GaussianDistribution",
         "init_std": init_std,
         "std_type": "log",
       },
     ),
-    critic=MuscleMimicModelCfg(),
+    critic=MuscleMimicModelCfg(hidden_dims=hidden_dims),
     algorithm=MuscleMimicPpoCfg(
       # conf_osl_fullbody_robot.yaml opts the servos into it; the muscles never.
       actor_bias_init="qpos0" if model == "robot" else "none",
@@ -217,8 +235,9 @@ def osl_mimic_runner_cfg(
     experiment_name=experiment_name,
     num_steps_per_env=NUM_STEPS,
     max_iterations=NUM_UPDATES,
-    # About 0.4 GB per checkpoint (two 24M-parameter networks plus optimizer
-    # state); musclemimic keeps 10.
+    # About 0.4 GB per checkpoint of musclemimic's networks (two of 25-27M
+    # parameters plus optimizer state; a tenth of that for the robot's); musclemimic
+    # keeps 10.
     save_interval=610,
     wandb_tags=("osl_fullbody", model, reward),
     env_stages=CLF_ENV_STAGES if reward == "clf" else (),

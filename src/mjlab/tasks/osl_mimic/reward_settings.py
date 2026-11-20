@@ -336,10 +336,10 @@ def run_reward_record(checkpoint: str | Path) -> dict | None:
   defaults for what it lacks, and ``agent.yaml``'s env stages (none in stage 2,
   whose runs had none then). None without a readable ``env.yaml``."""
   params = Path(checkpoint).parent / "params"
-  config = saved_reward_settings(_read_yaml(params / "env.yaml"))
+  config = saved_reward_settings(read_params_yaml(params / "env.yaml"))
   if config is None:
     return None
-  agent = _read_yaml(params / "agent.yaml")
+  agent = read_params_yaml(params / "agent.yaml")
   stages = agent.get("env_stages") if isinstance(agent, Mapping) else None
   return {"config": config, "env_stages": [list(s) for s in stages or ()]}
 
@@ -546,7 +546,7 @@ def _refuse_unreadable_reward(path: str | Path, allowed: bool) -> None:
   )
 
 
-def _read_yaml(path: Path) -> Any:
+def read_params_yaml(path: Path) -> Any:
   """A saved ``params/*.yaml`` as plain data (Python tags read as their data, never
   constructed); None when missing or unreadable."""
 

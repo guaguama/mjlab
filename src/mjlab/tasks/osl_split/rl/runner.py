@@ -90,7 +90,6 @@ from __future__ import annotations
 import gc
 import math
 import os
-import shlex
 import statistics
 import time
 from collections import deque
@@ -117,7 +116,9 @@ from mjlab.tasks.osl_mimic.reward_settings import CHECKPOINT_KEY as REWARD_KEY
 from mjlab.tasks.osl_mimic.reward_settings import reward_record
 from mjlab.tasks.osl_mimic.rl.expected import auto_inference
 from mjlab.tasks.osl_mimic.rl.runner import (
+  UNQUOTED_FLAGS_NOTE,
   EvalPurpose,
+  agent_flag,
   eval_mode,
   final_evaluation_due,
 )
@@ -1479,9 +1480,10 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     A ``load_cfg`` that asks for neither ``critic`` nor ``optimizer`` (``play.py``'s
     ``{"actor": True}``) loads the two actors and the teacher head only, all
     inference needs. ``play.py`` builds the runner from the task's registered
-    config, without the run's overrides, so the critics need not fit (a run
-    trained with ``osl_critic_obs="full+osl"`` has a wider OSL critic). Without
-    the run's critics, optimizers and statistics the runner cannot train.
+    config, with the run's network sizes but none of its other overrides, so the
+    critics need not fit (a run trained with ``osl_critic_obs="full+osl"`` has a
+    wider OSL critic). Without the run's critics, optimizers and statistics the
+    runner cannot train.
 
     Either way the env must build the checkpoint's OSL input layout (sensor set and
     history; :func:`.osl_observation.check_osl_observation`), since two sets of the
@@ -1746,15 +1748,16 @@ def _check_architecture(
   ]
   if given:
     message.append("Build stage 1's architecture: " + " ".join(given))
+    message.append(UNQUOTED_FLAGS_NOTE)
   if len(given) < len(flags):
     message.append("The command line cannot set the rest: change the task's config.")
   raise ValueError("\n".join(message))
 
 
 def _override(module: str, key: str, stage1: Mapping[str, Any]) -> str | None:
-  """The ``--agent`` flag that sets ``module``'s dotted ``key`` to stage 1's value,
-  or None when stage 1 records none or it is not a single value (a whole
-  ``distribution_cfg``)."""
+  """The ``--agent`` flag (:func:`~mjlab.tasks.osl_mimic.rl.runner.agent_flag`)
+  that sets ``module``'s dotted ``key`` to stage 1's value, or None when stage 1
+  records none or it is not a single value (a whole ``distribution_cfg``)."""
   value: Any = stage1
   for part in key.split("."):
     if not isinstance(value, Mapping) or part not in value:
@@ -1762,11 +1765,7 @@ def _override(module: str, key: str, stage1: Mapping[str, Any]) -> str | None:
     value = value[part]
   if value is None or isinstance(value, Mapping):
     return None
-  if isinstance(value, (list, tuple)):
-    value = tuple(value)  # tyro takes Python syntax for collections.
-  text = value if isinstance(value, str) else repr(value)
-  flag = ".".join(part.replace("_", "-") for part in ("agent", module, *key.split(".")))
-  return f"--{flag} {shlex.quote(text)}"
+  return agent_flag((module, *key.split(".")), value)
 
 
 _ADDITIVE_DEFAULT = (1.0, 1.0)

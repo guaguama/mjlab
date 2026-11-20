@@ -10,8 +10,8 @@ from dataclasses import dataclass, field, fields
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.config.rl_cfg import (
-  HIDDEN_DIMS,
   NUM_STEPS,
+  ROBOT_HIDDEN_DIMS,
   MuscleMimicPpoCfg,
   OslMimicRunnerCfg,
   OslMimicValidationCfg,
@@ -62,7 +62,10 @@ paid off once the std was small (tight-arc failures 0.05 vs 0.19 at update 3800)
 # teacher's last phase). Every count here is set for 8192 envs; none derives from
 # osl_mimic's ``NUM_UPDATES`` (4096 envs). Under Muon a step's length is set by the
 # rate, so per-iteration movement is the rate times ``num_mini_batches``, whatever
-# the batch size.
+# the batch size. The actor and critic are the robot tasks' ``ROBOT_HIDDEN_DIMS``
+# (about 2.5M parameters each, user decision 2026-11-19); the first run of this
+# recipe (W&B n7dps452, stopped at model_1000) trained musclemimic's 25M-parameter
+# ``HIDDEN_DIMS``.
 UNICYCLE_ROBOT_ITERATIONS = 2000
 """The run's last checkpoint is model_1999: phase A trains the first
 ``UNICYCLE_ROBOT_PHASE_A_ITERATIONS`` (``--agent.max-iterations 1500``), phase B
@@ -138,9 +141,10 @@ def osl_gait_library_runner_cfg(
     variant: ``"walk_fwd"`` or ``"unicycle"``; the unicycle tasks get their model's
       stage-1 recipe.
     robot_recipe: False keeps the robot's unicycle settings as they were before its
-      recipe (osl_mimic's), for stage-2 tasks whose stage 1 is not the robot recipe
-      (``osl_split_runner_cfg(..., robot_recipe=False)``). The MSK recipe applies
-      either way.
+      recipe (osl_mimic's), networks aside (every robot config builds
+      ``ROBOT_HIDDEN_DIMS``), for stage-2 tasks whose stage 1 is not the robot
+      recipe (``osl_split_runner_cfg(..., robot_recipe=False)``). The MSK recipe
+      applies either way.
   """
   base = osl_mimic_runner_cfg(model, socket, reward, experiment_name)
   cfg = GaitLibraryRunnerCfg(**{f.name: getattr(base, f.name) for f in fields(base)})
@@ -191,15 +195,16 @@ def apply_unicycle_msk_recipe(cfg: GaitLibraryRunnerCfg) -> None:
 
 
 def apply_unicycle_robot_recipe(cfg: GaitLibraryRunnerCfg) -> None:
-  """Set the robot recipe's PPO schedule, networks and evaluation cadence, every
-  value explicitly, and add its env stages to the config's own (the CLF tasks'
-  reward ramps; none under MimicReward)."""
+  """Set the robot recipe's PPO schedule, networks (actor and critic
+  :data:`~mjlab.tasks.osl_mimic.config.rl_cfg.ROBOT_HIDDEN_DIMS`, every robot
+  task's) and evaluation cadence, every value explicitly, and add its env stages to
+  the config's own (the CLF tasks' reward ramps; none under MimicReward)."""
   alg = cfg.algorithm
   assert isinstance(alg, MuscleMimicPpoCfg)
   assert cfg.actor.distribution_cfg is not None
   cfg.actor.distribution_cfg["init_std"] = UNICYCLE_ROBOT_INIT_STD
   for model_cfg in (cfg.actor, cfg.critic):
-    model_cfg.hidden_dims = HIDDEN_DIMS
+    model_cfg.hidden_dims = ROBOT_HIDDEN_DIMS
   alg.init_std_terms = {}
   alg.std_cap_start, alg.std_cap_end = UNICYCLE_ROBOT_STD_CAP
   alg.std_cap_begin_update, alg.std_cap_end_update = UNICYCLE_ROBOT_STD_CAP_UPDATES

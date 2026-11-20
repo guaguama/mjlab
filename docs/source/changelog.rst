@@ -468,6 +468,18 @@ Changed
   ``params/env.yaml`` and ``agent.yaml``, and one without them (a W&B download, say)
   is refused as unreadable unless allowed, with the ways on. The gait-library
   evaluation scores a checkpoint under its run's reward, read the same way.
+- Every OSL robot task (single clip, gait library walk-forward and unicycle,
+  stairs, the stage-2 split and split-stairs tasks and stage 1.5) trains a smaller
+  actor and critic: hidden dims (1024, 1024, 512, 512), about 2.5M parameters each
+  (``ROBOT_HIDDEN_DIMS``), instead of musclemimic's 16-layer stack of about 25M
+  (``HIDDEN_DIMS``), which the musculoskeletal tasks keep. Stage 2's human actor
+  and both critics follow stage 1's size; its OSL actor is unchanged, as is every
+  other setting of the robot recipes. A robot run trained before this change
+  resumes, and warm-starts stage 2, with ``--agent.actor.hidden-dims`` and
+  ``--agent.critic.hidden-dims`` (stage 2 also ``--agent.osl-critic.hidden-dims``)
+  set to its recorded dims, which the refusals name. ``play.py`` and the
+  gait-library evaluation size the networks from the run's ``params/agent.yaml``,
+  as the exporters already did. The G1-style tracking tasks are unchanged.
 
 - Bumped ``rsl-rl-lib`` from 5.5.0 to 5.5.1. This removes the need for capping
   ``wandb`` below 0.29.

@@ -199,11 +199,16 @@ def run_play(task_id: str, cfg: PlayConfig):
     log_dir = resume_path.parent
 
   if resume_path is not None:
-    # Play takes no --env overrides, so a runner may make the env build what the
-    # checkpoint was trained with (the OSL tasks' touch sites).
-    configure = getattr(load_runner_cls(task_id), "configure_env_for_checkpoint", None)
+    # Play takes no --env or --agent overrides, so a runner may make the env and
+    # the networks build what the checkpoint was trained with (the OSL tasks' touch
+    # sites and network sizes).
+    runner_type = load_runner_cls(task_id)
+    configure = getattr(runner_type, "configure_env_for_checkpoint", None)
     if configure is not None:
       configure(env_cfg, resume_path)
+    configure_agent = getattr(runner_type, "configure_agent_for_checkpoint", None)
+    if configure_agent is not None:
+      configure_agent(agent_cfg, resume_path)
 
   if cfg.num_envs is not None:
     env_cfg.scene.num_envs = cfg.num_envs
