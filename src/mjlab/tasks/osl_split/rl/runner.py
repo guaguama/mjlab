@@ -124,6 +124,7 @@ from mjlab.tasks.osl_mimic.rl.runner import (
   agent_flag,
   eval_mode,
   final_evaluation_due,
+  stress_group_metrics,
 )
 from mjlab.tasks.osl_mimic.touch_sites import (
   CHECKPOINT_KEY,
@@ -1250,6 +1251,7 @@ class SplitOnPolicyRunner(GaitLibraryOnPolicyRunner):
     metrics.update({f"{key}_peak": float(value) for key, value in peaks.items()})
     metrics["survival_rate"] = 1.0 - float(failed.float().mean())
     metrics["mean_first_episode_s"] = float(length.mean()) * float(env.step_dt)
+    metrics.update(stress_group_metrics(self._stress_groups(env), failed, length, env))
     metrics["mean_first_episode_return"] = float(team_return.mean())
     for i, name in enumerate(AGENTS):
       metrics[f"mean_first_episode_return_{name}"] = float(agent_return[:, i].mean())

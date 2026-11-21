@@ -260,9 +260,11 @@ def test_xml_contacts_drop_the_shell_and_socket_pelvis(variant: Variant) -> None
 
 
 def test_every_osl_task_uses_the_contact_solver_settings() -> None:
-  """mj-nlp's elliptic cone and impratio, in training and play, for all 54 tasks."""
+  """mj-nlp's elliptic cone and impratio, in training and play, for all 70 tasks
+  (54, and 16 terrain twins)."""
   tasks = [task for task in list_tasks() if "OSL" in task]
-  assert len(tasks) == 54
+  assert len(tasks) == 70
+  assert sum(task.endswith("-Terrain") for task in tasks) == 16
   for task in tasks:
     for play in (False, True):
       sim = load_env_cfg(task, play=play).sim.mujoco

@@ -74,6 +74,7 @@ import tyro
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket, TouchSites
 from mjlab.tasks.osl_gait_library import export as gl
+from mjlab.tasks.osl_gait_library import terrain as osl_terrain
 from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.osl_mimic.rl.export import (
   Inference,
@@ -964,6 +965,13 @@ def export_bundle(
         f"model.mjb carries the {manifest['touch_sites']['version']!r} touch sites, "
         f"but the run trained with {touch.value!r}."
       )
+    terrain = osl_terrain.run_terrain_spec(saved)
+    if terrain is not None:
+      # A terrain run: its task's terrain twin, and the spec of its ground (not
+      # under "terrain": osl_deploy reads that as a single clip's box terrain).
+      manifest["run"]["task"] = f"{spec.task_id}-Terrain"
+      manifest[osl_terrain.MANIFEST_KEY] = osl_terrain.manifest_section(terrain)
+      (tmp / osl_terrain.SPEC_FILE).write_text(osl_terrain.spec_json(terrain))
     manifest["provenance"] = gl._provenance(
       checkpoint,
       Path(command.cfg.library_dir),
@@ -1021,6 +1029,8 @@ def export_bundle(
       "physics_transfer_verified": False,
     }
     manifest["files"] = {name: gl.sha256(tmp / name) for name in CHECKED_FILES}
+    if terrain is not None:
+      manifest["files"][osl_terrain.SPEC_FILE] = gl.sha256(tmp / osl_terrain.SPEC_FILE)
     header = {k: manifest[k] for k in ("schema_version", "kind", "run")}
     for name in CONTROLLERS:
       attach_metadata(
@@ -1033,7 +1043,10 @@ def export_bundle(
       cfg.observations[OSL_OBS_GROUP]
     )
     (tmp / "manifest.json").write_text(json.dumps(_plain(manifest), indent=2) + "\n")
-    (tmp / "README.md").write_text(_readme(_plain(manifest)))
+    readme = _readme(_plain(manifest))
+    if terrain is not None:
+      readme += osl_terrain.readme_lines(manifest[osl_terrain.MANIFEST_KEY])
+    (tmp / "README.md").write_text(readme)
     if output.exists():
       shutil.rmtree(output)
     os.rename(tmp, output)

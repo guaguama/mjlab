@@ -288,6 +288,35 @@ Added
   nothing. A sensor changes no physics: at ``...leg-contact 0`` every reward is the
   previous one, bit for bit, and the stage-1 exporters leave the sensor out of a
   bundle's ``model.mjb``.
+- OSL terrain tasks: every unicycle task, stage 1
+  (``Mjlab-Gait-Library-Unicycle-OSL-Fullbody-*``) and stage 2
+  (``Mjlab-Split-Unicycle-OSL-Fullbody-*``), has a ``-Terrain`` twin that trains on
+  a seeded grid of heightfields (``tasks/osl_gait_library/terrain.py``): random rough
+  ground 0-6 cm, feathered waves of amplitude 0-6 cm (+-6 cm at the top level) and
+  flat-topped obstacles 0-4 cm, ten levels each (level 0 flat), 16 m tiles. The
+  policies stay blind (the observation, reward and reference are the flat task's);
+  an episode starts at the ground height under the reference's feet; a per-env
+  curriculum moves an env one level up after a time-out and one down after an
+  early termination (frozen on the first reset, start
+  levels 0-5, past the top a random level); ``nan_term`` resets an env whose physics
+  turns NaN. Validation stays flat (the 779 clips); stress validation is frozen on
+  its own seeded ground with envs spread evenly over every type and level, and
+  reports survival per band of levels (``Stress/survival_rate/<type>_L0-2``,
+  ``_L3-6``, ``_L7-9``, per band and per type). Checkpoints record every env's level
+  and type (``infos["terrain"]``) and a training resume restores them; a flat
+  checkpoint forked onto terrain starts at random levels. A terrain stage 2 refuses
+  a flat stage-1 teacher, and a training resume of a flat stage-2 checkpoint.
+  Stage-1 and dual bundles of terrain runs carry ``terrain_generator.json``
+  (``manifest.terrain_generator``, ``kind: hfield_generator``), which alone rebuilds
+  the ground: every generator setting, each type's tile as exact statements, the RNG
+  scheme, the MuJoCo conversion, the border boxes and the start-height rule
+  (``tasks/osl_gait_library/TERRAIN_SPEC.md``; a NumPy port in
+  ``tests/osl_terrain_port.py`` and a reference fixture,
+  ``tests/fixtures/osl_terrain_heights.npz``); their ``model.mjb`` is the flat
+  scene, so they also deploy as flat bundles. Every existing task's config and
+  bundle is unchanged; ``evaluate`` runs a terrain checkpoint on its terrain twin,
+  and ``--terrain True`` a flat checkpoint too (a flat control on the same terrain
+  stress).
 
 Changed
 ^^^^^^^

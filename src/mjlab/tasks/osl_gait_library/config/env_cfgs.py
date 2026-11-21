@@ -29,13 +29,19 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import fields
 from typing import Literal
 
 from mjlab.asset_zoo.robots.osl_fullbody.osl_constants import Model, Socket
+from mjlab.envs import ManagerBasedRlEnvCfg
+from mjlab.envs.mdp.terminations import nan_detection
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.tasks.osl_gait_library import mdp
+from mjlab.tasks.osl_gait_library import terrain as osl_terrain
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward, osl_mimic_env_cfg
 from mjlab.tasks.osl_mimic.mdp import mimic_component
 from mjlab.tasks.osl_mimic.touch_sites import OslEnvCfg
@@ -218,4 +224,76 @@ def osl_gait_library_env_cfg(
     cfg.episode_length_s = VALIDATION_EPISODE_LENGTH_S
   else:
     cfg.episode_length_s = EPISODE_LENGTH_S
+  return cfg
+
+
+# ===== The terrain tasks (round 7; ``...-Terrain``) ==============================
+TERRAIN_CURRICULUM = "terrain_levels"
+"""The terrain tasks' curriculum term (:class:`~..mdp.terrain_levels_survival`)."""
+NAN_TERMINATION = "nan_term"
+
+
+def apply_terrain(
+  cfg: ManagerBasedRlEnvCfg,
+  mode: Mode,
+  seed: int = osl_terrain.TERRAIN_SEED,
+) -> ManagerBasedRlEnvCfg:
+  """Put a gait-library config on the generated terrain grid
+  (:mod:`~mjlab.tasks.osl_gait_library.terrain`), in place, and return it.
+
+  * the scene's plane becomes the seeded grid (``seed``): training envs start at
+    random levels ``0..MAX_INIT_LEVEL``, play envs at any level;
+  * the motion command becomes :class:`~..mdp.TerrainGaitLibraryCommandCfg` (the
+    same settings), whose episodes start at the ground height under the reference's
+    feet;
+  * ``nan_term`` (``nan_detection``): mujoco_warp's convex heightfield collision can
+    return NaN after a fall drives a thin collider into the ground (the stairs
+    tasks' fix); the env resets instead of crashing the run;
+  * in training, the survival-gated level curriculum
+    (:class:`~..mdp.terrain_levels_survival`).
+
+  Validation stays flat: call it for ``"train"`` or ``"play"`` only. The
+  observation, reward and reference are unchanged.
+
+  Raises:
+    ValueError: For ``mode="validation"`` or a config without a library command.
+  """
+  if mode == "validation":
+    raise ValueError("Terrain tasks validate on flat ground (the task's own mode).")
+  motion = cfg.commands.get("motion")
+  if not isinstance(motion, mdp.GaitLibraryCommandCfg):
+    raise ValueError(f"Not a gait-library config: its motion is {type(motion)}.")
+  max_init = osl_terrain.MAX_INIT_LEVEL if mode == "train" else None
+  cfg.scene.terrain = osl_terrain.terrain_entity_cfg(seed, max_init)
+  if not isinstance(motion, mdp.TerrainGaitLibraryCommandCfg):
+    values = {f.name: getattr(motion, f.name) for f in fields(motion)}
+    cfg.commands = {
+      **cfg.commands,
+      "motion": mdp.TerrainGaitLibraryCommandCfg(**values),
+    }
+  cfg.terminations[NAN_TERMINATION] = TerminationTermCfg(func=nan_detection)
+  if mode == "train":
+    cfg.curriculum = {
+      **cfg.curriculum,
+      TERRAIN_CURRICULUM: CurriculumTermCfg(func=mdp.terrain_levels_survival),
+    }
+  else:
+    cfg.curriculum = {
+      k: v for k, v in cfg.curriculum.items() if k != TERRAIN_CURRICULUM
+    }
+  return cfg
+
+
+def osl_gait_library_terrain_env_cfg(
+  model: Model = "msk",
+  socket: Socket = "compliant",
+  reward: Reward = "clf",
+  mode: Mode = "train",
+  dr_cfg: OslDrCfg | None = None,
+) -> OslEnvCfg:
+  """The unicycle task on generated terrain (:func:`apply_terrain`) in training and
+  play; its validation mode is the flat unicycle task's."""
+  cfg = osl_gait_library_env_cfg(model, socket, reward, mode, "unicycle", dr_cfg)
+  if mode != "validation":
+    apply_terrain(cfg, mode)
   return cfg

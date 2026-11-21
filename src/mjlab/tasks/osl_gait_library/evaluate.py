@@ -32,6 +32,13 @@ and the runner's passes run once per inference mode:
   chain's continuous phase B, a forward-only library) changed on that date and
   compare only with numbers taken since.
 
+A terrain run (its ``params/env.yaml`` trains on generated terrain) is evaluated on
+its task's terrain twin: validation stays flat, and stress validation runs frozen
+on the stress ground with the terrain bands (``Stress*/survival_rate/<band>``).
+``--terrain True`` puts a flat run on the twin too (the matched flat control of a
+terrain run, measured on the same frozen terrain stress), and ``--terrain False``
+a terrain run on its flat task (flat stress).
+
 Results print as one JSON object; nothing is logged to TensorBoard or W&B.
 
 ``--legacy-contacts`` evaluates a checkpoint trained before 2026-11-07 under the
@@ -89,6 +96,10 @@ class EvaluateConfig:
   in every evaluation env, e.g. to probe how far a policy depends on truncated
   contact solves."""
   ls_solver_iterations: int | None = None
+  terrain: bool | None = None
+  """Evaluate on the task's ``-Terrain`` twin (True: flat validation, frozen
+  terrain stress with level bands) or on the flat task (False); default (None) as
+  the run trained (its ``params/env.yaml``)."""
   json_out: Path | None = None
   device: str = "cuda:0"
 
@@ -131,6 +142,8 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
     describe_sampler,
   )
   from mjlab.tasks.osl_gait_library.rl.runner import GaitLibraryOnPolicyRunner
+  from mjlab.tasks.osl_gait_library.rl.terrain_runner import TerrainGaitLibraryRunner
+  from mjlab.tasks.osl_gait_library.terrain import saved_terrain
   from mjlab.tasks.osl_mimic.rl.runner import configure_networks_for_checkpoint
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
   from mjlab.utils.torch import configure_torch_backends
@@ -143,6 +156,19 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
   task_id = spec.task_id
   if task_id is None:
     raise ValueError(f"No registered task matches the run: {spec}")
+  # A terrain run, or --terrain True: the terrain twin (flat validation, frozen
+  # terrain stress).
+  trained_on_terrain = saved_terrain(saved) is not None
+  terrain = trained_on_terrain if cfg.terrain is None else cfg.terrain
+  if terrain:
+    task_id = f"{task_id}-Terrain"
+  if terrain != trained_on_terrain:
+    grounds = ("flat ground", "generated terrain")
+    print(
+      f"[INFO] Evaluated on {grounds[terrain]} ({task_id}); the run trained on "
+      f"{grounds[trained_on_terrain]} (--terrain {terrain}).",
+      flush=True,
+    )
 
   library = cfg.library
   if library is None:
@@ -210,7 +236,8 @@ def evaluate(cfg: EvaluateConfig) -> dict[str, float]:
 
   env = ManagerBasedRlEnv(cfg=env_cfg, device=cfg.device)
   vec = RslRlVecEnvWrapper(env)
-  runner = GaitLibraryOnPolicyRunner(vec, agent_cfg, log_dir=None, device=cfg.device)
+  runner_cls = TerrainGaitLibraryRunner if terrain else GaitLibraryOnPolicyRunner
+  runner = runner_cls(vec, agent_cfg, log_dir=None, device=cfg.device)
   runner.load(str(checkpoint), map_location=cfg.device)
   iteration = int(runner.current_learning_iteration)
 

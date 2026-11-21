@@ -57,8 +57,20 @@ FSM = "Mjlab-FSM-Unicycle-OSL-Fullbody-MSK-CLF-Compliant"
 STAIRS = "Mjlab-Stairs-OSL-Fullbody-ROBOT"
 STAIRS_SPLIT = "Mjlab-Split-Stairs-OSL-Fullbody-MSK-CLF-Compliant"
 TRACKING = "Mjlab-Tracking-Flat-OSL-Fullbody-ROBOT"
+TERRAIN = GAIT_LIBRARY + "-Terrain"
+SPLIT_TERRAIN = SPLIT + "-Terrain"
 # One task per OSL runner class.
-RUNNER_TASKS = [MIMIC, GAIT_LIBRARY, SPLIT, FSM, STAIRS, STAIRS_SPLIT, TRACKING]
+RUNNER_TASKS = [
+  MIMIC,
+  GAIT_LIBRARY,
+  SPLIT,
+  FSM,
+  STAIRS,
+  STAIRS_SPLIT,
+  TRACKING,
+  TERRAIN,
+  SPLIT_TERRAIN,
+]
 
 R_FOOT = "robot/OSL_KA_L1_r_foot_touch"
 R_TOES = "robot/OSL_KA_L1_r_toes_touch"

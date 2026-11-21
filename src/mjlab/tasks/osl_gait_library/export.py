@@ -80,6 +80,7 @@ from mjlab.tasks.osl_mimic.touch_sites import (
   touch_sites_readme_line,
 )
 
+from . import terrain as osl_terrain
 from .config.env_cfgs import Variant, osl_gait_library_env_cfg
 from .mdp import GaitLibraryCommand, GaitLibraryCommandCfg, apply_sampler
 
@@ -710,6 +711,15 @@ def export_bundle(
       "blend_time_s": command.cfg.blend_time_s,
       "twist_metric_weights": list(command.cfg.twist_metric_weights),
     }
+    terrain = osl_terrain.run_terrain_spec(
+      read_config(checkpoint.parent / "params" / "env.yaml")
+    )
+    if terrain is not None:
+      # A terrain run: its task's terrain twin, and the spec of its ground (not
+      # under "terrain": osl_deploy reads that as a single clip's box terrain).
+      manifest["run"]["task"] = f"{c.spec.task_id}-Terrain"
+      manifest[osl_terrain.MANIFEST_KEY] = osl_terrain.manifest_section(terrain)
+      (tmp / osl_terrain.SPEC_FILE).write_text(osl_terrain.spec_json(terrain))
     manifest["deployment"] = {
       "solver": c.solver["deployment"],
       "training_solver": c.solver["training"],
@@ -752,12 +762,17 @@ def export_bundle(
       "physics_transfer_verified": False,
     }
     manifest["files"] = {name: sha256(tmp / name) for name in CHECKED_FILES}
+    if terrain is not None:
+      manifest["files"][osl_terrain.SPEC_FILE] = sha256(tmp / osl_terrain.SPEC_FILE)
     attach_metadata(
       tmp / "actor.onnx", {k: v for k, v in manifest.items() if k != "files"}
     )
     manifest["files"]["actor.onnx"] = sha256(tmp / "actor.onnx")
     (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    (tmp / "README.md").write_text(_readme(manifest))
+    readme = _readme(manifest)
+    if terrain is not None:
+      readme += osl_terrain.readme_lines(manifest[osl_terrain.MANIFEST_KEY])
+    (tmp / "README.md").write_text(readme)
     if output.exists():
       shutil.rmtree(output)
     os.rename(tmp, output)

@@ -226,3 +226,13 @@ def apply_unicycle_robot_recipe(cfg: GaitLibraryRunnerCfg) -> None:
   cfg.validation.stress_inference = UNICYCLE_ROBOT_INFERENCE
   cfg.video.enabled = True
   cfg.env_stages = (*cfg.env_stages, *UNICYCLE_ROBOT_ENV_STAGES)
+
+
+def osl_gait_library_terrain_runner_cfg(
+  model: Model, socket: Socket, reward: Reward, experiment_name: str
+) -> GaitLibraryRunnerCfg:
+  """A terrain task's runner settings: its unicycle task's (the same recipe and
+  evaluation cadence; validation stays flat), tagged ``terrain``."""
+  cfg = osl_gait_library_runner_cfg(model, socket, reward, experiment_name, "unicycle")
+  cfg.wandb_tags = (*cfg.wandb_tags, "terrain")
+  return cfg

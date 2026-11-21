@@ -14,6 +14,10 @@ and the unicycle tasks (``Mjlab-Gait-Library-Unicycle-OSL-Fullbody-*``) over the
 library with domain randomization. Both are stage 1 of the plan, the unified policy
 that stage 2 splits into separate human and OSL actors.
 
+Every unicycle task has a terrain twin (``...-Terrain``): the seeded heightfield grid
+of ``terrain`` (its deploy spec in ``TERRAIN_SPEC.md``) with a survival-gated level
+curriculum; the policy stays blind.
+
 ``mdp`` holds the library command and the added terms, events and curriculum;
 ``config`` the task registration and randomization; ``rl`` the runner's validation
 over the library.

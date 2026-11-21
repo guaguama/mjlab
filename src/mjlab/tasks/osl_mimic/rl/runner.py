@@ -301,6 +301,26 @@ def resumes_training(load_cfg: Mapping[str, Any] | None) -> bool:
   return bool(load_cfg.get("critic") or load_cfg.get("optimizer"))
 
 
+def stress_group_metrics(
+  groups: Mapping[str, torch.Tensor],
+  failed: torch.Tensor,
+  length: torch.Tensor,
+  env: ManagerBasedRlEnv,
+) -> dict[str, float]:
+  """A stress pass's ``survival_rate/<group>`` and ``mean_first_episode_s/<group>``
+  for each non-empty group mask (envs whose first episode ``failed``, its
+  ``length`` in steps)."""
+  metrics: dict[str, float] = {}
+  for group, mask in groups.items():
+    if not bool(mask.any()):
+      continue
+    metrics[f"survival_rate/{group}"] = 1.0 - float(failed[mask].float().mean())
+    metrics[f"mean_first_episode_s/{group}"] = float(length[mask].mean()) * float(
+      env.step_dt
+    )
+  return metrics
+
+
 def _check_staged_number(value: Any, path: str) -> None:
   if isinstance(value, bool) or not isinstance(value, (int, float)):
     raise TypeError(f"Env stage {path!r} sets {value!r}, which is not a number.")
@@ -868,7 +888,15 @@ class OslMimicOnPolicyRunner(MjlabOnPolicyRunner):
     }
     metrics["survival_rate"] = 1.0 - float(failed.float().mean())
     metrics["mean_first_episode_s"] = float(length.mean()) * float(env.step_dt)
+    metrics.update(stress_group_metrics(self._stress_groups(env), failed, length, env))
     return metrics
+
+  def _stress_groups(self, env: ManagerBasedRlEnv) -> dict[str, torch.Tensor]:
+    """(B,) boolean masks of stress envs whose survival is also reported per group
+    (:func:`stress_group_metrics`). None here; the terrain runners report bands of
+    terrain levels."""
+    del env
+    return {}
 
   ##
   # Checkpoint videos.

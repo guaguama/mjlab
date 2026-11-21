@@ -47,7 +47,10 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.tasks.osl_gait_library.config.dr import OslDrCfg
-from mjlab.tasks.osl_gait_library.config.env_cfgs import osl_gait_library_env_cfg
+from mjlab.tasks.osl_gait_library.config.env_cfgs import (
+  apply_terrain,
+  osl_gait_library_env_cfg,
+)
 from mjlab.tasks.osl_gait_library.mdp import GaitLibraryCommandCfg
 from mjlab.tasks.osl_mimic.config.env_cfgs import Mode, Reward
 from mjlab.tasks.osl_mimic.leg_contact import add_leg_contact_sensor
@@ -314,3 +317,21 @@ def osl_split_env_cfg(
   )
   apply_split_stage(cfg, reward, mode, osl_obs)
   return OslSplitEnvCfg(**{f.name: getattr(cfg, f.name) for f in fields(cfg)})
+
+
+def osl_split_terrain_env_cfg(
+  model: Model = "msk",
+  socket: Socket = "compliant",
+  reward: Reward = "clf",
+  mode: Mode = "train",
+  dr_cfg: OslDrCfg | None = None,
+  osl_obs: mdp.OslObsCfg | None = None,
+) -> OslSplitEnvCfg:
+  """The stage-2 split environment on stage 1's generated terrain: the terrain
+  task's grid, level curriculum, start height and ``nan_term`` in training and play
+  (:func:`~mjlab.tasks.osl_gait_library.config.env_cfgs.apply_terrain`); validation
+  stays flat. Everything else is :func:`osl_split_env_cfg`'s."""
+  cfg = osl_split_env_cfg(model, socket, reward, mode, dr_cfg, osl_obs)
+  if mode != "validation":
+    apply_terrain(cfg, mode)
+  return cfg

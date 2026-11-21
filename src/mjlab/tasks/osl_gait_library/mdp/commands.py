@@ -1275,7 +1275,7 @@ class GaitLibraryCommand(CommandTerm):
     self.frame[env_ids] = frame
     self.twist_command[env_ids] = twist
     self.anchor[env_ids] = anchor
-    self.z_offset[env_ids] = origins[:, 2]
+    self.z_offset[env_ids] = self._start_height(clip, frame, anchor, origins)
     self.clip_prev[env_ids] = clip
     self.anchor_prev[env_ids] = anchor
     self.frame_prev[env_ids] = frame.float()
@@ -1301,6 +1301,20 @@ class GaitLibraryCommand(CommandTerm):
     # servos toward the all-zero pose. Holding the start pose instead is what a
     # servo running before the episode would do.
     self.robot.set_joint_position_target(ref["joint_pos"], env_ids=env_ids)
+
+  def _start_height(
+    self,
+    clip: torch.Tensor,
+    frame: torch.Tensor,
+    anchor: torch.Tensor,
+    origins: torch.Tensor,
+  ) -> torch.Tensor:
+    """(n,) the height the starting episodes' references are raised by (their
+    ``z_offset``): the env origins' z. ``clip``, ``frame`` and ``anchor`` are the
+    episodes' start (the terrain command reads the ground under the reference's
+    feet there)."""
+    del clip, frame, anchor
+    return origins[:, 2]
 
   def _switch(self, env_ids: torch.Tensor) -> None:
     """Timer resample: new twist, phase-preserving clip switch, blend, re-base."""

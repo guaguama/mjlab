@@ -568,7 +568,11 @@ def _states(runner: SplitOnPolicyRunner) -> dict[str, dict[str, torch.Tensor]]:
 
 
 def test_split_tasks_are_registered() -> None:
-  ids = sorted(t for t in list_tasks() if t.startswith(TASK_PREFIX))
+  ids = sorted(
+    t
+    for t in list_tasks()
+    if t.startswith(TASK_PREFIX) and not t.endswith("-Terrain")  # Their own tests.
+  )
   tags = [
     m + r + s
     for m in ("-ROBOT", "-MSK")

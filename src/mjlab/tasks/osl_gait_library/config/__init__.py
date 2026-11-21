@@ -11,6 +11,11 @@ randomization: every combination of model (``-ROBOT``, ``-MSK``), reward
   uv run train Mjlab-Gait-Library-Unicycle-OSL-Fullbody-MSK-CLF \\
     --env.commands.motion.library-dir <100 Hz clipper unicycle library folder>
 
+Every unicycle task has a terrain twin, ``<task>-Terrain``, on the seeded grid of
+:mod:`~mjlab.tasks.osl_gait_library.terrain` with a survival-gated level curriculum
+(validation stays flat; see ``config.env_cfgs.apply_terrain``), in its own
+experiment folder (``<experiment>_terrain``).
+
 Play takes no ``--env`` overrides, so it reads the library from
 ``MJLAB_OSL_GAIT_LIBRARY`` (forward) or ``MJLAB_OSL_UNICYCLE_LIBRARY`` (unicycle)::
 
@@ -24,8 +29,13 @@ from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.registry import register_mjlab_task
 
 from ..rl.runner import GaitLibraryOnPolicyRunner
-from .env_cfgs import Variant, osl_gait_library_env_cfg
-from .rl_cfg import osl_gait_library_runner_cfg
+from ..rl.terrain_runner import TerrainGaitLibraryRunner
+from .env_cfgs import (
+  Variant,
+  osl_gait_library_env_cfg,
+  osl_gait_library_terrain_env_cfg,
+)
+from .rl_cfg import osl_gait_library_runner_cfg, osl_gait_library_terrain_runner_cfg
 
 # task id -> (model, socket, reward, variant, experiment name)
 _VARIANTS: dict[str, tuple[Model, Socket, Reward, Variant, str]] = {
@@ -85,4 +95,20 @@ for _task_id, (_model, _socket, _reward, _variant, _experiment) in _VARIANTS.ite
     play_env_cfg=osl_gait_library_env_cfg(_model, _socket, _reward, "play", _variant),
     rl_cfg=osl_gait_library_runner_cfg(_model, _socket, _reward, _experiment, _variant),
     runner_cls=GaitLibraryOnPolicyRunner,
+  )
+
+TERRAIN_SUFFIX = "-Terrain"
+# task id -> (model, socket, reward, experiment name) of the terrain twins.
+TERRAIN_TASKS: dict[str, tuple[Model, Socket, Reward, str]] = {
+  _task_id + TERRAIN_SUFFIX: (_model, _socket, _reward, _experiment + "_terrain")
+  for _task_id, (_model, _socket, _reward, _variant, _experiment) in _VARIANTS.items()
+  if _variant == "unicycle"
+}
+for _task_id, (_model, _socket, _reward, _experiment) in TERRAIN_TASKS.items():
+  register_mjlab_task(
+    task_id=_task_id,
+    env_cfg=osl_gait_library_terrain_env_cfg(_model, _socket, _reward, "train"),
+    play_env_cfg=osl_gait_library_terrain_env_cfg(_model, _socket, _reward, "play"),
+    rl_cfg=osl_gait_library_terrain_runner_cfg(_model, _socket, _reward, _experiment),
+    runner_cls=TerrainGaitLibraryRunner,
   )

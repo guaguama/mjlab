@@ -45,6 +45,11 @@ its run's ``params/env.yaml``, else the legacy set, and says which)::
   uv run play Mjlab-Split-Unicycle-OSL-Fullbody-MSK-CLF-Compliant \\
     --checkpoint-file <stage-2 run>/model_<N>.pt
 
+Every split task has a terrain twin, ``<task>-Terrain``, on stage 1's generated
+terrain (``Mjlab-Gait-Library-Unicycle-...-Terrain``; validation stays flat). Its warm
+start must come from a terrain stage-1 run: a flat teacher is refused (stage 2 cannot
+add conditions to the human).
+
 Every checkpoint comes with the OSL actor alone, the deployable part, as
 ``exported/osl_policy_<N>.onnx`` plus its metadata ``.json``. ``uv run --no-sync
 python -m mjlab.tasks.osl_split.export <stage-2 run>/model_<N>.pt`` exports both
@@ -58,7 +63,8 @@ from mjlab.tasks.osl_mimic.config.env_cfgs import Reward
 from mjlab.tasks.registry import register_mjlab_task
 
 from ..rl.runner import SplitOnPolicyRunner
-from .env_cfgs import osl_split_env_cfg
+from ..rl.terrain_runner import TerrainSplitRunner
+from .env_cfgs import osl_split_env_cfg, osl_split_terrain_env_cfg
 from .rl_cfg import osl_split_runner_cfg
 
 TASK_PREFIX = "Mjlab-Split-Unicycle-OSL-Fullbody"
@@ -101,4 +107,26 @@ for _task_id, (_model, _socket, _reward) in SPLIT_TASKS.items():
       _model, _socket, _reward, split_experiment_name(_model, _socket, _reward)
     ),
     runner_cls=SplitOnPolicyRunner,
+  )
+
+TERRAIN_SUFFIX = "-Terrain"
+SPLIT_TERRAIN_TASKS: dict[str, tuple[Model, Socket, Reward]] = {
+  task_id + TERRAIN_SUFFIX: spec for task_id, spec in SPLIT_TASKS.items()
+}
+"""Terrain task id -> (model, socket, reward)."""
+
+for _task_id, (_model, _socket, _reward) in SPLIT_TERRAIN_TASKS.items():
+  _rl = osl_split_runner_cfg(
+    _model,
+    _socket,
+    _reward,
+    split_experiment_name(_model, _socket, _reward) + "_terrain",
+  )
+  _rl.wandb_tags = (*_rl.wandb_tags, "terrain")
+  register_mjlab_task(
+    task_id=_task_id,
+    env_cfg=osl_split_terrain_env_cfg(_model, _socket, _reward, "train"),
+    play_env_cfg=osl_split_terrain_env_cfg(_model, _socket, _reward, "play"),
+    rl_cfg=_rl,
+    runner_cls=TerrainSplitRunner,
   )

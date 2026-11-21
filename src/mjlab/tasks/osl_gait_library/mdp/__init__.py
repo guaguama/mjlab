@@ -19,3 +19,6 @@ from .observations import joint_pos_biased as joint_pos_biased
 from .observations import stride_phase as stride_phase
 from .observations import twist_command as twist_command
 from .rewards import stride_twist as stride_twist
+from .terrain import TerrainGaitLibraryCommand as TerrainGaitLibraryCommand
+from .terrain import TerrainGaitLibraryCommandCfg as TerrainGaitLibraryCommandCfg
+from .terrain import terrain_levels_survival as terrain_levels_survival

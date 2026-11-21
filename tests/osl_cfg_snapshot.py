@@ -111,12 +111,19 @@ def task_digests(task: str) -> dict[str, dict[str, str]]:
   }
 
 
+TERRAIN_SUFFIX = "-Terrain"
+"""The terrain twins (round 7) are new configs of their own, outside the fixture:
+``tests/test_osl_terrain.py`` checks them against their flat tasks."""
+
+
 def osl_tasks() -> list[str]:
-  """Every registered OSL task."""
+  """Every registered OSL task the fixture covers (all but the terrain twins)."""
   import mjlab.tasks  # noqa: F401  (registers the tasks)
   from mjlab.tasks.registry import list_tasks
 
-  return sorted(t for t in list_tasks() if "OSL" in t)
+  return sorted(
+    t for t in list_tasks() if "OSL" in t and not t.endswith(TERRAIN_SUFFIX)
+  )
 
 
 def _cell(cell: Any) -> Any:
